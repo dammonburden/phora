@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "description": "Dev-only Phora MCP known-answer benchmark cases. Targets are local binaries and are skipped when no candidate exists.",
+  "default_call_timeout_s": 120,
+  "cases": [
+    {
+      "id": "phora-self-context",
+      "description": "Load the current Phora binary through MCP and verify high-level self-comprehension clues.",
+      "targets": ["zig-out/bin/phora"],
+      "load": {
+        "arguments": {
+          "options": {
+            "analysis": true,
+            "budget_ms": 120000
+          }
+        }
+      },
+      "calls": [
+        {
+          "name": "context-auto",
+          "tool": "get_binary_context",
+          "arguments": {
+            "doc_id": "{doc_id}",
+            "mode": "auto",
+            "max_chars": 120000
+          }
+        },
+        {
+          "name": "imports-by-library",
+          "tool": "get_imports",
+          "arguments": {
+            "doc_id": "{doc_id}",
+            "group_by": "library",
+            "max_results": 1
+          }
+        }
+      ],
+      "expected_clues": [
+        "phora",
+        "macho",
+        "arm64",
+        "get_binary_context",
+        "tools/call",
+        "save_project",
+        "session",
+        "subsystem_hints",
+        "has_more"
+      ],
+      "forbidden_clues": [
+        "\"runtime\":\"asar\"",
+        "\"runtime\":\"cpython\"",
+        "\"runtime_next_target\":\"app.asar"
+      ],
+      "min_score": 0.7
+    },
+    {
+      "id": "system-ls-auto-context",
+      "description": "Load /bin/ls and request the adaptive binary context planner.",
+      "targets": ["/bin/ls"],
+      "load": {
+        "arguments": {
+          "options": {
+            "analysis": true,
+            "budget_ms": 120000
+          }
+        }
+      },
+      "calls": [
+        {
+          "name": "context-auto",
+          "tool": "get_binary_context",
+          "arguments": {
+            "doc_id": "{doc_id}",
+            "mode": "auto",
+            "max_chars": 60000
+          }
+        }
+      ],
+      "expected_clues": [
+        "macho",
+        "entry_point",
+        "procedure_count",
+        "segments",
+        "strategy"
+      ],
+      "min_score": 0.6
+    },
+    {
+      "id": "system-wc-manifest",
+      "description": "Load wc and request the lightweight manifest view.",
+      "targets": ["/usr/bin/wc", "/bin/wc"],
+      "load": {
+        "arguments": {
+          "options": {
+            "analysis": true,
+            "budget_ms": 120000
+          }
+        }
+      },
+      "calls": [
+        {
+          "name": "context-manifest",
+          "tool": "get_binary_context",
+          "arguments": {
+            "doc_id": "{doc_id}",
+            "mode": "manifest",
+            "max_chars": 30000
+          }
+        }
+      ],
+      "expected_clues": [
+        "manifest",
+        "macho",
+        "entry_point",
+        "segments",
+        "next_call",
+        "subsystem_hints"
+      ],
+      "min_score": 0.6
+    },
+    {
+      "id": "system-echo-segments",
+      "description": "Load /bin/echo and exercise a direct structural query after load.",
+      "targets": ["/bin/echo"],
+      "load": {
+        "arguments": {
+          "options": {
+            "analysis": true,
+            "budget_ms": 120000
+          }
+        }
+      },
+      "calls": [
+        {
+          "name": "segments",
+          "tool": "get_segments",
+          "arguments": {
+            "doc_id": "{doc_id}"
+          }
+        }
+      ],
+      "expected_clues": [
+        "segments",
+        "__TEXT",
+        "__DATA",
+        "permissions"
+      ],
+      "min_score": 0.6
+    }
+  ]
+}

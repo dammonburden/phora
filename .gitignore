@@ -1,0 +1,51 @@
+.DS_Store
+
+# Local MCP configuration. Publish .mcp.example.json instead.
+.mcp.json
+
+# Zig build outputs and caches.
+.zig-cache/
+zig-out/
+
+# Local automation and research state.
+.local-state/
+local-state.json
+local-state.log
+
+# Large or generated binaries.
+*.macho
+*.o
+*.dylib
+*.so
+*.dll
+*.exe
+*.a
+
+# Analysis reports and local research notes.
+analysis-output/
+local-notes/
+scratch-*
+test-output-*
+undocumented_map.md
+ux_test_*
+
+# Local scratch or generated test output.
+test/
+tmp/
+benchmark-results/
+__pycache__/
+*.pyc
+*.swp
+*.swo
+*.tmp
+*.log
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Python helper caches.
+__pycache__/
+*.py[cod]
+
+# Dev benchmark run output.
+benchmarks/results/

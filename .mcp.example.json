@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "phora": {
+      "command": "/absolute/path/to/phora/zig-out/bin/phora",
+      "args": ["serve", "--stdio"]
+    }
+  }
+}
