@@ -20,9 +20,8 @@ pub const McpServer = struct {
     io: std.Io,
     store: tools.DocumentStore,
     sessions: std.StringHashMap(SessionState),
-    port: u16,
+    http_config: http.Config,
     session_timeout_ms: i64,
-    next_session_id: u64,
     session_mutex: std.Io.Mutex,
     /// v7.15.0 B2: per-session notification queues. Keyed by session id.
     /// Broadcast notifications (e.g. `tools/list_changed`) get fanned out to
@@ -85,14 +84,17 @@ pub const McpServer = struct {
     };
 
     pub fn init(allocator: Allocator, io: std.Io, port: u16) Self {
+        return Self.initWithHttpConfig(allocator, io, .{ .port = port });
+    }
+
+    pub fn initWithHttpConfig(allocator: Allocator, io: std.Io, config: http.Config) Self {
         return .{
             .allocator = allocator,
             .io = io,
             .store = tools.DocumentStore.init(allocator, io),
             .sessions = std.StringHashMap(SessionState).init(allocator),
-            .port = port,
+            .http_config = config,
             .session_timeout_ms = 30 * 60 * 1000, // 30 minutes
-            .next_session_id = 1,
             .session_mutex = .init,
             .pending_notifications = std.StringHashMap(std.array_list.Managed([]const u8)).init(allocator),
             .notification_mutex = .init,
@@ -249,7 +251,7 @@ pub const McpServer = struct {
 
     /// Start the MCP server. Blocks until shutdown.
     pub fn start(self: *Self, io: std.Io) !void {
-        try http.serve(self.allocator, io, self.port, self, handleHttpRequest);
+        try http.serve(self.allocator, io, self.http_config, self, handleHttpRequest);
     }
 
     /// Public entry point for processing a JSON-RPC request (used by stdio transport).
@@ -962,9 +964,17 @@ pub const McpServer = struct {
     }
 
     fn createSessionLocked(self: *Self) ![]const u8 {
-        const id_num = self.next_session_id;
-        self.next_session_id += 1;
-        const id = try std.fmt.allocPrint(self.allocator, "session-{d}", .{id_num});
+        var id: []const u8 = undefined;
+        var attempts: usize = 0;
+        while (true) : (attempts += 1) {
+            if (attempts >= 8) unreachable;
+            var random_bytes: [16]u8 = undefined;
+            self.io.random(&random_bytes);
+            const hex = std.fmt.bytesToHex(random_bytes, .lower);
+            id = try std.fmt.allocPrint(self.allocator, "session-{s}", .{&hex});
+            if (!self.sessions.contains(id)) break;
+            self.allocator.free(id);
+        }
         const now = runtime.realMillis(self.io);
 
         try self.sessions.put(id, .{
@@ -1025,6 +1035,13 @@ pub const McpServer = struct {
 /// Start a Phora MCP server on the given port. Blocks until shutdown.
 pub fn serve(allocator: Allocator, io: std.Io, port: u16) !void {
     var server = McpServer.init(allocator, io, port);
+    defer server.deinit();
+    try server.start(io);
+}
+
+/// Start a Phora MCP server with explicit HTTP transport settings.
+pub fn serveWithHttpConfig(allocator: Allocator, io: std.Io, config: http.Config) !void {
+    var server = McpServer.initWithHttpConfig(allocator, io, config);
     defer server.deinit();
     try server.start(io);
 }

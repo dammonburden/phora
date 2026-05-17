@@ -9,6 +9,7 @@ const macho = @import("loaders/macho.zig");
 const elf = @import("loaders/elf.zig");
 const pe = @import("loaders/pe.zig");
 const json = @import("util/json.zig");
+const http = @import("util/http.zig");
 const pipeline = @import("analysis/pipeline.zig");
 
 const version_string = "7.15.3";
@@ -78,13 +79,7 @@ pub fn main(init: std.process.Init) !void {
     const command = args[1];
 
     if (std.mem.eql(u8, command, "serve")) {
-        // Check for --stdio flag
-        for (args[2..]) |arg| {
-            if (std.mem.eql(u8, arg, "--stdio")) {
-                return cmdStdio(allocator, io);
-            }
-        }
-        try cmdServe(allocator, io, args[2..]);
+        try cmdServe(allocator, io, init.environ_map, args[2..]);
     } else if (std.mem.eql(u8, command, "analyze")) {
         try cmdAnalyze(allocator, io, args[2..]);
     } else if (std.mem.eql(u8, command, "info")) {
@@ -179,24 +174,87 @@ fn cmdStdio(allocator: std.mem.Allocator, io: std.Io) !void {
     }
 }
 
-fn cmdServe(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
-    var port: u16 = 42070;
+fn cmdServe(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, args: []const []const u8) !void {
+    var config: http.Config = .{};
+    if (env.get("PHORA_HTTP_TOKEN")) |token| {
+        if (token.len > 0) config.token = token;
+    }
+    var transport: enum { stdio, http } = .stdio;
+    var stdio_explicit = false;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--port") or std.mem.eql(u8, args[i], "-p")) {
+        if (std.mem.eql(u8, args[i], "--stdio")) {
+            stdio_explicit = true;
+        } else if (std.mem.eql(u8, args[i], "--http")) {
+            transport = .http;
+        } else if (std.mem.eql(u8, args[i], "--port") or std.mem.eql(u8, args[i], "-p")) {
+            transport = .http;
             i += 1;
             if (i >= args.len) {
                 const stderr = stderrWriter(io);
                 try stderr.print("Error: --port requires a value\n", .{});
                 std.process.exit(1);
             }
-            port = std.fmt.parseInt(u16, args[i], 10) catch {
+            config.port = std.fmt.parseInt(u16, args[i], 10) catch {
                 const stderr = stderrWriter(io);
                 try stderr.print("Error: invalid port number '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, args[i], "--host")) {
+            transport = .http;
+            i += 1;
+            if (i >= args.len) {
+                const stderr = stderrWriter(io);
+                try stderr.print("Error: --host requires a value\n", .{});
+                std.process.exit(1);
+            }
+            config.host = normalizeHost(args[i]);
+        } else if (std.mem.eql(u8, args[i], "--token")) {
+            transport = .http;
+            i += 1;
+            if (i >= args.len) {
+                const stderr = stderrWriter(io);
+                try stderr.print("Error: --token requires a value\n", .{});
+                std.process.exit(1);
+            }
+            if (args[i].len == 0) {
+                const stderr = stderrWriter(io);
+                try stderr.print("Error: --token cannot be empty\n", .{});
+                std.process.exit(1);
+            }
+            config.token = args[i];
+        } else if (std.mem.eql(u8, args[i], "--cors-origin")) {
+            transport = .http;
+            i += 1;
+            if (i >= args.len) {
+                const stderr = stderrWriter(io);
+                try stderr.print("Error: --cors-origin requires a value\n", .{});
+                std.process.exit(1);
+            }
+            config.cors_origin = args[i];
+        } else {
+            const stderr = stderrWriter(io);
+            try stderr.print("Unknown serve option: {s}\n\n", .{args[i]});
+            printUsage(io);
+            std.process.exit(1);
         }
+    }
+
+    if (stdio_explicit and transport == .http) {
+        const stderr = stderrWriter(io);
+        try stderr.print("Error: --stdio cannot be combined with HTTP options\n", .{});
+        std.process.exit(1);
+    }
+
+    if (transport == .stdio) {
+        return cmdStdio(allocator, io);
+    }
+
+    if (!isLoopbackHost(config.host) and config.token == null) {
+        const stderr = stderrWriter(io);
+        try stderr.print("Error: non-loopback HTTP bind requires PHORA_HTTP_TOKEN or --token\n", .{});
+        std.process.exit(1);
     }
 
     // v7.8.1 H2 hotfix: install fatal-signal handlers so a worker crash
@@ -211,10 +269,31 @@ fn cmdServe(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     const stdout = stdoutWriter(io);
     try stdout.print("Phora MCP server v{s}\n", .{version_string});
-    try stdout.print("Listening on port {d}\n", .{port});
+    try stdout.print("Listening on {s}:{d}\n", .{ config.host, config.port });
     try stdout.print("Transport: Streamable HTTP (JSON-RPC 2.0)\n", .{});
+    if (config.token != null) {
+        try stdout.print("HTTP auth: bearer token required\n", .{});
+    }
+    if (config.cors_origin) |origin| {
+        try stdout.print("CORS origin: {s}\n", .{origin});
+    }
+    if (!isLoopbackHost(config.host)) {
+        const stderr = stderrWriter(io);
+        try stderr.print("WARNING: Phora HTTP is exposed on non-loopback host {s}. Keep the bearer token secret and use only on trusted networks.\n", .{config.host});
+    }
 
-    try server.serve(allocator, io, port);
+    try server.serveWithHttpConfig(allocator, io, config);
+}
+
+fn normalizeHost(host: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(host, "localhost")) return "127.0.0.1";
+    return host;
+}
+
+fn isLoopbackHost(host: []const u8) bool {
+    if (std.mem.eql(u8, host, "::1")) return true;
+    if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
+    return std.mem.eql(u8, host, "127.0.0.1") or std.mem.startsWith(u8, host, "127.");
 }
 
 // ============================================================================
@@ -476,12 +555,19 @@ fn printUsage(io: std.Io) void {
         \\Usage: phora <command> [options]
         \\
         \\Commands:
-        \\  serve [--port PORT]    Start MCP server (default port: 42070)
+        \\  serve                  Start MCP server on stdin/stdout
         \\  serve --stdio          Start MCP server on stdin/stdout
+        \\  serve --http [options] Start MCP server over HTTP on 127.0.0.1:42070
         \\  analyze <path>         One-shot analysis, JSON to stdout
         \\  info <path>            Quick binary overview
         \\  version                Print version info
         \\  help                   Show this message
+        \\
+        \\HTTP options:
+        \\  --host HOST            Bind host (non-loopback requires --token or PHORA_HTTP_TOKEN)
+        \\  --port PORT            Bind port
+        \\  --token TOKEN          Require Authorization: Bearer TOKEN
+        \\  --cors-origin ORIGIN   Emit CORS headers for one explicit origin
         \\
     , .{}) catch {};
 }

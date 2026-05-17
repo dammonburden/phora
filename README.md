@@ -1,6 +1,11 @@
 # Phora
 
-Phora is an AI-first binary analysis engine exposed through MCP. It loads binaries, extracts analysis facts, and packages binary context into tool responses that an LLM or harness can use for guided reverse-engineering workflows.
+[![License: CC0-1.0](https://img.shields.io/badge/license-CC0--1.0-lightgrey.svg)](LICENSE)
+[![Zig](https://img.shields.io/badge/language-Zig-f7a41d.svg)](https://ziglang.org/)
+[![MCP](https://img.shields.io/badge/interface-MCP-blue.svg)](https://modelcontextprotocol.io/)
+[![Status: Public Preview](https://img.shields.io/badge/status-public%20preview-yellow.svg)](#known-limitations)
+
+Phora is an MCP-native binary analysis engine for agentic reverse engineering. It loads binaries, builds memory maps, extracts procedures, strings, imports, xrefs, and control-flow evidence, then exposes that evidence through bounded tool calls designed for LLM workflows. Instead of dumping an entire binary into context, Phora helps agents plan, divide, inspect, prove, and resume analysis.
 
 This is an early public source snapshot. It is useful for review, experimentation, and MCP integration work, but it is not a polished public release yet.
 
@@ -13,6 +18,42 @@ Phora is built around the idea that binary analysis should be split across agent
 The important design choice is that Phora returns bounded, structured evidence. Tool results are JSON-shaped for MCP clients, and the higher-level tools are designed to produce useful next calls instead of dumping everything into one enormous response. That makes it practical for multiple agents to divide the work: one maps the binary, one follows call graph evidence, one checks strings and imports, one compares versions, and another drops to bytes or disassembly when the model needs proof.
 
 Phora can also stay small. The release build is configured for a 2 MiB binary budget, while the dev-only benchmark lane checks JSON validity, core MCP behavior, strict self-analysis, and repeatable two-agent runs.
+
+## Architecture
+
+```mermaid
+flowchart TD
+  A["Binary file"] --> B["Loader<br/>Mach-O / ELF / PE / ZIP / Raw"]
+  B --> C["Document + memory map<br/>segments, sections, imports, symbols"]
+  C --> D["Analysis pipeline"]
+
+  D --> D1["disassembly"]
+  D --> D2["procedures"]
+  D --> D3["strings"]
+  D --> D4["imports"]
+  D --> D5["xrefs"]
+  D --> D6["CFG"]
+  D --> D7["lifting / IR"]
+
+  D1 --> E["DocumentStore / Database"]
+  D2 --> E
+  D3 --> E
+  D4 --> E
+  D5 --> E
+  D6 --> E
+  D7 --> E
+
+  E --> F["MCP tools"]
+  F --> F1["get_binary_context"]
+  F --> F2["get_remake_frontier"]
+  F --> F3["get_semantic_slice"]
+  F --> F4["decompile"]
+  F --> F5["search"]
+  F --> F6["read_bytes"]
+  F --> F7["compare"]
+
+  F --> G["LLM / agent harness"]
+```
 
 ## Build
 
@@ -93,6 +134,16 @@ decompile doc_id=1 address="0x..." scope=cluster
 search doc_id=1 type=string_refs pattern="update|config|token"
 read_bytes doc_id=1 address="0x..." length=256
 ```
+
+## Known Limitations
+
+- Phora is a public preview, not a polished release.
+- Stdio is the recommended MCP transport.
+- HTTP remains experimental until the request-arena leak is resolved.
+- `read_bytes` returns bounded hex/ascii evidence from mapped addresses, not arbitrary memory.
+- Benchmark results are sanity checks, not formal performance claims.
+- Analysis depth varies by architecture, format, strippedness, and binary size.
+- Integration tests and benchmarks may skip host-specific binaries.
 
 ## License
 

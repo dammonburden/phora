@@ -17,14 +17,22 @@ pub const RequestContext = struct {
     path: []const u8,
 };
 
+pub const Config = struct {
+    host: []const u8 = "127.0.0.1",
+    port: u16 = 42070,
+    token: ?[]const u8 = null,
+    cors_origin: ?[]const u8 = null,
+    max_body_bytes: usize = 4 * 1024 * 1024,
+};
+
 pub fn serve(
     allocator: Allocator,
     io: std.Io,
-    port: u16,
+    config: Config,
     context: anytype,
     handler_fn: anytype,
 ) !void {
-    var address = try std.Io.net.IpAddress.parse("0.0.0.0", port);
+    var address = try std.Io.net.IpAddress.parse(config.host, config.port);
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.socket.close(io);
     var group: std.Io.Group = .init;
@@ -37,19 +45,19 @@ pub fn serve(
         };
 
         const Handler = struct {
-            fn run(conn: std.Io.net.Stream, alloc: Allocator, run_io: std.Io, ctx: @TypeOf(context)) std.Io.Cancelable!void {
+            fn run(conn: std.Io.net.Stream, alloc: Allocator, run_io: std.Io, cfg: Config, ctx: @TypeOf(context)) std.Io.Cancelable!void {
                 var mutable_conn = conn;
                 defer mutable_conn.close(run_io);
-                handleConnection(alloc, run_io, mutable_conn, ctx, handler_fn) catch |err| {
+                handleConnection(alloc, run_io, mutable_conn, cfg, ctx, handler_fn) catch |err| {
                     std.log.err("Connection error: {s}", .{@errorName(err)});
                 };
             }
         };
 
-        group.concurrent(io, Handler.run, .{ stream, allocator, io, context }) catch {
+        group.concurrent(io, Handler.run, .{ stream, allocator, io, config, context }) catch {
             var mutable_stream = stream;
             defer mutable_stream.close(io);
-            handleConnection(allocator, io, mutable_stream, context, handler_fn) catch {};
+            handleConnection(allocator, io, mutable_stream, config, context, handler_fn) catch {};
             continue;
         };
     }
@@ -59,6 +67,7 @@ fn handleConnection(
     allocator: Allocator,
     io: std.Io,
     stream: std.Io.net.Stream,
+    config: Config,
     context: anytype,
     handler_fn: anytype,
 ) !void {
@@ -78,11 +87,24 @@ fn handleConnection(
         defer allocator.free(header);
 
         const req = parseRequest(header) catch {
-            try sendResponse(writer, 400, "application/json", null, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32700,\"message\":\"bad request\"},\"id\":null}");
+            try sendResponse(writer, config, 400, "application/json", null, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32700,\"message\":\"bad request\"},\"id\":null}");
             continue;
         };
 
+        if (!std.mem.eql(u8, req.path, "/mcp")) {
+            try sendResponse(writer, config, 404, "application/json", null, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32004,\"message\":\"not found\"},\"id\":null}");
+            return;
+        }
+
         if (std.ascii.eqlIgnoreCase(req.method, "POST")) {
+            if (!isAuthorized(req, config)) {
+                try sendResponse(writer, config, 401, "application/json", null, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32001,\"message\":\"unauthorized\"},\"id\":null}");
+                return;
+            }
+            if (req.content_length > config.max_body_bytes) {
+                try sendResponse(writer, config, 413, "application/json", null, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32013,\"message\":\"request body too large\"},\"id\":null}");
+                return;
+            }
             const body = try allocator.alloc(u8, req.content_length);
             defer allocator.free(body);
             try reader.readSliceAll(body);
@@ -93,14 +115,19 @@ fn handleConnection(
                 .path = req.path,
             };
             const response = handler_fn(context, body, req_ctx);
-            try sendResponse(writer, response.status, response.content_type, response.session_id, response.body);
+            try sendResponse(writer, config, response.status, response.content_type, response.session_id, response.body);
         } else if (std.ascii.eqlIgnoreCase(req.method, "OPTIONS")) {
-            try sendResponse(writer, 204, "text/plain", null, "");
+            try sendResponse(writer, config, 204, "text/plain", null, "");
         } else if (std.ascii.eqlIgnoreCase(req.method, "GET")) {
-            try handleSseRequest(writer, context, req.session_id);
+            if (!isAuthorized(req, config)) {
+                try sendResponse(writer, config, 401, "application/json", null, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32001,\"message\":\"unauthorized\"},\"id\":null}");
+                return;
+            }
+            try handleSseRequest(writer, config, context, req.session_id);
             return;
         } else {
-            try sendResponse(writer, 405, "application/json", null, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32600,\"message\":\"method not allowed\"},\"id\":null}");
+            try sendResponse(writer, config, 405, "application/json", null, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32600,\"message\":\"method not allowed\"},\"id\":null}");
+            return;
         }
     }
 }
@@ -110,6 +137,7 @@ const ParsedRequest = struct {
     path: []const u8,
     content_length: usize,
     session_id: ?[]const u8,
+    authorization: ?[]const u8,
 };
 
 fn readHeader(allocator: Allocator, reader: *std.Io.Reader) ![]u8 {
@@ -134,6 +162,7 @@ fn parseRequest(header: []const u8) !ParsedRequest {
 
     var content_length: usize = 0;
     var session_id: ?[]const u8 = null;
+    var authorization: ?[]const u8 = null;
 
     var lines = std.mem.splitSequence(u8, header[first_line_end + 2 ..], "\r\n");
     while (lines.next()) |line| {
@@ -145,6 +174,8 @@ fn parseRequest(header: []const u8) !ParsedRequest {
             content_length = std.fmt.parseInt(usize, value, 10) catch return error.BadRequest;
         } else if (std.ascii.eqlIgnoreCase(name, "mcp-session-id")) {
             session_id = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "authorization")) {
+            authorization = value;
         }
     }
 
@@ -153,11 +184,30 @@ fn parseRequest(header: []const u8) !ParsedRequest {
         .path = path,
         .content_length = content_length,
         .session_id = session_id,
+        .authorization = authorization,
     };
+}
+
+fn isAuthorized(req: ParsedRequest, config: Config) bool {
+    const token = config.token orelse return true;
+    const header = req.authorization orelse return false;
+    const prefix = "Bearer ";
+    if (!std.mem.startsWith(u8, header, prefix)) return false;
+    return timingSafeEql(header[prefix.len..], token);
+}
+
+fn timingSafeEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, 0..) |byte, i| {
+        diff |= byte ^ b[i];
+    }
+    return diff == 0;
 }
 
 fn handleSseRequest(
     writer: *std.Io.Writer,
+    config: Config,
     context: anytype,
     session_id: ?[]const u8,
 ) !void {
@@ -165,9 +215,7 @@ fn handleSseRequest(
     try writer.writeAll("Content-Type: text/event-stream\r\n");
     try writer.writeAll("Cache-Control: no-cache\r\n");
     try writer.writeAll("Connection: keep-alive\r\n");
-    try writer.writeAll("Access-Control-Allow-Origin: *\r\n");
-    try writer.writeAll("Access-Control-Allow-Headers: Content-Type, mcp-session-id, Authorization\r\n");
-    try writer.writeAll("Access-Control-Expose-Headers: mcp-session-id\r\n");
+    try writeCorsHeaders(writer, config);
     if (session_id) |sid| {
         try writer.writeAll("mcp-session-id: ");
         try writer.writeAll(sid);
@@ -195,6 +243,7 @@ fn handleSseRequest(
 
 fn sendResponse(
     writer: *std.Io.Writer,
+    config: Config,
     status_code: u16,
     content_type: []const u8,
     session_id: ?[]const u8,
@@ -205,8 +254,10 @@ fn sendResponse(
         202 => "Accepted",
         204 => "No Content",
         400 => "Bad Request",
+        401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        413 => "Payload Too Large",
         500 => "Internal Server Error",
         else => "OK",
     };
@@ -214,10 +265,8 @@ fn sendResponse(
     try writer.print("HTTP/1.1 {d} {s}\r\n", .{ status_code, reason });
     try writer.writeAll("Content-Type: ");
     try writer.writeAll(content_type);
-    try writer.writeAll("\r\nAccess-Control-Allow-Origin: *\r\n");
-    try writer.writeAll("Access-Control-Allow-Headers: Content-Type, mcp-session-id, Authorization\r\n");
-    try writer.writeAll("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
-    try writer.writeAll("Access-Control-Expose-Headers: mcp-session-id\r\n");
+    try writer.writeAll("\r\n");
+    try writeCorsHeaders(writer, config);
     if (session_id) |sid| {
         try writer.writeAll("mcp-session-id: ");
         try writer.writeAll(sid);
@@ -226,4 +275,38 @@ fn sendResponse(
     try writer.print("Content-Length: {d}\r\n\r\n", .{body.len});
     try writer.writeAll(body);
     try writer.flush();
+}
+
+fn writeCorsHeaders(writer: *std.Io.Writer, config: Config) !void {
+    const origin = config.cors_origin orelse return;
+    try writer.writeAll("Access-Control-Allow-Origin: ");
+    try writer.writeAll(origin);
+    try writer.writeAll("\r\n");
+    try writer.writeAll("Access-Control-Allow-Headers: Content-Type, mcp-session-id, Authorization\r\n");
+    try writer.writeAll("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
+    try writer.writeAll("Access-Control-Expose-Headers: mcp-session-id\r\n");
+}
+
+test "HTTP request parsing captures auth and session headers" {
+    const header =
+        "POST /mcp HTTP/1.1\r\n" ++
+        "Host: 127.0.0.1:42070\r\n" ++
+        "Content-Length: 2\r\n" ++
+        "Authorization: Bearer secret\r\n" ++
+        "mcp-session-id: session-test\r\n" ++
+        "\r\n";
+    const req = try parseRequest(header);
+    try std.testing.expect(std.mem.eql(u8, req.method, "POST"));
+    try std.testing.expect(std.mem.eql(u8, req.path, "/mcp"));
+    try std.testing.expectEqual(@as(usize, 2), req.content_length);
+    try std.testing.expect(std.mem.eql(u8, req.authorization.?, "Bearer secret"));
+    try std.testing.expect(std.mem.eql(u8, req.session_id.?, "session-test"));
+}
+
+test "HTTP token authorization is strict bearer auth" {
+    const config: Config = .{ .token = "secret" };
+    try std.testing.expect(!isAuthorized(.{ .method = "POST", .path = "/mcp", .content_length = 0, .session_id = null, .authorization = null }, config));
+    try std.testing.expect(!isAuthorized(.{ .method = "POST", .path = "/mcp", .content_length = 0, .session_id = null, .authorization = "Bearer wrong" }, config));
+    try std.testing.expect(isAuthorized(.{ .method = "POST", .path = "/mcp", .content_length = 0, .session_id = null, .authorization = "Bearer secret" }, config));
+    try std.testing.expect(isAuthorized(.{ .method = "POST", .path = "/mcp", .content_length = 0, .session_id = null, .authorization = null }, .{}));
 }
