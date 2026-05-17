@@ -5,9 +5,19 @@ const NidEntry = struct {
     name: []const u8,
 };
 
-/// PSP NID database — sorted by NID for binary search.
-/// Comprehensive coverage of PSP SDK functions across all major libraries.
-/// Sources: PPSSPP, PSPSDK, psp-hb-docs, and firmware analysis.
+/// PSP NID resolver table — sorted by NID for binary search.
+/// A PSP NID is the 32-bit identifier used by PRX import/export records. Many
+/// values are derived from function-name hashes, and firmware/library revisions
+/// can introduce alternate, renamed, or still-unknown mappings.
+///
+/// This table is intentionally partial and best-effort. It covers common public
+/// homebrew/reversing names useful for import labeling, but it is not an
+/// authoritative or complete SDK/firmware database. Unknown NIDs should remain
+/// unresolved rather than guessed, and matched names should be treated as
+/// analysis labels rather than proof of implementation identity.
+///
+/// Reference background: public PSP homebrew and reverse-engineering
+/// documentation. No affiliation, endorsement, or official status is implied.
 const nid_table = [_]NidEntry{
     .{ .nid = 0x00220f16, .name = "sceNetAdhocMatchingAbortSendData" },
     .{ .nid = 0x00413887, .name = "sceHttpGetNetworkErrno" },
