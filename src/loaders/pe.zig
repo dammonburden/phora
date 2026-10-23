@@ -373,6 +373,7 @@ pub fn parse(allocator: std.mem.Allocator, doc_id: u64, path: []const u8, data: 
             .start = result.image_base + sect.virtual_address,
             .length = sect.virtual_size,
             .file_offset = sect.raw_data_offset,
+            .is_code = (sect.characteristics & IMAGE_SCN_MEM_EXECUTE) != 0,
         }) catch return PeError.OutOfMemory;
 
         segments.append(.{

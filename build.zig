@@ -53,9 +53,7 @@ pub fn build(b: *std.Build) void {
     // Run step
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run phora");
     run_step.dependOn(&run_cmd.step);
 
@@ -131,8 +129,12 @@ pub fn build(b: *std.Build) void {
     verify_step.dependOn(test_step);
     verify_step.dependOn(check_safe_step);
 
-    const verify_zig = b.addSystemCommand(&.{ "sh", "-c", "test \"$(zig version)\" = \"0.16.0\"" });
+    const verify_zig = b.addSystemCommand(&.{ b.graph.zig_exe, "version" });
+    verify_zig.expectStdOutEqual("0.17.0\n");
     verify_step.dependOn(&verify_zig.step);
+
+    const verify_export_script = b.addSystemCommand(&.{"scripts/test-github-safe-publish.sh"});
+    verify_step.dependOn(&verify_export_script.step);
 
     const verify_native = b.addSystemCommand(&.{
         "sh", "-c",
@@ -152,16 +154,19 @@ pub fn build(b: *std.Build) void {
     verify_step.dependOn(&verify_bench_strict.step);
 
     const verify_safe_export = b.addSystemCommand(&.{
-        "sh", "-c",
+        "sh",                  "-c",
         "set -eu; " ++
             "tmp=$(mktemp -d \"${TMPDIR:-/tmp}/phora-verify-export.XXXXXX\"); " ++
             "trap 'rm -rf \"$tmp\"' EXIT; " ++
-            "scripts/github-safe-publish.sh --export-dir \"$tmp\" >/tmp/phora-verify-safe-publish.log; " ++
+            "ZIG=\"$1\" scripts/github-safe-publish.sh --require-tests --export-dir \"$tmp\" >/tmp/phora-verify-safe-publish.log; " ++
             "test -f \"$tmp/benchmarks/cases.json\"; " ++
             "test -f \"$tmp/scripts/bench-phora.py\"; " ++
             "test ! -e \"$tmp/benchmark-results\"; " ++
             "test ! -e \"$tmp/benchmarks/results\"",
+        "phora-verify-export", b.graph.zig_exe,
     });
+    // Pass the compiler as an argument so cached configuration does not freeze
+    // the entire environment; cache overrides must follow each invocation.
     verify_safe_export.step.dependOn(b.getInstallStep());
     verify_step.dependOn(&verify_safe_export.step);
 }

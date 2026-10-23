@@ -76,6 +76,21 @@ pub const XrefTracker = struct {
         try to_entry.value_ptr.append(xref);
     }
 
+    /// Replay both indices without repeatedly growing hash tables while inserting
+    /// in source hash-bucket order. That ordering creates long probe clusters on
+    /// large loads when the destination repeatedly grows from a tiny capacity.
+    pub fn mergeFrom(self: *XrefTracker, other: *const XrefTracker) !void {
+        try self.refs_from.ensureTotalCapacity(self.refs_from.count() + other.refs_from.count());
+        try self.refs_to.ensureTotalCapacity(self.refs_to.count() + other.refs_to.count());
+        self.sorted_finalized = false;
+        var it = other.refs_from.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items) |xref| {
+                try self.addXref(xref.from, xref.to, xref.xref_type);
+            }
+        }
+    }
+
     /// Get all xrefs originating from an address.
     pub fn getRefsFrom(self: *const XrefTracker, address: u64) []const types.Xref {
         if (self.refs_from.get(address)) |list| {
@@ -154,6 +169,7 @@ pub const XrefTracker = struct {
             }
         }.lt);
 
+        if (self.sorted_from.len > 0) self.allocator.free(self.sorted_from);
         self.sorted_from = arr;
         self.sorted_finalized = true;
     }
@@ -257,4 +273,25 @@ test "bidirectional xref query" {
     const result = tracker.getXrefs(0x2000, .bidirectional);
     try std.testing.expectEqual(@as(usize, 0), result.from.len); // 0x2000 doesn't reference anything
     try std.testing.expectEqual(@as(usize, 2), result.to.len); // 0x2000 is referenced by 2 xrefs
+}
+
+test "large bucket-order xref merge preserves existing references and range index" {
+    var source = XrefTracker.init(std.testing.allocator, std.testing.io);
+    defer source.deinit();
+    var dest = XrefTracker.init(std.testing.allocator, std.testing.io);
+    defer dest.deinit();
+    try dest.addXref(0x1000, 0x8000, .data_read);
+    dest.finalize();
+    for (0..20000) |i| {
+        try source.addXref(0x1000 + i * 4, 0x8000 + (i % 257) * 4, .call);
+    }
+    try dest.mergeFrom(&source);
+    try std.testing.expect(!dest.sorted_finalized);
+    try std.testing.expectEqual(@as(usize, 20001), dest.count());
+    try std.testing.expectEqual(@as(usize, 2), dest.getRefsFrom(0x1000).len);
+    try std.testing.expectEqual(types.XrefType.data_read, dest.getRefsFrom(0x1000)[0].xref_type);
+    try std.testing.expectEqual(@as(usize, 79), dest.getRefsTo(0x8000).len);
+    dest.finalize();
+    try std.testing.expectEqual(@as(usize, 2), dest.getRefsFromRange(0x1000, 0x1004).len);
+    try std.testing.expectEqual(@as(usize, 20000), source.count());
 }

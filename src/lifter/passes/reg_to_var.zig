@@ -80,6 +80,12 @@ const EscapeInfo = struct {
 // ---------------------------------------------------------------------------
 
 pub fn run(allocator: std.mem.Allocator, func: *types.IRFunction) !void {
+    // Unknown instructions can read or write any architectural register.
+    // Renaming only modeled uses would disconnect them from this evidence.
+    for (func.statements) |stmt| {
+        if (stmt.type == .@"opaque" or (stmt.type == .call and stmt.args == null)) return;
+    }
+
     // Map: candidate name -> EscapeInfo.
     // Keys are borrowed from existing IR strings; no duplication necessary.
     var info = std.StringHashMap(EscapeInfo).init(allocator);

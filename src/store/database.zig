@@ -78,8 +78,28 @@ pub const Database = struct {
     /// IR results indexed by procedure entry address.
     ir_cache: std.AutoHashMap(u64, types.IRFunction),
 
+    /// v7.16 W4: dedicated arena for cached-IR CONTENT (statements, duped
+    /// operand strings, variables). Cached IR outlives the request that lifted
+    /// it, so it must NOT be allocated from a per-request arena (that was the
+    /// cross-request use-after-free). Lifting into this store-lifetime arena
+    /// keeps cached IR valid for the doc's life and frees it all in one shot on
+    /// `deinit` — no per-string ownership tracking, no double-free risk.
+    ir_arena: std.heap.ArenaAllocator,
+
+    /// v7.16 W4: guards ALL access to `ir_cache` + `ir_arena`. Lifting happens
+    /// under only the SHARED rw_lock, so concurrent lifts on one doc would race
+    /// on the non-thread-safe ArenaAllocator + AutoHashMap. This mutex serializes
+    /// the check+lift+put in `ensureLiftedIR` and the map read in `getCachedIR`
+    /// (mirrors the call_index_mutex pattern). Always taken AFTER rw_lock; the
+    /// lift path never re-acquires rw_lock, so no lock-order inversion.
+    ir_mutex: std.Io.Mutex,
+
     /// CFG results indexed by procedure entry address.
     cfg_cache: std.AutoHashMap(u64, types.CfgResult),
+    /// Cached graphs own their slices independently of tool-request arenas.
+    /// Immutable once inserted; readers may use them after releasing this lock.
+    cfg_arena: std.heap.ArenaAllocator,
+    cfg_mutex: std.Io.Mutex,
 
     /// Pre-lowercased string cache for fast case-insensitive search.
     /// Built lazily on first case-insensitive query, invalidated on addString.
@@ -102,8 +122,17 @@ pub const Database = struct {
             .instructions = std.AutoHashMap(u64, types.Instruction).init(allocator),
             .symbols = std.AutoHashMap(u64, []const u8).init(allocator),
             .ir_cache = std.AutoHashMap(u64, types.IRFunction).init(allocator),
+            .ir_arena = std.heap.ArenaAllocator.init(allocator),
+            .ir_mutex = .init,
             .cfg_cache = std.AutoHashMap(u64, types.CfgResult).init(allocator),
+            .cfg_arena = std.heap.ArenaAllocator.init(allocator),
+            .cfg_mutex = .init,
         };
+    }
+
+    /// Store-lifetime allocator for cached-IR content (see `ir_arena`).
+    pub fn irAllocator(self: *Database) std.mem.Allocator {
+        return self.ir_arena.allocator();
     }
 
     pub fn deinit(self: *Database) void {
@@ -129,7 +158,9 @@ pub const Database = struct {
         self.instructions.deinit();
         self.symbols.deinit();
         self.ir_cache.deinit();
+        self.ir_arena.deinit(); // frees all cached-IR content in one shot
         self.cfg_cache.deinit();
+        self.cfg_arena.deinit();
     }
 
     // ========================================================================
@@ -209,8 +240,8 @@ pub const Database = struct {
             while (i < result.count) : (i += 1) {
                 var j: u8 = i;
                 while (j > 0) {
-                    const a_conf = @intFromEnum(result.items[j].confidence);
-                    const b_conf = @intFromEnum(result.items[j - 1].confidence);
+                    const a_conf = @backingInt(result.items[j].confidence);
+                    const b_conf = @backingInt(result.items[j - 1].confidence);
                     if (a_conf > b_conf or
                         (a_conf == b_conf and
                             absDiff(result.items[j].proc.entry, address) <
@@ -458,11 +489,19 @@ pub const Database = struct {
     // IR Cache
     // ========================================================================
 
-    pub fn cacheIR(self: *Database, address: u64, ir: types.IRFunction) !void {
-        try self.ir_cache.put(address, ir);
-    }
+    // v7.16 W4: the old unlocked `cacheIR` helper was removed — it would have
+    // bypassed `ir_mutex`. The sole writer (`ensureLiftedIR`) puts into
+    // `ir_cache` directly while holding the mutex.
 
-    pub fn getCachedIR(self: *const Database, address: u64) ?types.IRFunction {
+    /// v7.16 W4: takes `ir_mutex` so a concurrent lift (map put + arena alloc)
+    /// under the shared rw_lock can't corrupt the map mid-read. The returned
+    /// IRFunction is a value copy; its slices point into the append-only
+    /// `ir_arena` (never freed until deinit), so they stay valid after unlock.
+    /// NOTE: callers already holding `ir_mutex` (ensureLiftedIR) must use the
+    /// raw `ir_cache` map directly to avoid re-entrant lock.
+    pub fn getCachedIR(self: *Database, address: u64) ?types.IRFunction {
+        self.ir_mutex.lockUncancelable(self.io);
+        defer self.ir_mutex.unlock(self.io);
         return self.ir_cache.get(address);
     }
 
@@ -471,10 +510,24 @@ pub const Database = struct {
     // ========================================================================
 
     pub fn cacheCfg(self: *Database, address: u64, cfg_result: types.CfgResult) !void {
-        try self.cfg_cache.put(address, cfg_result);
+        self.cfg_mutex.lockUncancelable(self.io);
+        defer self.cfg_mutex.unlock(self.io);
+        if (self.cfg_cache.contains(address)) return;
+        const a = self.cfg_arena.allocator();
+        const blocks = try a.dupe(types.BasicBlock, cfg_result.basic_blocks);
+        for (blocks) |*block| {
+            block.successors = try a.dupe(u64, block.successors);
+            block.predecessors = try a.dupe(u64, block.predecessors);
+        }
+        try self.cfg_cache.put(address, .{
+            .basic_blocks = blocks,
+            .edges = try a.dupe(types.CfgEdge, cfg_result.edges),
+        });
     }
 
-    pub fn getCachedCfg(self: *const Database, address: u64) ?types.CfgResult {
+    pub fn getCachedCfg(self: *Database, address: u64) ?types.CfgResult {
+        self.cfg_mutex.lockUncancelable(self.io);
+        defer self.cfg_mutex.unlock(self.io);
         return self.cfg_cache.get(address);
     }
 
@@ -937,4 +990,36 @@ test "database stats" {
     try std.testing.expectEqual(@as(u32, 1), stats.procedure_count);
     try std.testing.expectEqual(@as(u32, 1), stats.string_count);
     try std.testing.expectEqual(@as(u32, 1), stats.import_count);
+}
+
+fn cfgCacheOwnershipTest(a: std.mem.Allocator) !void {
+    var db = Database.init(a, std.testing.io);
+    defer db.deinit();
+    var successors = [_]u64{0x1010};
+    var predecessors = [_]u64{0x1000};
+    var blocks = [_]types.BasicBlock{
+        .{ .start = 0x1000, .size = 4, .instruction_count = 1, .successors = &successors, .predecessors = &.{}, .terminator = .jump },
+        .{ .start = 0x1010, .size = 4, .instruction_count = 1, .successors = &.{}, .predecessors = &predecessors, .terminator = .@"return" },
+    };
+    var edges = [_]types.CfgEdge{.{ .from = 0x1000, .to = 0x1010, .edge_type = .unconditional }};
+    try db.cacheCfg(0x1000, .{ .basic_blocks = &blocks, .edges = &edges });
+    successors[0] = 0xdead;
+    predecessors[0] = 0xbeef;
+    blocks[0].start = 0x1004;
+    edges[0].to = 0xdead;
+    const cached = db.getCachedCfg(0x1000).?;
+    try std.testing.expectEqual(@as(u64, 0x1000), cached.basic_blocks[0].start);
+    try std.testing.expectEqual(@as(u64, 0x1010), cached.basic_blocks[0].successors[0]);
+    try std.testing.expectEqual(@as(u64, 0x1000), cached.basic_blocks[1].predecessors[0]);
+    try std.testing.expectEqual(@as(u64, 0x1010), cached.edges[0].to);
+    try db.cacheCfg(0x1000, .{ .basic_blocks = &.{}, .edges = &.{} });
+    try std.testing.expectEqual(@as(usize, 2), db.getCachedCfg(0x1000).?.basic_blocks.len);
+}
+
+test "CFG cache owns immutable graph slices independently of requests" {
+    try cfgCacheOwnershipTest(std.testing.allocator);
+}
+
+test "CFG cache copy cleans up allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, cfgCacheOwnershipTest, .{});
 }

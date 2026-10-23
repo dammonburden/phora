@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const types = @import("../../types.zig");
+const util = @import("pass_util.zig");
 
 const NUM_ARG_REGS: usize = 8;
 
@@ -32,9 +33,9 @@ const State = struct {
     fn init(allocator: std.mem.Allocator) State {
         return .{
             .allocator = allocator,
-            .last_write = .{null} ** NUM_ARG_REGS,
-            .owned = .{false} ** NUM_ARG_REGS,
-            .written = .{false} ** NUM_ARG_REGS,
+            .last_write = @splat(null),
+            .owned = @splat(false),
+            .written = @splat(false),
             .high_water = 0,
         };
     }
@@ -78,7 +79,7 @@ const State = struct {
 fn parseArgName(name: []const u8) ?usize {
     if (name.len < 4) return null;
     if (!std.mem.startsWith(u8, name, "arg")) return null;
-    const tail = name[3..];
+    const tail = if (std.mem.endsWith(u8, name, "_32")) name[3 .. name.len - 3] else name[3..];
     // Single-digit only (we cap at 8 args). Reject "arg10", "arg-1", etc.
     if (tail.len != 1) return null;
     const c = tail[0];
@@ -88,24 +89,32 @@ fn parseArgName(name: []const u8) ?usize {
     return idx;
 }
 
+/// Legacy alias-based heuristic for callers that already established their
+/// alias convention. Excluded from liftProcedureMature: argN display labels
+/// alone cannot certify the platform ABI, call arity or argument types.
 /// Run the call_arg_fixup pass on a single function.
 pub fn run(allocator: std.mem.Allocator, func: *types.IRFunction) !void {
     var state = State.init(allocator);
     defer state.deinit();
 
     for (func.statements) |*stmt| {
+        if (stmt.block_start) state.reset();
         switch (stmt.type) {
             .assign => {
                 // Track writes to argN; do not disturb state for other dests.
                 const dest = stmt.dest orelse continue;
                 const src = stmt.src orelse continue;
                 if (parseArgName(dest)) |idx| {
-                    try state.recordWrite(idx, src);
+                    // Replaying a historical expression at the call can read
+                    // a later value of its source register. Only literals are
+                    // timeless; retain the current argument register otherwise.
+                    const value = if (util.isLiteral(src) and !std.mem.endsWith(u8, dest, "_32")) src else dest;
+                    try state.recordWrite(idx, value);
                 }
             },
             .call => {
                 // Respect lifter-provided args if already populated.
-                if (stmt.args == null and state.high_water > 0) {
+                if (stmt.args == null and state.high_water > 0 and allWritten(state.written[0..state.high_water])) {
                     const k = state.high_water;
                     var out = try allocator.alloc([]const u8, k);
                     var filled: usize = 0;
@@ -140,7 +149,14 @@ pub fn run(allocator: std.mem.Allocator, func: *types.IRFunction) !void {
                 // stale arg writes don't leak into the next call site.
                 state.reset();
             },
-            .branch, .@"return" => {
+            .load => {
+                // Loads define the destination too. Its value at the call is
+                // the register itself, not a stale earlier assignment.
+                if (stmt.dest) |dest| {
+                    if (parseArgName(dest)) |idx| try state.recordWrite(idx, dest);
+                }
+            },
+            .@"opaque", .branch, .@"return" => {
                 state.reset();
             },
             else => {
@@ -148,6 +164,11 @@ pub fn run(allocator: std.mem.Allocator, func: *types.IRFunction) !void {
             },
         }
     }
+}
+
+fn allWritten(written: []const bool) bool {
+    for (written) |value| if (!value) return false;
+    return true;
 }
 
 // ============================================================================
@@ -323,10 +344,10 @@ test "later write to same argN overwrites earlier value" {
     try std.testing.expectEqualStrings("0x2", args[0]);
 }
 
-test "gap in arg writes is filled with placeholder" {
+test "gap in arg writes does not invent positional arguments" {
     const a = std.testing.allocator;
 
-    // arg2 written but arg0/arg1 are not. K=3, with placeholders for 0 and 1.
+    // A high argument-register write cannot establish earlier arguments.
     var stmts = [_]types.IRStatement{
         .{ .type = .assign, .address = 0x1000, .dest = "arg2", .src = "0xc" },
         .{ .type = .call, .address = 0x1004, .target = "f" },
@@ -346,11 +367,7 @@ test "gap in arg writes is filled with placeholder" {
         }
     }
 
-    const args = func.statements[1].args orelse return error.TestExpectedArgs;
-    try std.testing.expectEqual(@as(usize, 3), args.len);
-    try std.testing.expectEqualStrings("arg0", args[0]);
-    try std.testing.expectEqualStrings("arg1", args[1]);
-    try std.testing.expectEqualStrings("0xc", args[2]);
+    try std.testing.expect(func.statements[1].args == null);
 }
 
 test "no arg writes leaves args null" {
@@ -381,4 +398,26 @@ test "empty function does not crash" {
         .variables = vars[0..],
     };
     try run(a, &func);
+}
+
+test "evidence: argument load and expression source overwrite cannot reuse stale values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var stmts = [_]types.IRStatement{
+        .{ .type = .assign, .address = 0, .dest = "arg0", .src = "arg1" },
+        .{ .type = .assign, .address = 4, .dest = "arg1", .src = "7" },
+        .{ .type = .call, .address = 8, .target = "first" },
+        .{ .type = .assign, .address = 12, .dest = "arg0", .src = "42" },
+        .{ .type = .load, .address = 16, .dest = "arg0", .src = "[x1]" },
+        .{ .type = .call, .address = 20, .target = "second" },
+        .{ .type = .assign, .address = 24, .dest = "arg0", .src = "99" },
+        .{ .type = .@"opaque", .address = 28, .op = "unknown" },
+        .{ .type = .call, .address = 32, .target = "third" },
+    };
+    var func = types.IRFunction{ .address = 0, .statements = &stmts, .variables = &.{} };
+    try run(arena.allocator(), &func);
+    try std.testing.expectEqualStrings("arg0", stmts[2].args.?[0]);
+    try std.testing.expectEqualStrings("7", stmts[2].args.?[1]);
+    try std.testing.expectEqualStrings("arg0", stmts[5].args.?[0]);
+    try std.testing.expect(stmts[8].args == null);
 }

@@ -440,6 +440,7 @@ fn parseMacho(
     const cmds_end = cmd_offset + sizeofcmds;
     if (cmds_end > slice_end) return MachoError.TruncatedLoadCommand;
 
+    var function_starts_command: ?usize = null;
     var cmd_index: u32 = 0;
     while (cmd_index < ncmds) : (cmd_index += 1) {
         if (cmd_offset + @sizeOf(LoadCommand) > cmds_end) break;
@@ -456,12 +457,19 @@ fn parseMacho(
             LC_MAIN => parseEntryPoint(data, cmd_offset, needs_swap, &result),
             LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_ID_DYLIB => parseDylib(allocator, data, cmd_offset, cmdsize, needs_swap, &result),
             LC_DYSYMTAB => parseDysymtab(data, cmd_offset, needs_swap, &result),
-            LC_FUNCTION_STARTS => try parseFunctionStarts(allocator, data, cmd_offset, slice_offset, slice_end, needs_swap, &result),
+            LC_FUNCTION_STARTS => {
+                if (cmdsize < 16) return MachoError.InvalidLoadCommand;
+                function_starts_command = cmd_offset;
+            },
             else => {},
         }
 
         cmd_offset += cmdsize;
     }
+
+    // Decode after all segments: load-command order must not affect __TEXT base.
+    if (function_starts_command) |off|
+        try parseFunctionStarts(allocator, data, off, slice_offset, slice_end, needs_swap, &result);
 
     // Resolve undefined symbols as imports
     try resolveImports(allocator, &result);
@@ -494,9 +502,23 @@ fn parseMacho(
     doc.is_stripped = result.has_dysymtab and result.nlocalsym == 0;
     // Mach-O doesn't have RELRO — leave defaults (false)
 
-    // Create procedure stubs from defined symbols
+    // Keep only code-backed starts. A structurally malformed stream was already
+    // discarded in full; valid entries outside instruction sections are not code.
+    var valid_starts: usize = 0;
+    for (result.func_starts.items) |addr| {
+        if (doc.codeRangeEnd(addr) == null) continue;
+        result.func_starts.items[valid_starts] = addr;
+        valid_starts += 1;
+    }
+    result.func_starts.shrinkRetainingCapacity(valid_starts);
+    doc.linker_function_starts = result.func_starts.toOwnedSlice() catch return MachoError.OutOfMemory;
+
+    // Only instruction-section symbols can be functions. Data and header
+    // symbols remain available through the symbol table, not procedure entries.
     for (result.symbols.items) |sym| {
-        if (!sym.is_undefined and sym.section != 0 and sym.address != 0) {
+        if (!sym.is_undefined and sym.section != 0 and sym.address != 0 and
+            doc.codeRangeEnd(sym.address) != null and doc.permitsProcedureStart(sym.address))
+        {
             doc.procedures.append(.{
                 .entry = sym.address,
                 .size = 0, // Size will be determined by the analysis engine
@@ -513,7 +535,7 @@ fn parseMacho(
         for (doc.procedures.items) |p| {
             proc_set.put(p.entry, {}) catch {};
         }
-        for (result.func_starts.items) |addr| {
+        for (doc.linker_function_starts) |addr| {
             if (!proc_set.contains(addr)) {
                 proc_set.put(addr, {}) catch {};
                 doc.procedures.append(.{
@@ -528,29 +550,27 @@ fn parseMacho(
     // Compute procedure sizes by sorting and using next-procedure boundaries.
     // LC_FUNCTION_STARTS and symbol procedures are added with size=0; fix that here.
     {
+        const sorted = doc.procedures.items;
+        std.mem.sort(types.Procedure, sorted, {}, struct {
+            fn lessThan(_: void, a: types.Procedure, b: types.Procedure) bool {
+                return a.entry < b.entry;
+            }
+        }.lessThan);
+        var unique: usize = 0;
+        for (sorted) |proc| {
+            if (unique > 0 and sorted[unique - 1].entry == proc.entry) continue;
+            sorted[unique] = proc;
+            unique += 1;
+        }
+        doc.procedures.shrinkRetainingCapacity(unique);
+        // Size recovery borrows element pointers after deduplication is done.
+        doc.procedures.lockPointers();
+        defer doc.procedures.unlockPointers();
         const procs = doc.procedures.items;
-        if (procs.len > 1) {
-            // Sort procedures by entry address
-            std.mem.sort(types.Procedure, procs, {}, struct {
-                fn lessThan(_: void, a: types.Procedure, b: types.Procedure) bool {
-                    return a.entry < b.entry;
-                }
-            }.lessThan);
-
-            // Set size = next.entry - this.entry for each procedure (only if size is 0)
-            for (procs[0 .. procs.len - 1], 0..) |*p, idx| {
-                if (p.size == 0) {
-                    p.size = procs[idx + 1].entry - p.entry;
-                }
-            }
-            // Last procedure: use a reasonable default size of 64 bytes
-            if (procs[procs.len - 1].size == 0) {
-                procs[procs.len - 1].size = 64;
-            }
-        } else if (procs.len == 1) {
-            if (procs[0].size == 0) {
-                procs[0].size = 64;
-            }
+        for (procs, 0..) |*p, idx| {
+            var end = doc.codeRangeEnd(p.entry) orelse p.entry;
+            if (idx + 1 < procs.len) end = @min(end, procs[idx + 1].entry);
+            p.size = end - p.entry;
         }
     }
 
@@ -667,6 +687,7 @@ fn parseSegment64(
             .file_offset = slice_offset + maybeSwap32(sh.offset, needs_swap),
             .alignment = maybeSwap32(sh.@"align", needs_swap),
             .is_zerofill = is_zf,
+            .is_code = (sh_flags & 0x80000400) != 0, // PURE_INSTRUCTIONS | SOME_INSTRUCTIONS
         };
         sections.append(sect) catch return MachoError.OutOfMemory;
         sect_offset += @sizeOf(SectionHeader64);
@@ -796,8 +817,6 @@ fn parseDysymtab(data: []const u8, offset: usize, needs_swap: bool, result: *Par
     result.has_dysymtab = true;
 }
 
-/// Parse LC_FUNCTION_STARTS — the linker's definitive list of function entry points.
-/// This is the most accurate function detection possible: the compiler/linker knows
 /// Find the reserved1 field of a section header by scanning raw Mach-O load commands.
 /// reserved1 is the indirect symbol table starting index for stub/GOT sections.
 fn findSectionReserved1(data: []const u8, sect_name: []const u8, seg_name: []const u8) ?usize {
@@ -832,7 +851,10 @@ fn findSectionReserved1(data: []const u8, sect_name: []const u8, seg_name: []con
     return null;
 }
 
-/// exactly where every function starts. ULEB128-encoded deltas from __text vmaddr.
+/// Decode unsigned deltas relative to __TEXT. Mach-O linkedit offsets are
+/// always relative to the selected slice, even when they numerically overlap
+/// absolute offsets in a universal file. Never accept a partial malformed list:
+/// it would incorrectly suppress discovery in the rest of the code section.
 fn parseFunctionStarts(
     _: std.mem.Allocator,
     data: []const u8,
@@ -841,42 +863,38 @@ fn parseFunctionStarts(
     slice_end: usize,
     needs_swap: bool,
     result: *ParseResult,
-) !void {
-    _ = needs_swap;
-    if (offset + 16 > data.len) return;
-
-    const dataoff = std.mem.readInt(u32, data[offset + 8 ..][0..4], .little);
-    const datasize = std.mem.readInt(u32, data[offset + 12 ..][0..4], .little);
-
-    // Adjust for FAT binary slice offset
-    const abs_off = if (dataoff >= slice_offset and dataoff < slice_end)
-        dataoff
-    else
-        dataoff + @as(u32, @intCast(slice_offset));
-
-    if (abs_off + datasize > data.len) return;
+) MachoError!void {
+    if (offset > data.len or data.len - offset < 16) return;
+    const dataoff = maybeSwap32(std.mem.readInt(u32, data[offset + 8 ..][0..4], .little), needs_swap);
+    const datasize = maybeSwap32(std.mem.readInt(u32, data[offset + 12 ..][0..4], .little), needs_swap);
+    if (slice_end > data.len or slice_offset > slice_end) return;
+    if (dataoff > slice_end - slice_offset or datasize > slice_end - slice_offset - dataoff) return;
+    const abs_off = slice_offset + dataoff;
     const fs_data = data[abs_off .. abs_off + datasize];
-
-    // First function is at text_vmaddr (added by caller or entry point)
+    var valid = false;
+    defer if (!valid) result.func_starts.clearRetainingCapacity();
     var addr = result.text_vmaddr;
-
     var i: usize = 0;
     while (i < fs_data.len) {
-        // Read ULEB128 delta
         var delta: u64 = 0;
-        var shift: u6 = 0;
-        while (i < fs_data.len) {
+        var lane: usize = 0;
+        while (true) : (lane += 1) {
+            if (i == fs_data.len or lane == 10) return;
             const byte = fs_data[i];
             i += 1;
-            delta |= @as(u64, byte & 0x7F) << shift;
-            if (shift < 63) {
-                shift += 7;
-            }
+            // A u64 ULEB has one usable bit in its tenth byte.
+            if (lane == 9 and byte > 1) return;
+            delta |= @as(u64, byte & 0x7f) << @as(u6, @intCast(lane * 7));
             if (byte < 0x80) break;
         }
-        if (delta == 0) break;
-        addr += delta;
-        result.func_starts.append(addr) catch {};
+        if (delta == 0) {
+            // Only zero padding may follow the terminator.
+            for (fs_data[i..]) |byte| if (byte != 0) return;
+            valid = true;
+            return;
+        }
+        addr = std.math.add(u64, addr, delta) catch return;
+        result.func_starts.append(addr) catch return MachoError.OutOfMemory;
     }
 }
 
@@ -1107,4 +1125,151 @@ test "parse /bin/ls (real Mach-O)" {
     // Should have imports (undefined external symbols) — /bin/ls is stripped
     // so it has many undefined symbols but few defined ones
     try std.testing.expect(doc.imports.items.len > 0);
+}
+
+// Two linker functions contain an early return, a local named code label, an
+// internal call target, and a second frame setup. Those are not extra entries.
+fn boundaryFixture() [1024]u8 {
+    var data: [1024]u8 = @splat(0);
+    const W = struct {
+        fn u32le(bytes: []u8, at: usize, value: u32) void {
+            std.mem.writeInt(u32, bytes[at..][0..4], value, .little);
+        }
+        fn u64le(bytes: []u8, at: usize, value: u64) void {
+            std.mem.writeInt(u64, bytes[at..][0..8], value, .little);
+        }
+        fn name(bytes: []u8, at: usize, value: []const u8) void {
+            @memcpy(bytes[at..][0..value.len], value);
+        }
+    };
+    const base: u64 = 0x100000000;
+    W.u32le(&data, 0, MH_MAGIC_64);
+    W.u32le(&data, 4, CPU_TYPE_ARM64);
+    W.u32le(&data, 12, MH_EXECUTE);
+    W.u32le(&data, 16, 4);
+    W.u32le(&data, 20, 216);
+    W.u32le(&data, 32, LC_SEGMENT_64);
+    W.u32le(&data, 36, 152);
+    W.name(&data, 40, "__TEXT");
+    W.u64le(&data, 56, base);
+    W.u64le(&data, 64, 1024);
+    W.u64le(&data, 80, 1024);
+    W.u32le(&data, 88, 5);
+    W.u32le(&data, 92, 5);
+    W.u32le(&data, 96, 1);
+    W.name(&data, 104, "__text");
+    W.name(&data, 120, "__TEXT");
+    W.u64le(&data, 136, base + 0x200);
+    W.u64le(&data, 144, 0x80);
+    W.u32le(&data, 152, 0x200);
+    W.u32le(&data, 168, 0x80000400);
+    W.u32le(&data, 184, LC_SYMTAB);
+    W.u32le(&data, 188, 24);
+    W.u32le(&data, 192, 0x300);
+    W.u32le(&data, 196, 3);
+    W.u32le(&data, 200, 0x350);
+    const names = "\x00_main\x00L_cold\x00_next\x00";
+    W.u32le(&data, 204, names.len);
+    W.name(&data, 0x350, names);
+    W.u32le(&data, 208, LC_FUNCTION_STARTS);
+    W.u32le(&data, 212, 16);
+    W.u32le(&data, 216, 0x380);
+    W.u32le(&data, 220, 4);
+    W.name(&data, 0x380, "\x80\x04\x40\x00");
+    W.u32le(&data, 224, LC_MAIN);
+    W.u32le(&data, 228, 24);
+    W.u64le(&data, 232, 0x200);
+    for ([_]u64{ 0x200, 0x208, 0x240 }, [_]u32{ 1, 7, 14 }, 0..) |address, str_off, i| {
+        const at = 0x300 + i * 16;
+        W.u32le(&data, at, str_off);
+        data[at + 4] = 0x0f;
+        data[at + 5] = 1;
+        W.u64le(&data, at + 8, base + address);
+    }
+    W.u32le(&data, 0x200, 0x34000040); // cbz w0, +8
+    W.u32le(&data, 0x204, 0xd65f03c0); // early ret
+    W.u32le(&data, 0x208, 0xa9bf7bfd); // internal frame setup
+    W.u32le(&data, 0x20c, 0x94000001); // bl +4: local helper label
+    W.u32le(&data, 0x210, 0xd65f03c0);
+    W.u32le(&data, 0x240, 0xd65f03c0);
+    return data;
+}
+
+test "linker boundaries survive internal labels returns and call targets in thin and FAT images" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const thin = boundaryFixture();
+    // slice offset 0x100 < function dataoff 0x380 < slice end 0x500.
+    // Guessing that dataoff is absolute therefore reads the wrong bytes.
+    var fat: [1280]u8 = @splat(0);
+    @memcpy(fat[256..], &thin);
+    std.mem.writeInt(u32, fat[0..4], FAT_MAGIC, .big);
+    std.mem.writeInt(u32, fat[4..8], 1, .big);
+    std.mem.writeInt(u32, fat[8..12], CPU_TYPE_ARM64, .big);
+    std.mem.writeInt(u32, fat[16..20], 256, .big);
+    std.mem.writeInt(u32, fat[20..24], thin.len, .big);
+    std.mem.writeInt(u32, fat[24..28], 8, .big);
+    for ([_][]const u8{ &thin, &fat }) |bytes| {
+        var doc = try parse(a, 1, "linker-boundaries", bytes, .{});
+        defer doc.deinit();
+        try t.expectEqualSlices(u64, &.{ 0x100000200, 0x100000240 }, doc.linker_function_starts);
+        try t.expectEqual(@as(usize, 2), doc.procedures.items.len);
+        try t.expectEqual(@as(u64, 0x40), doc.procedures.items[0].size);
+        try t.expectEqualStrings("_main", doc.procedures.items[0].name.?);
+        try t.expectEqualStrings("_next", doc.procedures.items[1].name.?);
+        var analysis = try @import("../analysis/pipeline.zig").analyzeLean(a, t.io, &doc, bytes);
+        defer analysis.deinit(a);
+        try t.expectEqual(@as(usize, 2), doc.procedures.items.len);
+        try t.expectEqual(@as(usize, 2), analysis.procedures.len);
+        try t.expectEqual(@as(u64, 0x100000200), analysis.procedures[0].entry);
+        try t.expectEqual(@as(u64, 0x100000240), analysis.procedures[1].entry);
+        try t.expect(!doc.permitsProcedureStart(0x100000208));
+        try t.expect(doc.permitsProcedureStart(0x100000240));
+    }
+}
+
+test "malformed linker streams discard all partial entries and restore heuristic discovery" {
+    const t = std.testing;
+    const streams = [_][]const u8{
+        "\x80\x04\x80", // incomplete second ULEB
+        "\x80\x04", // missing terminator
+        "\x80\x04\xff\xff\xff\xff\xff\xff\xff\xff\xff\x02", // ULEB overflow
+        "\x80\x04\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01\x00", // address overflow
+        "\x80\x04\x00\x01", // nonzero data after terminator
+    };
+    for (streams) |stream| {
+        var arena = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var bytes = boundaryFixture();
+        @memcpy(bytes[0x380..][0..stream.len], stream);
+        std.mem.writeInt(u32, bytes[220..224], @intCast(stream.len), .little);
+        var doc = try parse(a, 1, "malformed-starts", &bytes, .{});
+        defer doc.deinit();
+        try t.expectEqual(@as(usize, 0), doc.linker_function_starts.len);
+        try t.expect(doc.permitsProcedureStart(0x100000208));
+        try t.expectEqual(@as(usize, 3), doc.procedures.items.len);
+        var analysis = try @import("../analysis/pipeline.zig").analyzeLean(a, t.io, &doc, &bytes);
+        defer analysis.deinit(a);
+        try t.expect(analysis.procedures.len > 3);
+    }
+}
+
+test "function starts are endian aware and constrained to the selected slice" {
+    const t = std.testing;
+    var result = ParseResult.init(t.allocator);
+    defer result.deinit();
+    result.text_vmaddr = 0x1000;
+    var bytes: [96]u8 = @splat(0);
+    std.mem.writeInt(u32, bytes[8..12], 64, .big);
+    std.mem.writeInt(u32, bytes[12..16], 3, .big);
+    @memcpy(bytes[64..67], "\x10\x04\x00");
+    try parseFunctionStarts(t.allocator, &bytes, 0, 0, bytes.len, true, &result);
+    try t.expectEqualSlices(u64, &.{ 0x1010, 0x1014 }, result.func_starts.items);
+    result.func_starts.clearRetainingCapacity();
+    // Bytes exist in the outer universal file but are outside this slice.
+    try parseFunctionStarts(t.allocator, &bytes, 0, 0, 64, true, &result);
+    try t.expectEqual(@as(usize, 0), result.func_starts.items.len);
 }

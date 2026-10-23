@@ -3,6 +3,13 @@
 // Uses the real json.zig and database.zig interfaces.
 
 const std = @import("std");
+const arm64_steps = @import("analysis/arm64_steps.zig");
+const arm64_loop_state = @import("analysis/arm64_loop_state.zig");
+const arm64_semantics = @import("analysis/arm64_semantics.zig");
+const arm64_addressing = @import("analysis/arm64_addressing.zig");
+const arm64_arithmetic = @import("analysis/arm64_arithmetic.zig");
+const arm64_branch_predicate = @import("analysis/arm64_branch_predicate.zig");
+const arm64_bitfield = @import("analysis/arm64_bitfield.zig");
 const builtin = @import("builtin");
 const runtime = @import("runtime.zig");
 const types = @import("types.zig");
@@ -17,8 +24,10 @@ const pipeline = @import("analysis/pipeline.zig");
 const strings_mod = @import("analysis/strings.zig");
 const lifter = @import("lifter/lift.zig");
 const cfg_mod = @import("analysis/cfg.zig");
-const structure_mod = @import("analysis/structure.zig");
-const analysis_types = @import("analysis/types.zig");
+const loops_mod = @import("analysis/loops.zig");
+const register_flow = @import("analysis/register_flow.zig");
+const abi_mod = @import("analysis/abi.zig");
+const type_recovery = @import("analysis/types.zig");
 const swift_mod = @import("analysis/swift.zig");
 const arm64 = @import("arch/arm64.zig");
 const arm32 = @import("arch/arm32.zig");
@@ -109,7 +118,7 @@ pub const tool_definitions = [_]ToolDef{
     },
     .{
         .name = "get_binary_context",
-        .description = "Adaptive context planner — call FIRST after load_binary. mode=auto picks full enumeration for tiny binaries (<=200 KiB, <=200 procs), guided ranking via get_remake_frontier for medium binaries, or a lightweight manifest for huge/opaque ones (>100 MiB or >30000 procs). One call replaces 5-10 exploratory load_binary→get_strings→get_imports→get_segments→decompile→get_embedded_resources fan-outs.",
+        .description = "Adaptive context planner — call FIRST after load_binary. mode=auto picks full enumeration for tiny binaries (<=200 KiB, <=200 procs), guided ranking via get_remake_frontier for medium binaries, or a lightweight manifest for huge/opaque ones (>100 MiB or >30000 procs). Tiny single-procedure ARM64 full contexts use compact execution steps with current carried values; other architectures retain disassembly/provenance. control_flow_evidence.instruction_view identifies the CFG shape; follow its next_call if deferred. Interpret instructions in CFG edge order, not increasing address order. One call replaces 5-10 exploratory load_binary→get_strings→get_imports→get_segments→get_cfg→get_embedded_resources fan-outs.",
         .input_schema =
         \\{
         \\  "type": "object",
@@ -141,7 +150,7 @@ pub const tool_definitions = [_]ToolDef{
         \\    "max_chars": {"type": "integer", "default": 80000, "maximum": 200000, "description": "Hard cap on response length (bytes)."},
         \\    "max_candidates": {"type": "integer", "default": 24, "maximum": 128, "description": "Frontier candidate cap."},
         \\    "max_batch": {"type": "integer", "default": 12, "maximum": 50, "description": "Frontier parallel-batch cap."},
-        \\    "include_bytes": {"type": "boolean", "default": false, "description": "Mode=full: emit per-section compact-hex bytes (zero runs squelched). Off by default — bytes inflate response 5-10x."}
+        \\    "include_bytes": {"type": "boolean", "default": false, "description": "Mode=full: add bounded per-section raw-byte previews with explicit zero-run encoding and read_bytes continuations. Off by default; up to 4096 bytes per section and 16384 total preview bytes."}
         \\  },
         \\  "required": [],
         \\  "additionalProperties": false
@@ -153,7 +162,7 @@ pub const tool_definitions = [_]ToolDef{
     },
     .{
         .name = "get_remake_frontier",
-        .description = "Deterministic harness-native planner: ranks the next functions/subsystems to inspect for remaking a binary, explains the evidence, and emits exact parallel MCP calls to fan out next. Use as the first call in an LLM-driven remake loop — feeds get_semantic_slice view=remake / decompile / suggest_names with prioritized targets instead of brute-forcing every procedure. Read-only; performs no full decompilation itself. For tiny binaries, `get_binary_context mode=auto` returns enumeration directly (skips frontier ranking when full enumeration is cheaper).",
+        .description = "Deterministic harness-native planner: ranks the next functions/subsystems to inspect for remaking a binary, explains the evidence, and emits exact parallel MCP calls to fan out next. Use as the first call in an LLM-driven remake loop — feeds get_semantic_slice view=remake / get_cfg / suggest_names with prioritized targets instead of brute-forcing every procedure. Read-only; does not lift functions implicitly. For tiny binaries, `get_binary_context mode=auto` returns enumeration directly (skips frontier ranking when full enumeration is cheaper).",
         .input_schema =
         \\{
         \\  "type": "object",
@@ -202,32 +211,8 @@ pub const tool_definitions = [_]ToolDef{
         ,
     },
     .{
-        .name = "decompile",
-        .description = "Render N functions as a coherent C-like translation unit with inferred struct typedefs, resolved imports, and structured control flow. Use this when you want the cleanest possible recovered source. Distinct from `lift` (raw IR / per-function) and `get_semantic_slice` (multi-function context pack with strings/imports). Pass `scope=\"cluster\"` to expand to nearby/related functions in one call (capped by `max_cluster`). For tiny binaries (<128 KiB), `get_binary_context mode=full` returns the whole binary including disasm in one call.",
-        .input_schema =
-        \\{
-        \\  "type": "object",
-        \\  "properties": {
-        \\    "address": {"type": "string", "description": "Entry address (hex or decimal). Required."},
-        \\    "doc_id": {"oneOf": [{"type": "integer"},{"type": "string"}], "description": "Optional; auto-picked if single doc loaded."},
-        \\    "scope": {"type": "string", "enum": ["single", "cluster"], "default": "single"},
-        \\    "max_cluster": {"type": "integer", "default": 5, "minimum": 1, "maximum": 30},
-        \\    "include_types": {"type": "boolean", "default": true},
-        \\    "include_data_refs": {"type": "boolean", "default": true},
-        \\    "include_addresses": {"type": "boolean", "default": false},
-        \\    "max_chars": {"type": "integer", "default": 30000, "minimum": 1000, "maximum": 100000}
-        \\  },
-        \\  "required": ["address"],
-        \\  "additionalProperties": false
-        \\}
-        ,
-        .annotations =
-        \\{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true}
-        ,
-    },
-    .{
         .name = "get_semantic_slice",
-        .description = "Binary-to-context compiler — the flagship RE tool. Three views: `facts` (typed structural facts: function entries, calls, jumps, data refs, string refs), `pack` (LLM-readable context with pseudocode, strings, imports, callers/callees), `remake` (structured spec with interfaces, resources, evidence — for porting/rebuilding the binary). Use scope=cluster to expand beyond seed functions when context is sparse or the binary is stripped. Response always includes seed_diagnostics so you can see how well each seed address resolved.",
+        .description = "Binary-to-context compiler — the flagship RE tool. Three views: `facts` (typed structural facts: function entries, calls, jumps, data refs, string refs), `pack` (LLM-readable instruction evidence, strings, imports, callers/callees; no implicit lifting), `remake` (structured spec with interfaces, resources, evidence — for porting/rebuilding the binary). Use scope=cluster to expand beyond seed functions when context is sparse or the binary is stripped. Response always includes seed_diagnostics so you can see how well each seed address resolved.",
         .input_schema =
         \\{
         \\  "type": "object",
@@ -255,7 +240,7 @@ pub const tool_definitions = [_]ToolDef{
         \\    "max_chars": {
         \\      "type": "integer",
         \\      "default": 12000,
-        \\      "description": "Max chars for pack/remake text (hard cap 30000)"
+        \\      "description": "Target text budget for pack/remake (clamped to 30000); fixed labels and evidence metadata may exceed this budget"
         \\    },
         \\    "kinds": {
         \\      "type": "array",
@@ -358,7 +343,7 @@ pub const tool_definitions = [_]ToolDef{
     },
     .{
         .name = "suggest_names",
-        .description = "Gather naming context for one or more procedures: pseudocode snippet, referenced strings, callers, callees, imports used. Designed to feed an LLM that will propose better function names — does not generate names itself. Use annotate with op=set_name to apply names afterward.",
+        .description = "Gather naming evidence for one or more procedures: bounded code bytes, referenced strings, callers, callees, imports used. Does not generate pseudocode. Designed to feed an LLM that will propose better function names — does not generate names itself. Use annotate with op=set_name to apply names afterward.",
         .input_schema =
         \\{
         \\  "type": "object",
@@ -754,7 +739,7 @@ pub const tool_definitions = [_]ToolDef{
     },
     .{
         .name = "get_cfg",
-        .description = "Get the control-flow graph (basic blocks, edges, terminators) for a function. Set include_disassembly=true to inline instructions per block. Note: not yet available for MIPS32.",
+        .description = "Get the control-flow graph (basic blocks, edges, terminators) for a function. Set include_disassembly=true to inline instructions per block. ARM64 instruction_view=execution implies instructions and emits compact per-block versioned execution steps plus raw bytes; opaque operations invalidate local state and omitted steps have exact byte continuations. Its detailed_provenance_call selects the legacy disassembly/provenance view. Execution is unavailable for rebased views. Omit instruction_view for legacy behavior. Pages contain at most max_blocks blocks and their outgoing edges; follow next_call to complete the graph. Pages shrink to retain inline disassembly; a single oversized block may still require disassemble_range. partial describes pagination, not complete control-flow recovery. loop_evidence derives bounded natural loops from the full recovered graph independently of pages, with header/members/latches/exits and explicit omissions; dominance is relative to recovered edges and semantic completeness remains unknown. Every traversal executes header instructions; loop-assigned registers carry their updated values, so their initializers are not invariant. Trace current register values through at least two traversals before deriving a recurrence; arithmetic hoisting requires separate invariance proof. Not yet available for MIPS32.",
         .input_schema =
         \\{
         \\  "type": "object",
@@ -773,6 +758,9 @@ pub const tool_definitions = [_]ToolDef{
         \\      ],
         \\      "description": "Function address"
         \\    },
+        \\    "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "Skip this many basic blocks"},
+        \\    "max_blocks": {"type": "integer", "minimum": 1, "maximum": 256, "default": 64, "description": "Blocks per page; outgoing edges may target blocks outside the page"},
+        \\    "instruction_view": {"type": "string", "enum": ["execution", "disassembly"], "description": "ARM64 compact execution steps or legacy disassembly; execution implies instructions. Default preserves include_disassembly behavior."},
         \\    "include_disassembly": {
         \\      "type": "boolean",
         \\      "default": false,
@@ -789,7 +777,7 @@ pub const tool_definitions = [_]ToolDef{
     },
     .{
         .name = "lift",
-        .description = "Lift one or more functions to C-like pseudocode (default) or raw IR. Supports ARM64, ARM32 (incl. Thumb), MIPS32, and x86_64. Pseudocode is the recommended output for human/LLM reading; IR is lower-level for tooling.",
+        .description = "Explicitly lift selected functions to heuristic IR. This is not validated instruction semantics. Prefer disassemble_range for encoding-backed effects and read_bytes for primary evidence. Supports ARM64, ARM32 (incl. Thumb), MIPS32, and x86_64. Pages contain statements followed by variable records; follow each result.next_call until partial is false.",
         .input_schema =
         \\{
         \\  "type": "object",
@@ -809,12 +797,8 @@ pub const tool_definitions = [_]ToolDef{
         \\      ],
         \\      "description": "Function address(es)"
         \\    },
-        \\    "format": {
-        \\      "type": "string",
-        \\      "enum": ["ir", "pseudocode"],
-        \\      "default": "pseudocode",
-        \\      "description": "Output: pseudocode (recommended) or ir"
-        \\    }
+        \\    "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "Record offset: statements first, then variables; use next_call for continuation"},
+        \\    "max_results": {"type": "integer", "minimum": 1, "maximum": 256, "default": 128, "description": "Maximum records per function page; response budget may reduce this"}
         \\  },
         \\  "required": ["doc_id", "addresses"],
         \\  "additionalProperties": false
@@ -826,7 +810,7 @@ pub const tool_definitions = [_]ToolDef{
     },
     .{
         .name = "analyze_functions",
-        .description = "Deep analysis for known function addresses (entry points). Returns IR/pseudocode, CFG, xrefs, callees, and optional semantic facts. Use this when you already know the address is a function. For arbitrary addresses where you don't know the kind, use analyze_addresses instead.",
+        .description = "Deep analysis for known function addresses (entry points). Returns CFG, xrefs, strings, callees, and optional derived IR, semantic facts, ABI register-use evidence (include=abi), or observed memory layouts (include=types). ABI defaults and layout hypotheses are not verified function prototypes or C structs. Use this when you already know the address is a function. For arbitrary addresses where you don't know the kind, use analyze_addresses instead.",
         .input_schema =
         \\{
         \\  "type": "object",
@@ -850,10 +834,10 @@ pub const tool_definitions = [_]ToolDef{
         \\      "type": "array",
         \\      "items": {
         \\        "type": "string",
-        \\        "enum": ["ir", "cfg", "xrefs", "strings", "calls", "semantics"]
+        \\        "enum": ["ir", "cfg", "xrefs", "strings", "calls", "semantics", "abi", "types"]
         \\      },
         \\      "description": "Data to include",
-        \\      "default": ["ir", "cfg", "xrefs", "calls"]
+        \\      "default": ["cfg", "xrefs", "strings", "calls"]
         \\    }
         \\  },
         \\  "required": ["doc_id", "addresses"],
@@ -906,7 +890,7 @@ pub const tool_definitions = [_]ToolDef{
     },
     .{
         .name = "disassemble_range",
-        .description = "Disassemble a byte range starting at an address. Returns instructions with mnemonics and operands. byte_length is byte count, not instruction count (cap 4096).",
+        .description = "Inspect bounded file-backed code: instructions, exact bytes, file offsets, and semantics status. ARM64 MOVZ/MOVN/MOVK have encoding-backed register effects; other instructions explicitly report unsupported. Coverage and partial-range metadata are included. byte_length is bytes, not instruction count (cap 4096).",
         .input_schema =
         \\{
         \\  "type": "object",
@@ -941,7 +925,7 @@ pub const tool_definitions = [_]ToolDef{
     },
     .{
         .name = "read_bytes",
-        .description = "Read raw bytes from any address. For whole-binary or full-segment dumps, prefer `get_binary_context mode=full` instead — it skips zero padding and won't blow the token cap. Read-only escape hatch for opaque regions where Phora's parsers can't help (packed runtimes, custom formats, hand-crafted shellcode). Length capped at 65536 bytes (64 KB). Encoding 'both' (default) returns both hex and ASCII; 'hex' or 'ascii' returns only one; 'hex_compact' returns hex bytes with no spaces and no ASCII column (densest output, ~2 chars per byte).",
+        .description = "Read raw bytes by virtual `address` OR raw `file_offset`. For small binaries, `get_binary_context mode=full include_bytes=true` adds bounded byte previews; use this tool for exact ranges and larger dumps. Primary byte evidence for direct reasoning about binary structure and behavior: use architecture, endianness and base context, then validate hypotheses with independent evidence. For code, cross-check instruction widths and loop/branch targets with disassemble_range and get_cfg. Pass `file_offset` (from `get_embedded_resources`) to carve an embedded bundle without resolving its virtual base — follow next_call to page through bounded reads. Requested length capped per page at 65536 bytes (64 KB), with smaller pages for expanded encodings. Address reads stop at mapping/backing boundaries. For numeric tables, pass element_size (1/2/4/8) and explicit byte_order (little/big) to receive exact unsigned decimal strings; at most 256 elements per typed read. Copy every table value, including repeated or exceptional entries. ASCII is a lossy printable preview: dots replace nonprintable bytes; use hex for byte identity. Encoding 'both' (default) returns both hex and ASCII; 'hex' or 'ascii' returns only one; 'hex_compact' returns hex bytes with no spaces and no ASCII column (densest output, ~2 chars per byte).",
         .input_schema =
         \\{
         \\  "type": "object",
@@ -958,13 +942,21 @@ pub const tool_definitions = [_]ToolDef{
         \\        {"type": "integer", "description": "Address (numeric)"},
         \\        {"type": "string", "description": "Hex address like 0x100000000"}
         \\      ],
-        \\      "description": "Virtual address to read from (rebase-aware)"
+        \\      "description": "Virtual address to read from (rebase-aware). Omit if using file_offset."
+        \\    },
+        \\    "file_offset": {
+        \\      "type": "integer",
+        \\      "minimum": 0,
+        \\      "description": "Raw byte offset into the file to read from (alternative to address; as reported by get_embedded_resources). Bypasses virtual-address resolution."
         \\    },
         \\    "length": {
         \\      "type": "integer",
         \\      "default": 64,
-        \\      "description": "Number of bytes to read (max 65536)"
+        \\      "minimum": 1,
+        \\      "description": "Requested bytes; each page is bounded by encoding budget and mapping/EOF. Follow next_call when present."
         \\    },
+        \\    "element_size": {"type":"integer","enum":[1,2,4,8],"description":"Optional integer interpretation width in bytes; length must be at most 256 times this width"},
+        \\    "byte_order": {"type":"string","enum":["little","big"],"description":"Required with element_size; explicit byte order, never inferred"},
         \\    "encoding": {
         \\      "type": "string",
         \\      "enum": ["ascii", "hex", "both", "hex_compact"],
@@ -972,7 +964,8 @@ pub const tool_definitions = [_]ToolDef{
         \\      "description": "Output encoding"
         \\    }
         \\  },
-        \\  "required": ["doc_id", "address"],
+        \\  "required": ["doc_id"],
+        \\  "oneOf": [{"required":["address"]},{"required":["file_offset"]}],
         \\  "additionalProperties": false
         \\}
         ,
@@ -1028,7 +1021,7 @@ pub const tool_definitions = [_]ToolDef{
     },
     .{
         .name = "get_embedded_resources",
-        .description = "List structured embedded runtime resources (Bun JS bundle, etc.) discovered in a document. Returns each resource with runtime, name, kind, size, address, file_offset, preview, and provenance. Optional `runtime` filter (e.g. 'bun') restricts to one adapter. v7.4.3 ships Bun support; future runtimes plug in via the RuntimeAdapter registry.",
+        .description = "List structured embedded runtime resources (Bun JS bundle, etc.) discovered in a document, AND summarize what's IN them. Returns each resource with runtime, name, kind, size, address, file_offset, preview, and provenance. Unless include_surface=false, also returns a `surface` block for packed runtimes: a categorized-marker histogram, top markers per category (telemetry_event/env_toggle/model_id/endpoint/api_path/credential/...), and prefix `clusters` (a dark-launch codename family shows up as an unexpected shared prefix) — scanned on demand from the embedded text the string table skips. Optional `runtime` filter (e.g. 'bun') restricts to one adapter.",
         .input_schema =
         \\{
         \\  "type": "object",
@@ -1043,6 +1036,11 @@ pub const tool_definitions = [_]ToolDef{
         \\    "runtime": {
         \\      "type": "string",
         \\      "description": "Optional filter — only return resources from this runtime (e.g. 'bun'). Omit to return all detected runtimes."
+        \\    },
+        \\    "include_surface": {
+        \\      "type": "boolean",
+        \\      "default": true,
+        \\      "description": "Scan the embedded bundle text for categorized surface markers + codename clusters. Set false to skip (faster; metadata only)."
         \\    }
         \\  },
         \\  "required": ["doc_id"],
@@ -1111,6 +1109,44 @@ pub const tool_definitions = [_]ToolDef{
         \\    }
         \\  },
         \\  "required": ["doc_id_a", "doc_id_b"],
+        \\  "additionalProperties": false
+        \\}
+        ,
+        .annotations =
+        \\{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true}
+        ,
+    },
+    .{
+        .name = "release_diff",
+        .description = "Directional \"what's NEW & HIDDEN between two builds\" diff (old → new). Unlike `compare` (symmetric, native-code oriented), this diffs at the STRING + embedded-runtime-bundle (Bun __BUN etc.) + CAPABILITY level, keeps only markers present in `doc_id_new` and absent in `doc_id_old` (new-only lens), classifies each (telemetry_event/env_toggle/model_id/endpoint/credential/...), ranks the security/novel ones into `headlines[]`, and prefix-clusters them (a dark-launch codename shows up as an unexpected shared prefix). Pass `changelog` (raw release notes text) to auto-tag each new marker ANNOUNCED vs HIDDEN. Built for recurring per-release binary diffs. Load both builds with load_binary first.",
+        .input_schema =
+        \\{
+        \\  "type": "object",
+        \\  "properties": {
+        \\    "doc_id_old": {
+        \\      "oneOf": [{"type": "integer"}, {"type": "string"}],
+        \\      "description": "Previous build (document ID or name)"
+        \\    },
+        \\    "doc_id_new": {
+        \\      "oneOf": [{"type": "integer"}, {"type": "string"}],
+        \\      "description": "Current build (document ID or name)"
+        \\    },
+        \\    "sources": {
+        \\      "type": "array",
+        \\      "items": {"enum": ["strings", "bundle", "imports"]},
+        \\      "description": "Which surfaces to diff (default: all). 'bundle' scans embedded-runtime segments; 'imports' diffs the import name set."
+        \\    },
+        \\    "changelog": {
+        \\      "type": "string",
+        \\      "description": "Optional raw changelog / announced-notes text. Each new marker whose value appears here is tagged announced:true; the rest are HIDDEN."
+        \\    },
+        \\    "max_per_cluster": {
+        \\      "type": "integer",
+        \\      "default": 40,
+        \\      "description": "Cap on headlines[] entries returned."
+        \\    }
+        \\  },
+        \\  "required": ["doc_id_old", "doc_id_new"],
         \\  "additionalProperties": false
         \\}
         ,
@@ -1518,6 +1554,8 @@ pub fn dispatch(ctx: ToolContext, method: []const u8, params: std.json.Value) To
         try handleGetDemangledName(ctx, params)
     else if (eql(method, "compare"))
         try handleCompare(ctx, params)
+    else if (eql(method, "release_diff"))
+        try handleReleaseDiff(ctx, params)
     else if (eql(method, "get_dependency_graph"))
         try handleGetDependencyGraph(ctx, params)
     else if (eql(method, "suggest_names"))
@@ -1528,8 +1566,6 @@ pub fn dispatch(ctx: ToolContext, method: []const u8, params: std.json.Value) To
         try handleGetBinaryContext(ctx, params)
     else if (eql(method, "get_semantic_slice"))
         try handleGetSemanticSlice(ctx, params)
-    else if (eql(method, "decompile"))
-        try handleDecompile(ctx, params)
     else if (eql(method, "get_hardening_report"))
         try handleGetHardeningReport(ctx, params)
     else
@@ -1538,9 +1574,28 @@ pub fn dispatch(ctx: ToolContext, method: []const u8, params: std.json.Value) To
     // Apply output safety cap; respect per-tool _meta override, else use 80K default.
     const effective_limit = if (result.meta_max_chars) |m| @min(m, 500_000) else max_response_chars;
     if (result.json_response.len > effective_limit) {
-        const msg = std.fmt.allocPrint(ctx.allocator,
-            \\{{"error":"Response too large ({d} chars). Use offset/max_results parameters to paginate.","truncated":true,"original_size":{d}}}
-        , .{ result.json_response.len, result.json_response.len }) catch return ToolError.OutOfMemory;
+        // v7.16 W5: non-destructive truncation. The old path threw the entire
+        // body away and returned only an error stub, forcing a blind re-query.
+        // Instead keep a JSON-escaped preview of the FRONT of the real response
+        // (where summary/counts/first results live) so the LLM has usable
+        // context alongside the paginate hint.
+        var preview_len = @min(result.json_response.len, 2000);
+        // v7.16 W5 fix: don't cut mid-UTF-8 (bodies carry em dashes/ellipses/
+        // symbol names) or the escaped preview becomes invalid UTF-8 and strict
+        // clients reject the whole reply. Back off any trailing continuation
+        // bytes (0b10xxxxxx). Also clamp to the cap for very small limits.
+        preview_len = @min(preview_len, @max(effective_limit / 4, 256));
+        if (preview_len < result.json_response.len) {
+            while (preview_len > 0 and (result.json_response[preview_len] & 0xC0) == 0x80) preview_len -= 1;
+        }
+        var pbuf = std.Io.Writer.Allocating.init(ctx.allocator);
+        const pw = &pbuf.writer;
+        pw.writeAll("{\"error\":\"Response too large — paginate with offset/max_results (or lower max_chars).\",\"truncated\":true") catch return ToolError.OutOfMemory;
+        pw.print(",\"original_size\":{d},\"cap\":{d}", .{ result.json_response.len, effective_limit }) catch return ToolError.OutOfMemory;
+        pw.writeAll(",\"preview\":") catch return ToolError.OutOfMemory;
+        json.writeJsonString(pw, result.json_response[0..preview_len]) catch return ToolError.OutOfMemory;
+        pw.writeByte('}') catch return ToolError.OutOfMemory;
+        const msg = pbuf.toOwnedSlice() catch return ToolError.OutOfMemory;
         return .{ .json_response = msg, .is_error = false, .meta_max_chars = result.meta_max_chars };
     }
 
@@ -1671,6 +1726,23 @@ fn registerStubSymbols(allocator: std.mem.Allocator, data: []const u8, doc: *con
         }
 
         cmd_offset += cmdsize;
+    }
+
+    // Preserve defined data symbols without advertising them as functions.
+    const strings_start = slice_offset + stroff;
+    if (symoff != 0 and strings_start <= data.len and strsize <= data.len - strings_start) {
+        const strings = data[strings_start..][0..strsize];
+        for (0..nsyms) |i| {
+            const offset = slice_offset + symoff + i * 16;
+            if (offset > data.len or data.len - offset < 16) break;
+            const kind = data[offset + 4];
+            if ((kind & 0xe0) != 0 or (kind & 0x0e) != 0x0e) continue;
+            const index = readU32Swap(data, offset, needs_swap);
+            const address = readU64Swap(data, offset + 8, needs_swap);
+            if (index >= strings.len or address == 0) continue;
+            const name = std.mem.sliceTo(strings[index..], 0);
+            if (name.len > 0) db.addSymbol(address, name) catch {};
+        }
     }
 
     if (indirectsymoff == 0 or nindirectsyms == 0 or symoff == 0 or nsyms == 0) return;
@@ -1827,6 +1899,7 @@ fn synthesizeRawSegment(allocator: Allocator, doc: *types.Document, data: []cons
         .length = data.len,
         .file_offset = 0,
         .alignment = 0,
+        .is_code = true,
     };
     const segments = try allocator.alloc(types.Segment, 1);
     segments[0] = .{
@@ -2289,7 +2362,7 @@ fn parseBatchAddresses(allocator: Allocator, params: std.json.Value) ![]u64 {
 
 /// Parse include flags from JSON array.
 /// Unknown flags are silently skipped for robustness. If the array exists but
-/// contains no valid flags, defaults (ir, cfg, xrefs, calls) are used.
+/// contains no valid flags, defaults (cfg, xrefs, strings, calls) are used.
 fn parseIncludeFlagsValidated(params: std.json.Value) IncludeFlags {
     var flags = IncludeFlags{};
     var any_valid = false;
@@ -2314,20 +2387,26 @@ fn parseIncludeFlagsValidated(params: std.json.Value) IncludeFlags {
                 } else if (std.ascii.eqlIgnoreCase(item.string, "semantics")) {
                     flags.semantics = true;
                     any_valid = true;
+                } else if (std.ascii.eqlIgnoreCase(item.string, "abi")) {
+                    flags.abi = true;
+                    any_valid = true;
+                } else if (std.ascii.eqlIgnoreCase(item.string, "types")) {
+                    flags.types = true;
+                    any_valid = true;
                 }
                 // unknown flags silently skipped
             }
         }
         // If array existed but had no valid flags, use defaults
         if (!any_valid) {
-            flags.ir = true;
+            flags.strings = true;
             flags.cfg = true;
             flags.xrefs = true;
             flags.calls = true;
         }
     } else {
         // Default includes
-        flags.ir = true;
+        flags.strings = true;
         flags.cfg = true;
         flags.xrefs = true;
         flags.calls = true;
@@ -2347,6 +2426,8 @@ const IncludeFlags = struct {
     strings: bool = false,
     calls: bool = false,
     semantics: bool = false,
+    abi: bool = false,
+    types: bool = false,
 };
 
 fn addrStr(buf: []u8, address: u64) []const u8 {
@@ -2815,7 +2896,7 @@ fn ensureCalleesCached(entry: *DocumentEntry, db: *Database, proc_entry: u64, al
 }
 
 /// Serialize a procedure's analysis to JSON using the writer-based approach.
-fn serializeProcedureJson(allocator: Allocator, proc: types.Procedure, db: *const Database, flags: IncludeFlags, call_index: ?std.AutoHashMap(u64, []const u64)) ![]const u8 {
+fn serializeProcedureJson(allocator: Allocator, proc: types.Procedure, db: *Database, flags: IncludeFlags, call_index: ?std.AutoHashMap(u64, []const u64), doc_id: u64, delta: i128, ir_budget: usize) ![]const u8 {
     var buf = std.Io.Writer.Allocating.init(allocator);
     errdefer buf.deinit();
     const w = &buf.writer;
@@ -2898,15 +2979,27 @@ fn serializeProcedureJson(allocator: Allocator, proc: types.Procedure, db: *cons
 
     if (flags.cfg) {
         if (db.getCachedCfg(proc.entry)) |cfg_result| {
+            var cfg_json = std.Io.Writer.Allocating.init(allocator);
+            defer cfg_json.deinit();
+            // Reserve room for the other requested evidence in a batch. Full
+            // graph traversal is available through the paginated get_cfg tool.
+            if (cfg_result.basic_blocks.len <= 16 and cfg_result.edges.len <= 32)
+                try writeCfgJson(&cfg_json.writer, cfg_result);
             try w.writeAll(",\"cfg\":");
-            try writeCfgJson(w, cfg_result);
+            if (cfg_json.written().len > 0 and cfg_json.written().len <= ir_budget / 3) {
+                try w.writeAll(cfg_json.written());
+            } else {
+                try w.print("{{\"total_blocks\":{d},\"total_edges\":{d},\"partial\":true,\"note\":\"Graph omitted from batch summary; follow get_cfg pages for block and edge evidence\",\"next_call\":{{\"tool\":\"get_cfg\",\"arguments\":{{\"doc_id\":{d},\"function_address\":", .{ cfg_result.basic_blocks.len, cfg_result.edges.len, doc_id });
+                try json.writeAddress(w, applyRebaseDelta(proc.entry, delta));
+                try w.writeAll(",\"offset\":0,\"max_blocks\":64}}}");
+            }
         }
     }
 
     if (flags.ir) {
         if (db.getCachedIR(proc.entry)) |ir_func| {
             try w.writeAll(",\"ir\":");
-            try writeIrJson(w, ir_func);
+            try w.writeAll(try irPageJson(allocator, ir_func, doc_id, applyRebaseDelta(proc.entry, delta), 0, 64, ir_budget));
         }
     }
 
@@ -3025,9 +3118,151 @@ fn writeCfgJson(w: anytype, cfg_result: types.CfgResult) !void {
     try w.writeAll("]}");
 }
 
+// Count only fully emitted slots: the caller advances covered_bytes after
+// success. A failed warning or newline must not make decoded_bytes underflow.
+fn writeArm64PackInstruction(w: anytype, raw: []const u8, addr: u64, display_addr: u64, decode_gaps: *usize, previous_word: ?u32) !void {
+    const d = arm64.decode(raw, addr);
+    try w.print("  0x{x}: {s}", .{ display_addr, d.mnemonic });
+    if (d.decode_status != .decoded)
+        try w.print(" ; unsupported decode, raw=0x{x:0>8}, effects/control flow unknown", .{std.mem.readInt(u32, raw[0..4], .little)});
+    const ops = d.operands[0..d.operands_len];
+    if (ops.len > 0) try w.print(" {s}", .{ops});
+    if (previous_word) |previous| try arm64_branch_predicate.writeText(w, previous, std.mem.readInt(u32, raw[0..4], .little));
+    try w.writeByte('\n');
+    if (d.decode_status != .decoded) decode_gaps.* += 1;
+}
+
+// Always read encoding bytes, including for cached mnemonic records.
+fn writeArm64AddressingAt(w: anytype, entry: *DocumentEntry, addr: u64, block_start: u64) !void {
+    if (entry.doc.arch != .arm64) return;
+    const info = resolveRawBytesInfo(entry, addr) orelse return;
+    const off = info.file_offset + (addr - info.section_base);
+    if (off > entry.doc.data.len or entry.doc.data.len - off < 4) return;
+    const raw = entry.doc.data[off..][0..4];
+    const decoded = arm64.decode(raw, addr);
+    try w.print(",\"decode_status\":\"{s}\"", .{@tagName(decoded.decode_status)});
+    if (decoded.decode_status != .decoded)
+        try w.writeAll(",\"decode_warning\":\"Opaque ARM64 decoder fallback; control flow and instruction effects are unknown.\"");
+    try arm64_addressing.writeJsonMember(w, std.mem.readInt(u32, raw, .little));
+    try arm64_arithmetic.writeJsonMember(w, std.mem.readInt(u32, raw, .little));
+    try arm64_bitfield.writeJsonMember(w, std.mem.readInt(u32, raw, .little));
+    // Do not attribute flags across a recovered basic-block entry.
+    if (addr >= block_start +| 4) {
+        const previous_raw = instructionBytes(&entry.doc, addr - 4, 4) orelse return;
+        if (previous_raw.data.len >= 4)
+            try arm64_branch_predicate.writeJsonMember(w, std.mem.readInt(u32, previous_raw.data[0..4], .little), std.mem.readInt(u32, raw, .little), addr - 4);
+    }
+}
+
+// Shared guidance is bounded and describes a reconstruction process, not an
+// inferred recurrence or instruction effect. Legacy get_cfg is unchanged.
+const reconstruction_workflow = "First transcribe blocks and edges, retaining every assignment and both destinations of each conditional branch. Preserve every update at its loop nesting level. Trace at least two visits with carried values distinct from initializers; follow each exit and backedge exactly. Check encoded widths and read every RHS from the state before that instruction writes. Only simplify, hoist, or replace gotos with break/continue after checking equivalence to the transcribed control flow and updates.";
+const execution_rows_note = "Incoming-state links in execution.text bind each block input to the previous write for each predecessor, including backedges; unresolved alternatives remain explicit. loop_context locates every block in recovered natural loops. Each instruction row includes its address, raw bytes, and assembly. OPAQUE describes an unmodeled effect, not a missing instruction; retain that instruction and follow detailed provenance for its effects.";
+
+fn writeReconstructionGuide(w: anytype, instructions_at: []const u8, execution_view: bool) !void {
+    try w.writeAll("\"instructions_at\":");
+    try json.writeJsonString(w, instructions_at);
+    try w.writeAll(",\"reconstruction_workflow\":");
+    try json.writeJsonString(w, reconstruction_workflow);
+    if (execution_view) {
+        try w.writeAll(",\"instruction_rows_note\":");
+        try json.writeJsonString(w, execution_rows_note);
+    }
+}
+
+/// Compact instruction evidence. Missing or bounded tails always have exact
+/// raw-byte continuations; block pagination and instruction omissions differ.
+fn writeCfgJsonExecution(w: anytype, cfg_result: types.CfgResult, full_cfg: types.CfgResult, loop_ev: *const loops_mod.Evidence, page_start: usize, entry_addr: u64, entry: *DocumentEntry, doc_id: u64, allocator: Allocator, omit_steps: bool) !void {
+    const Words = struct {
+        entry: *DocumentEntry,
+        pub fn word(self: @This(), addr: u64) ?u32 {
+            const raw = instructionBytes(&self.entry.doc, addr, 4) orelse return null;
+            if (raw.data.len != 4) return null;
+            return std.mem.readInt(u32, raw.data[0..4], .little);
+        }
+    };
+    const incoming = arm64_loop_state.derive(full_cfg.basic_blocks, full_cfg.edges, Words{ .entry = entry });
+    var incoming_budget: arm64_loop_state.Budget = .{};
+    var omitted_binding_blocks: usize = 0;
+    try w.writeByte('{');
+    try writeReconstructionGuide(w, "basic_blocks[].execution.text", true);
+    try w.writeAll(",\"basic_blocks\":[");
+    for (cfg_result.basic_blocks, 0..) |block, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll("{\"start\":");
+        try json.writeAddress(w, block.start);
+        try w.print(",\"size\":{d},\"instruction_count\":{d},\"successors\":[", .{ block.size, block.instruction_count });
+        for (block.successors, 0..) |succ, j| {
+            if (j > 0) try w.writeByte(',');
+            try json.writeAddress(w, succ);
+        }
+        try w.writeAll("]");
+        var emitted_bytes: u64 = 0;
+        var status: []const u8 = "unavailable_instruction_bytes";
+        if (instructionBytes(&entry.doc, block.start, block.size)) |raw| {
+            const aligned_len = raw.data.len - raw.data.len % 4;
+            if (block.start % 4 == 0 and aligned_len > 0) {
+                var execution_text = std.Io.Writer.Allocating.init(allocator);
+                defer execution_text.deinit();
+                if (!omit_steps) {
+                    var links = std.Io.Writer.Allocating.init(allocator);
+                    defer links.deinit();
+                    arm64_loop_state.writeBlockText(&links.writer, &incoming, full_cfg.basic_blocks, full_cfg.edges, 0, page_start + i, entry_addr, &incoming_budget) catch |err| switch (err) {
+                        error.InvalidBlockIndex => return ToolError.InvalidParams,
+                        else => return ToolError.OutOfMemory,
+                    };
+                    if (links.written().len <= 8192) {
+                        try execution_text.writer.writeAll(links.written());
+                    } else {
+                        omitted_binding_blocks += 1;
+                        try execution_text.writer.writeAll("Incoming-state links omitted: block output budget (8192 characters); use detailed_provenance_call.\n");
+                    }
+                }
+                const summary = arm64_steps.writeBlockText(&execution_text.writer, block.start, raw.data[0..aligned_len], block.successors, .{ .max_steps = if (omit_steps) 0 else 256 }) catch return ToolError.OutOfMemory;
+                try w.writeAll(",\"execution\":{\"text\":");
+                try json.writeJsonString(w, execution_text.written());
+                try w.print(",\"total_steps\":{d},\"emitted_steps\":{d},\"opaque_steps\":{d},\"omitted_steps\":{d},\"partial\":{}}}", .{ summary.total_steps, summary.emitted_steps, summary.opaque_steps, summary.total_steps - summary.emitted_steps, summary.partial });
+                emitted_bytes = summary.emitted_steps * 4;
+                status = if (omit_steps) "omitted_response_budget" else if (emitted_bytes < aligned_len) "omitted_step_budget" else if (raw.data.len < block.size or aligned_len < raw.data.len) "incomplete_instruction_bytes" else "included";
+            }
+        }
+        try w.writeAll(",\"execution_status\":");
+        try json.writeJsonString(w, status);
+        try w.writeAll(",\"loop_context\":{\"status\":");
+        try json.writeJsonString(w, if (loop_ev.omitted) "omitted_graph_budget_or_missing_entry" else "derived_recovered_graph");
+        try w.writeAll(",\"containing_headers\":[");
+        var containing: usize = 0;
+        var returned_headers: usize = 0;
+        if (!loop_ev.omitted) for (full_cfg.basic_blocks, 0..) |header, h| {
+            if (!loop_ev.members[h][h] or !loop_ev.members[h][page_start + i]) continue;
+            containing += 1;
+            if (returned_headers == 16) continue;
+            if (returned_headers != 0) try w.writeByte(',');
+            try json.writeAddress(w, header.start);
+            returned_headers += 1;
+        };
+        try w.print("],\"total_containing_headers\":{d},\"omitted_headers\":{d},\"is_loop_header\":{},\"execution_rule\":\"Every visit starts at this block's first instruction and executes its rows in order; a backedge repeats header rows. Incoming values are predecessor outputs on that visit.\"}}", .{ containing, containing - returned_headers, !loop_ev.omitted and loop_ev.members[page_start + i][page_start + i] });
+        if (emitted_bytes < block.size) {
+            try w.print(",\"omitted_bytes\":{{\"status\":\"requires_instruction_followup\",\"start\":", .{});
+            try json.writeAddress(w, block.start + emitted_bytes);
+            try w.print(",\"byte_length\":{d},\"next_call\":{{\"tool\":\"disassemble_range\",\"arguments\":{{\"doc_id\":{d},\"start\":", .{ block.size - emitted_bytes, doc_id });
+            try json.writeAddress(w, block.start + emitted_bytes);
+            try w.print(",\"byte_length\":{d}}}}},\"raw_bytes_call\":{{\"tool\":\"read_bytes\",\"arguments\":{{\"doc_id\":{d},\"address\":", .{ @min(block.size - emitted_bytes, 4096), doc_id });
+            try json.writeAddress(w, block.start + emitted_bytes);
+            try w.print(",\"length\":{d},\"encoding\":\"hex_compact\"}}}}}}", .{@min(block.size - emitted_bytes, 65536)});
+        }
+        try w.writeByte('}');
+    }
+    try w.print("],\"incoming_state_evidence\":{{\"status\":\"{s}\",\"scope\":\"full_recovered_graph; visible_block_inputs\",\"instructions_scanned\":{d},\"instruction_limit\":4096,\"bindings_processed\":{d},\"binding_limit\":128,\"work_used\":{d},\"work_limit\":262144,\"work_exhausted\":{},\"truncated\":{},\"omitted_block_outputs\":{d},\"block_output_character_limit\":8192}}}}", .{ if (omit_steps) "omitted_response_budget" else @tagName(incoming.status), incoming.instructions, incoming_budget.bindings, arm64_loop_state.max_work - incoming_budget.remaining, incoming_budget.exhausted, incoming_budget.truncated or omitted_binding_blocks != 0, omitted_binding_blocks });
+}
+
 /// Write CFG JSON with inline disassembly in each basic block (#8).
-fn writeCfgJsonWithDisasm(w: anytype, cfg_result: types.CfgResult, db: *const Database, doc_data: []const u8, doc_arch: types.Arch) !void {
-    try w.writeAll("{\"basic_blocks\":[");
+fn writeCfgJsonWithDisasm(w: anytype, cfg_result: types.CfgResult, db: *const Database, entry: *DocumentEntry) !void {
+    const doc_data = entry.doc.data;
+    const doc_arch = entry.doc.arch;
+    if (doc_arch == .arm32) {
+        try w.writeAll("{\"instruction_context\":\"Raw decoded mnemonics: Thumb IT predication and implicit flag suppression are not rendered inline here. Use disassemble_range from the function entry for execution_condition and effective sets_flags.\",\"basic_blocks\":[");
+    } else try w.writeAll("{\"basic_blocks\":[");
     for (cfg_result.basic_blocks, 0..) |block, i| {
         if (i > 0) try w.writeByte(',');
         try w.writeAll("{\"start\":");
@@ -3062,14 +3297,18 @@ fn writeCfgJsonWithDisasm(w: anytype, cfg_result: types.CfgResult, db: *const Da
                     try w.writeAll(",\"operands\":");
                     try json.writeJsonString(w, ops);
                 }
+                try writeArm64AddressingAt(w, entry, addr, block.start);
                 try w.writeByte('}');
                 inst_idx += 1;
                 addr += inst.size;
-            } else if (doc_data.len > 0 and addr < doc_data.len) {
-                // On-demand decode from raw bytes
+            } else {
+                // Virtual addresses are not file offsets, including in FAT slices.
+                const info = resolveRawBytesInfo(entry, addr) orelse break;
+                const byte_off = info.file_offset + (addr - info.section_base);
+                if (byte_off >= doc_data.len) break;
                 var got_inst = false;
-                if (doc_arch == .arm64 and addr + 4 <= doc_data.len) {
-                    const inst = arm64.decode(doc_data[addr..], addr);
+                if (doc_arch == .arm64 and doc_data.len - byte_off >= 4) {
+                    const inst = arm64.decode(doc_data[byte_off..], addr);
                     if (inst_idx > 0) try w.writeByte(',');
                     try w.writeAll("{\"address\":");
                     try json.writeAddress(w, addr);
@@ -3079,12 +3318,13 @@ fn writeCfgJsonWithDisasm(w: anytype, cfg_result: types.CfgResult, db: *const Da
                         try w.writeAll(",\"operands\":");
                         try json.writeJsonString(w, inst.operands[0..inst.operands_len]);
                     }
+                    try writeArm64AddressingAt(w, entry, addr, block.start);
                     try w.writeByte('}');
                     inst_idx += 1;
                     addr += 4;
                     got_inst = true;
-                } else if (doc_arch == .arm32 and addr + 2 <= doc_data.len) {
-                    const inst = arm32.decode(doc_data[addr..], addr);
+                } else if (doc_arch == .arm32 and doc_data.len - byte_off >= 2) {
+                    const inst = arm32.decode(doc_data[byte_off..], addr);
                     if (inst_idx > 0) try w.writeByte(',');
                     try w.writeAll("{\"address\":");
                     try json.writeAddress(w, addr);
@@ -3098,8 +3338,8 @@ fn writeCfgJsonWithDisasm(w: anytype, cfg_result: types.CfgResult, db: *const Da
                     inst_idx += 1;
                     addr += inst.length;
                     got_inst = true;
-                } else if (doc_arch == .mips32 and addr + 4 <= doc_data.len) {
-                    const inst = mips32.decode(doc_data[addr..], addr);
+                } else if (doc_arch == .mips32 and doc_data.len - byte_off >= 4) {
+                    const inst = mips32.decode(doc_data[byte_off..], addr);
                     if (inst_idx > 0) try w.writeByte(',');
                     try w.writeAll("{\"address\":");
                     try json.writeAddress(w, addr);
@@ -3113,9 +3353,10 @@ fn writeCfgJsonWithDisasm(w: anytype, cfg_result: types.CfgResult, db: *const Da
                     inst_idx += 1;
                     addr += 4;
                     got_inst = true;
-                } else if (doc_arch == .x86_64 and addr < doc_data.len) {
+                } else if (doc_arch == .x86_64 or doc_arch == .x86) {
                     const x86 = @import("arch/x86_64.zig");
-                    const inst = x86.decode(doc_data[addr..], addr);
+                    const inst = if (doc_arch == .x86) x86.decode32(doc_data[byte_off..], addr) else x86.decode(doc_data[byte_off..], addr);
+                    if (x86DecodeGap(inst.mnemonic)) break;
                     if (inst_idx > 0) try w.writeByte(',');
                     try w.writeAll("{\"address\":");
                     try json.writeAddress(w, addr);
@@ -3131,8 +3372,6 @@ fn writeCfgJsonWithDisasm(w: anytype, cfg_result: types.CfgResult, db: *const Da
                     got_inst = true;
                 }
                 if (!got_inst) addr += if (doc_arch == .x86_64) @as(usize, 1) else @as(usize, 4);
-            } else {
-                addr += 4;
             }
         }
         try w.writeAll("]}");
@@ -3150,19 +3389,37 @@ fn writeCfgJsonWithDisasm(w: anytype, cfg_result: types.CfgResult, db: *const Da
 }
 
 fn writeIrJson(w: anytype, ir_func: types.IRFunction) !void {
-    try w.writeAll("{\"address\":");
+    try writeIrJsonRecords(w, ir_func, 0, ir_func.statements.len + ir_func.variables.len, true);
+}
+
+/// A single stable cursor covers statements followed by variable metadata.
+fn writeIrJsonRecords(w: anytype, ir_func: types.IRFunction, start: usize, end: usize, include_note: bool) !void {
+    const stmt_start = @min(start, ir_func.statements.len);
+    const stmt_end = @min(end, ir_func.statements.len);
+    const var_start = @min(start -| ir_func.statements.len, ir_func.variables.len);
+    const var_end = @min(end -| ir_func.statements.len, ir_func.variables.len);
+    try w.writeAll("{\"analysis_kind\":\"heuristic_ir\",\"verification_required\":true,\"address\":");
     try json.writeAddress(w, ir_func.address);
     if (ir_func.name) |name| {
         try w.writeAll(",\"name\":");
         try json.writeJsonString(w, name);
     }
+    // Guidance is repeated on normal single-function pages. Tight batches
+    // retain every evidence field and continuation without repeating this prose.
+    if (include_note) try w.writeAll(",\"interpretation_note\":\"Register views are not stable source variables or parameter types. On ARM64 Wn and Xn alias: a Wn write replaces Xn with a zero-extended 32-bit result. On x86-64 EAX-like writes likewise clear the high half of RAX-like storage. Return sources are architectural candidates, not recovered prototypes.\"");
     try w.writeAll(",\"statements\":[");
-    for (ir_func.statements, 0..) |stmt, i| {
+    for (ir_func.statements[stmt_start..stmt_end], 0..) |stmt, i| {
         if (i > 0) try w.writeByte(',');
         try w.writeAll("{\"type\":\"");
         try w.writeAll(stmt.type.toString());
         try w.writeAll("\",\"address\":");
         try json.writeAddress(w, stmt.address);
+        if (stmt.block_start) try w.writeAll(",\"block_start\":true");
+        if (stmt.memory_width) |width| try w.print(",\"memory_width_bytes\":{d}", .{width});
+        if (stmt.memory_signedness != .unknown) {
+            try w.writeAll(",\"load_extension\":");
+            try json.writeJsonString(w, @tagName(stmt.memory_signedness));
+        }
         if (stmt.dest) |dest| {
             try w.writeAll(",\"dest\":");
             try json.writeJsonString(w, dest);
@@ -3183,6 +3440,8 @@ fn writeIrJson(w: anytype, ir_func: types.IRFunction) !void {
             try w.writeAll(",\"condition\":");
             try json.writeJsonString(w, cond);
         }
+        if (stmt.type == .call and stmt.args == null)
+            try w.writeAll(",\"arguments_status\":\"unknown\"");
         if (stmt.args) |args| {
             try w.writeAll(",\"args\":[");
             for (args, 0..) |arg, j| {
@@ -3196,7 +3455,7 @@ fn writeIrJson(w: anytype, ir_func: types.IRFunction) !void {
         try w.writeByte('}');
     }
     try w.writeAll("],\"variables\":[");
-    for (ir_func.variables, 0..) |v, i| {
+    for (ir_func.variables[var_start..var_end], 0..) |v, i| {
         if (i > 0) try w.writeByte(',');
         try w.writeAll("{\"name\":");
         try json.writeJsonString(w, v.name);
@@ -3213,544 +3472,32 @@ fn writeIrJson(w: anytype, ir_func: types.IRFunction) !void {
     try w.writeAll("]}");
 }
 
-/// Write IR as C-like pseudocode instead of raw JSON statements.
-/// Much easier for LLMs to interpret than individual assign/call/branch statements.
-/// W5 (v7.8.0) — PLT / stub resolution for call targets.
-///
-/// A call `target` coming out of the lifter may be either:
-///   * a symbolic name (function, export) — return null (use as-is)
-///   * a hex string like "0x4560" pointing at a PLT / stub trampoline
-///
-/// This helper parses a hex-ish target, then tries (in order):
-///   1. db.resolveName(addr)           — covers Mach-O stubs (symbols added via
-///                                        registerStubSymbols) and regular local
-///                                        procedures / exports / imports at that
-///                                        exact address.
-///   2. scan doc.imports for stub_address == addr — covers ELF PLT entries where
-///                                        the loader set Import.stub_address but
-///                                        did NOT add a stub-addressed symbol.
-///
-/// Returns the resolved name (caller-demangled on hit) or null.
-fn resolvePltImportName(
-    allocator: Allocator,
-    db: *const Database,
-    doc: *const types.Document,
-    target: []const u8,
-) ?[]const u8 {
-    // Only try to resolve hex-ish targets. A symbolic target like "memcpy" or
-    // "sub_12340" is already what we want to print.
-    if (target.len < 3) return null;
-    if (!(target[0] == '0' and (target[1] == 'x' or target[1] == 'X'))) return null;
-    const addr = std.fmt.parseInt(u64, target[2..], 16) catch return null;
-
-    const raw_name: []const u8 = blk: {
-        if (db.resolveName(addr)) |n| break :blk n;
-        for (doc.imports.items) |imp| {
-            if (imp.stub_address) |sa| {
-                if (sa == addr) break :blk imp.name;
-            }
+/// Serialize bounded IR without dropping records or returning a JSON preview.
+/// A large batch receives smaller per-function pages; its continuations use
+/// one function each and can therefore recover the usual page budget.
+fn irPageJson(allocator: Allocator, ir_func: types.IRFunction, doc_id: u64, address: u64, offset: usize, max_results: usize, budget: usize) ![]const u8 {
+    const total = ir_func.statements.len + ir_func.variables.len;
+    const start = @min(offset, total);
+    var count = @min(max_results, total - start);
+    while (true) {
+        var buf = std.Io.Writer.Allocating.init(allocator);
+        defer buf.deinit();
+        const end = start + count;
+        try writeIrJsonRecords(&buf.writer, ir_func, start, end, budget >= 2048);
+        // Reopen the root object to attach lossless continuation metadata.
+        buf.writer.end -= 1;
+        const w = &buf.writer;
+        try w.print(",\"pagination_order\":\"statements_then_variables\",\"total_statements\":{d},\"total_variables\":{d},\"total_results\":{d},\"offset\":{d},\"returned_results\":{d},\"partial\":{s}", .{ ir_func.statements.len, ir_func.variables.len, total, start, count, if (end < total) "true" else "false" });
+        if (end < total) {
+            try w.print(",\"next_offset\":{d},\"next_call\":{{\"tool\":\"lift\",\"arguments\":{{\"doc_id\":{d},\"addresses\":", .{ end, doc_id });
+            try json.writeAddress(w, address);
+            try w.print(",\"offset\":{d},\"max_results\":{d}}}}}", .{ end, max_results });
         }
-        return null;
-    };
-
-    // Try to demangle. On failure fall back to the raw symbol.
-    if (tryDemangleCpp(allocator, raw_name)) |d| return d;
-    if (tryDemangleRust(allocator, raw_name)) |d| return d;
-    if (tryDemangleSwift(allocator, raw_name)) |d| return d;
-    return raw_name;
-}
-
-/// Sanitize an operand string: truncate at first null byte, replace non-printable chars.
-/// The lifter sometimes produces raw register buffer data with embedded nulls.
-fn sanitizeOperand(s: []const u8) []const u8 {
-    // Truncate at first null byte
-    for (s, 0..) |c, i| {
-        if (c == 0) return if (i > 0) s[0..i] else "?";
+        try w.writeByte('}');
+        if (buf.written().len <= budget) return try buf.toOwnedSlice();
+        if (count <= 1) return error.RecordTooLarge;
+        count = @max(count / 2, 1);
     }
-    return if (s.len > 0) s else "?";
-}
-
-/// B7 (v7.8.1) — When an operand text contains characters that would break
-/// C-like output (newlines, tabs, quotes, backslashes, non-printables),
-/// write a C-escaped form instead. Used by the decompile renderer for any
-/// operand that the lifter may have populated from a binary string literal.
-/// Operands that are already register/variable names pass through unchanged.
-fn writeEscapedOperand(w: anytype, s: []const u8) !void {
-    const sanitized = sanitizeOperand(s);
-    // Fast path: if the operand has no control / quote / backslash chars, write as-is.
-    var needs_escape = false;
-    for (sanitized) |c| {
-        if (c == '\n' or c == '\r' or c == '\t' or c == '"' or c == '\\' or c < 0x20 or c > 0x7e) {
-            needs_escape = true;
-            break;
-        }
-    }
-    if (!needs_escape) {
-        try w.writeAll(sanitized);
-        return;
-    }
-    for (sanitized) |c| {
-        switch (c) {
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            else => {
-                if (c < 0x20 or c > 0x7e) {
-                    try w.print("\\x{x:0>2}", .{c});
-                } else {
-                    try w.writeByte(c);
-                }
-            },
-        }
-    }
-}
-
-/// W5 (v7.8.0) — Optional context for resolving PLT / stub call targets while
-/// rendering pseudocode. Pass null for legacy behavior (raw `0x...` targets).
-/// Extended in v7.8.1 (B2) to optionally carry recovered-type info so the
-/// renderer can substitute `[var+OFF]` with `var->f_OFF` when applicable.
-pub const PseudocodeCtx = struct {
-    allocator: Allocator,
-    db: *const Database,
-    doc: *const types.Document,
-    /// Optional: recovered struct types. When present, the renderer will try
-    /// to substitute memory expressions of the form `[var, #0xOFF]` with
-    /// `var->f_OFF` if `var` was inferred to be a pointer to a struct that
-    /// has a field at OFF.
-    types_result: ?*const analysis_types.TypeRecoveryResult = null,
-};
-
-/// B2 helper: parse a memory-reference operand of the form
-///   `[var, #0xOFF]`, `[var, #OFF]`, `[var]`, `[var+0xOFF]`, `[var+OFF]`.
-/// Returns the inner var name + offset, or null if not parseable.
-fn parseMemRefForSubst(s: []const u8) ?struct { name: []const u8, offset: i64 } {
-    if (s.len < 3 or s[0] != '[') return null;
-    const close = std.mem.indexOfScalar(u8, s, ']') orelse return null;
-    const inner = std.mem.trim(u8, s[1..close], " ");
-    if (inner.len == 0) return null;
-    // v7.9.0: also detect '-' as a separator to support negative offsets
-    // (frame-relative accesses like `[fp - 0x20]`).
-    var sep_idx: ?usize = null;
-    var sep_is_minus = false;
-    for (inner, 0..) |c, i| {
-        if (c == ',' or c == '+') {
-            sep_idx = i;
-            break;
-        }
-        if (c == '-' and i > 0) {
-            sep_idx = i;
-            sep_is_minus = true;
-            break;
-        }
-    }
-    if (sep_idx == null) {
-        return .{ .name = std.mem.trim(u8, inner, " "), .offset = 0 };
-    }
-    const name = std.mem.trim(u8, inner[0..sep_idx.?], " ");
-    var rest = std.mem.trim(u8, inner[sep_idx.? + 1 ..], " ");
-    // Strip leading '#' (ARM literal marker) and optional second sign.
-    if (rest.len > 0 and rest[0] == '#') rest = rest[1..];
-    rest = std.mem.trim(u8, rest, " ");
-    var inner_sign: i64 = 1;
-    if (rest.len > 0 and rest[0] == '-') {
-        inner_sign = -1;
-        rest = rest[1..];
-    } else if (rest.len > 0 and rest[0] == '+') {
-        rest = rest[1..];
-    }
-    var off: u64 = 0;
-    if (rest.len >= 2 and rest[0] == '0' and (rest[1] == 'x' or rest[1] == 'X')) {
-        off = std.fmt.parseInt(u64, rest[2..], 16) catch return null;
-    } else if (rest.len > 0) {
-        off = std.fmt.parseInt(u64, rest, 10) catch return null;
-    }
-    const outer_sign: i64 = if (sep_is_minus) -1 else 1;
-    const signed: i64 = outer_sign * inner_sign * @as(i64, @intCast(off));
-    return .{ .name = name, .offset = signed };
-}
-
-/// B4 (v7.8.1): merge near-duplicate structs in the recovered-type result.
-/// Two structs are merged when:
-///   - one's fields are a SUBSET of the other (every field present at the same
-///     offset+width in the larger), OR
-///   - their field sets overlap by >70% (matched offsets / smaller-side count).
-/// The struct with more fields wins; variable_types entries pointing at the
-/// loser are remapped to the winner. Operates in-place on `tr.structs` (the
-/// underlying arena owns the slice; we just shorten it via copy-down).
-fn dedupStructs(allocator: Allocator, tr: *analysis_types.TypeRecoveryResult) !void {
-    if (tr.structs.len < 2) return;
-    const n = tr.structs.len;
-    var keep = try allocator.alloc(bool, n);
-    defer allocator.free(keep);
-    @memset(keep, true);
-    var remap = try allocator.alloc(usize, n);
-    defer allocator.free(remap);
-    for (0..n) |i| remap[i] = i;
-
-    // O(n^2) pairwise — n is small (one decompile call rarely sees >50 structs).
-    for (0..n) |i| {
-        if (!keep[i]) continue;
-        for (i + 1..n) |j| {
-            if (!keep[j]) continue;
-            const a = tr.structs[i];
-            const b = tr.structs[j];
-            if (!structsAreCompatible(a, b)) continue;
-            // Pick winner: whichever has more fields. Tie → first.
-            const i_wins = a.fields.len >= b.fields.len;
-            if (i_wins) {
-                keep[j] = false;
-                remap[j] = i;
-            } else {
-                keep[i] = false;
-                remap[i] = j;
-                break; // i is gone — move on.
-            }
-        }
-    }
-
-    // Compact the structs slice.
-    var new_structs = try allocator.alloc(analysis_types.InferredStruct, n);
-    var w_idx: usize = 0;
-    var idx_remap = try allocator.alloc(usize, n);
-    defer allocator.free(idx_remap);
-    for (0..n) |i| {
-        if (!keep[i]) continue;
-        new_structs[w_idx] = tr.structs[i];
-        idx_remap[i] = w_idx;
-        w_idx += 1;
-    }
-    // For removed structs, point idx_remap at the kept survivor.
-    for (0..n) |i| {
-        if (keep[i]) continue;
-        var r = remap[i];
-        // Follow chains.
-        var guard: u32 = 0;
-        while (!keep[r] and guard < 32) : (guard += 1) r = remap[r];
-        idx_remap[i] = if (keep[r]) idx_remap[r] else 0;
-    }
-
-    // Build a name remap: oldName -> newName (winner's name).
-    var name_remap = std.StringHashMap([]const u8).init(allocator);
-    defer name_remap.deinit();
-    for (0..n) |i| {
-        if (keep[i]) continue;
-        try name_remap.put(tr.structs[i].name, new_structs[idx_remap[i]].name);
-    }
-
-    // Rewrite the structs slice (caller's arena still owns the storage; we
-    // assign a new sub-slice).
-    tr.structs = new_structs[0..w_idx];
-
-    // Update variable_types: any value that maps to a removed struct → winner.
-    var it = tr.variable_types.iterator();
-    while (it.next()) |e| {
-        const cur = e.value_ptr.*;
-        if (name_remap.get(cur)) |new_name| {
-            e.value_ptr.* = new_name;
-        }
-    }
-}
-
-/// B4 helper: two structs are compatible (i.e. should be merged) if their
-/// field sets satisfy the subset/superset rule OR overlap >70% by offset.
-fn structsAreCompatible(a: analysis_types.InferredStruct, b: analysis_types.InferredStruct) bool {
-    if (a.fields.len == 0 or b.fields.len == 0) return false;
-    // Count how many of `small`'s fields exist in `large` at matching offset+width.
-    const small = if (a.fields.len <= b.fields.len) a else b;
-    const large = if (a.fields.len <= b.fields.len) b else a;
-    var matches: usize = 0;
-    for (small.fields) |sf| {
-        for (large.fields) |lf| {
-            if (sf.offset == lf.offset and sf.width == lf.width) {
-                matches += 1;
-                break;
-            }
-        }
-    }
-    if (matches == small.fields.len) return true; // perfect subset
-    const ratio = (matches * 100) / small.fields.len;
-    return ratio >= 70;
-}
-
-/// B2: If `mem_expr` looks like `[var, #OFF]` AND `var` has a recovered struct
-/// type AND the struct has a field at OFF, write `var->f_OFF` and return true.
-/// Otherwise return false (caller should emit the literal expression).
-fn writeFieldAccessIfStruct(
-    w: anytype,
-    mem_expr: []const u8,
-    func_addr: u64,
-    plt_ctx: PseudocodeCtx,
-) !bool {
-    const tr_ptr = plt_ctx.types_result orelse return false;
-    const ref = parseMemRefForSubst(mem_expr) orelse return false;
-
-    // Build the "0xADDR:varname" key.
-    var key_buf: [128]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "0x{x}:{s}", .{ func_addr, ref.name }) catch return false;
-    const struct_name = tr_ptr.variable_types.get(key) orelse return false;
-
-    // Find the struct and verify it has a field at this offset.
-    // v7.9.0: InferredField.offset is now i32 (was u32). Widen to i64 for
-    // comparison with the signed ParsedRef.offset from parseMemRefForSubst.
-    for (tr_ptr.structs) |s| {
-        if (!std.mem.eql(u8, s.name, struct_name)) continue;
-        for (s.fields) |f| {
-            if (@as(i64, f.offset) == ref.offset) {
-                try w.print("{s}->{s}", .{ ref.name, f.name });
-                return true;
-            }
-        }
-        return false;
-    }
-    return false;
-}
-
-fn writePseudocode(w: anytype, ir_func: types.IRFunction) !void {
-    return writePseudocodeWithCtx(w, ir_func, null);
-}
-
-fn writePseudocodeWithCtx(
-    w: anytype,
-    ir_func: types.IRFunction,
-    plt_ctx: ?PseudocodeCtx,
-) !void {
-    try w.writeAll("{\"address\":");
-    try json.writeAddress(w, ir_func.address);
-    if (ir_func.name) |name| {
-        try w.writeAll(",\"name\":");
-        try json.writeJsonString(w, name);
-    }
-    try w.writeAll(",\"pseudocode\":");
-
-    // Build pseudocode string
-    var pc = std.Io.Writer.Allocating.init(std.heap.page_allocator);
-    defer pc.deinit();
-    const pw = &pc.writer;
-
-    // Pre-pass: build block label map (address → block_N) for readable branch targets
-    var block_map = std.AutoHashMap(u64, u32).init(std.heap.page_allocator);
-    defer block_map.deinit();
-    {
-        var block_idx: u32 = 0;
-        for (ir_func.statements) |stmt| {
-            if (stmt.type == .branch) {
-                if (stmt.true_block) |tb| {
-                    if (!block_map.contains(tb)) {
-                        block_map.put(tb, block_idx) catch {};
-                        block_idx += 1;
-                    }
-                }
-                if (stmt.false_block) |fb| {
-                    if (!block_map.contains(fb)) {
-                        block_map.put(fb, block_idx) catch {};
-                        block_idx += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    // Pre-pass: ADRP+ADD folding — detect consecutive ADRP Xn, page / ADD Xn, Xn, #off
-    // Mark ADRP statements that are followed by ADD to same register
-    var adrp_fold = std.AutoHashMap(u64, u64).init(std.heap.page_allocator); // stmt_addr → folded_addr
-    defer adrp_fold.deinit();
-    var adrp_skip = std.AutoHashMap(u64, void).init(std.heap.page_allocator); // ADD stmt addrs to skip
-    defer adrp_skip.deinit();
-    {
-        var i: usize = 0;
-        while (i + 1 < ir_func.statements.len) : (i += 1) {
-            const s0 = ir_func.statements[i];
-            const s1 = ir_func.statements[i + 1];
-            if (s0.type == .assign and s1.type == .assign) {
-                if (s0.dest) |d0| {
-                    if (s1.dest) |d1| {
-                        if (std.mem.eql(u8, d0, d1)) {
-                            if (s1.src) |src1| {
-                                // Pattern: dest = 0xPAGE000; dest = dest + #0xOFF;
-                                if (s0.src) |src0| {
-                                    if (src0.len > 2 and src0[0] == '0' and src0[1] == 'x') {
-                                        if (std.mem.startsWith(u8, src1, d1) and std.mem.indexOf(u8, src1, "+ #0x") != null) {
-                                            // Parse page and offset
-                                            const page_val = std.fmt.parseInt(u64, src0[2..], 16) catch 0;
-                                            if (std.mem.indexOf(u8, src1, "#0x")) |off_start| {
-                                                const off_str = src1[off_start + 3 ..];
-                                                const off_val = std.fmt.parseInt(u64, off_str, 16) catch 0;
-                                                if (page_val > 0) {
-                                                    adrp_fold.put(s0.address, page_val + off_val) catch {};
-                                                    adrp_skip.put(s1.address, {}) catch {};
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Function signature
-    if (ir_func.name) |name| {
-        pw.print("function {s}(", .{name}) catch {};
-    } else {
-        pw.print("function sub_{x}(", .{ir_func.address}) catch {};
-    }
-    var first_param = true;
-    for (ir_func.variables) |v| {
-        // G6: same ABI filter as decompile — exclude callee-saved /
-        // frame / link / synthesized helper variables so the lift
-        // signature lists only real argument registers.
-        if (!isArgumentVariable(v.name, v.register)) continue;
-        if (!first_param) pw.writeAll(", ") catch {};
-        first_param = false;
-        pw.print("{s}", .{v.name}) catch {};
-        if (v.type_name) |tn| pw.print(": {s}", .{tn}) catch {};
-    }
-    pw.writeAll(") {{\n") catch {};
-
-    // Calculate where trailing udf padding starts (scan backwards)
-    var effective_end: usize = ir_func.statements.len;
-    while (effective_end > 0) {
-        const s = ir_func.statements[effective_end - 1];
-        if (s.type == .assign) {
-            if (s.src) |src| {
-                if (std.mem.startsWith(u8, src, "udf") or std.mem.startsWith(u8, src, "? = udf")) break;
-            }
-            // Not udf — this is real code, stop trimming
-            break;
-        } else if (s.type == .nop) {
-            effective_end -= 1;
-            continue;
-        } else break;
-    }
-    // Now trim: find first udf in the trailing run
-    while (effective_end > 0) {
-        const s = ir_func.statements[effective_end - 1];
-        const is_udf = if (s.type == .assign) blk: {
-            break :blk if (s.src) |src| std.mem.startsWith(u8, src, "udf") or std.mem.startsWith(u8, src, "? = udf") else false;
-        } else s.type == .nop;
-        if (is_udf) {
-            effective_end -= 1;
-        } else break;
-    }
-
-    for (ir_func.statements[0..effective_end]) |stmt| {
-        if (stmt.type == .nop) continue;
-        // Skip ADD half of a folded ADRP+ADD pair
-        if (adrp_skip.contains(stmt.address)) continue;
-
-        // Emit block label if this address is a branch target
-        if (block_map.get(stmt.address)) |blk_idx| {
-            pw.print("block_{d}:\n", .{blk_idx}) catch {};
-        }
-
-        pw.writeAll("  ") catch {};
-        switch (stmt.type) {
-            .assign => {
-                if (stmt.dest) |dest| {
-                    // Check for ADRP fold
-                    if (adrp_fold.get(stmt.address)) |folded| {
-                        pw.print("{s} = 0x{x};\n", .{ sanitizeOperand(dest), folded }) catch {};
-                    } else {
-                        pw.print("{s} = ", .{sanitizeOperand(dest)}) catch {};
-                        if (stmt.src) |src| pw.print("{s}", .{sanitizeOperand(src)}) catch {};
-                        pw.writeAll(";\n") catch {};
-                    }
-                }
-            },
-            .call => {
-                if (stmt.dest) |dest| pw.print("{s} = ", .{sanitizeOperand(dest)}) catch {};
-                if (stmt.target) |target| {
-                    // W5: PLT / stub resolution — if target is a hex address that
-                    // maps to an imported symbol (Mach-O stub or ELF PLT entry),
-                    // render the symbol name instead of the raw address.
-                    const resolved: ?[]const u8 = if (plt_ctx) |c|
-                        resolvePltImportName(c.allocator, c.db, c.doc, target)
-                    else
-                        null;
-                    if (resolved) |r| {
-                        pw.print("{s}(", .{sanitizeOperand(r)}) catch {};
-                    } else {
-                        pw.print("{s}(", .{sanitizeOperand(target)}) catch {};
-                    }
-                } else pw.writeAll("?(") catch {};
-                if (stmt.args) |args| {
-                    for (args, 0..) |arg, j| {
-                        if (j > 0) pw.writeAll(", ") catch {};
-                        pw.print("{s}", .{sanitizeOperand(arg)}) catch {};
-                    }
-                }
-                pw.writeAll(");\n") catch {};
-            },
-            .compare => {
-                // G5: emit only the two operands. stmt.op carries the mnemonic
-                // ("cmp") which would render as `cmp(src, cmp, target)` if
-                // included as an operand.
-                pw.writeAll("flags = cmp(") catch {};
-                var wrote_first = false;
-                if (stmt.src) |src| {
-                    pw.print("{s}", .{sanitizeOperand(src)}) catch {};
-                    wrote_first = true;
-                }
-                if (stmt.target) |t| {
-                    if (wrote_first) pw.writeAll(", ") catch {};
-                    pw.print("{s}", .{sanitizeOperand(t)}) catch {};
-                }
-                pw.writeAll(");\n") catch {};
-            },
-            .branch => {
-                if (stmt.condition) |cond| {
-                    if (stmt.true_block) |tb| {
-                        if (block_map.get(tb)) |blk| {
-                            pw.print("if ({s}) goto block_{d}", .{ sanitizeOperand(cond), blk }) catch {};
-                        } else {
-                            pw.print("if ({s}) goto 0x{x}", .{ sanitizeOperand(cond), tb }) catch {};
-                        }
-                    } else {
-                        pw.print("if ({s}) goto next", .{sanitizeOperand(cond)}) catch {};
-                    }
-                    if (stmt.false_block) |fb| {
-                        if (block_map.get(fb)) |blk| {
-                            pw.print(" else goto block_{d}", .{blk}) catch {};
-                        } else {
-                            pw.print(" else goto 0x{x}", .{fb}) catch {};
-                        }
-                    }
-                    pw.writeAll(";\n") catch {};
-                } else {
-                    if (stmt.true_block) |tb| {
-                        if (block_map.get(tb)) |blk| {
-                            pw.print("goto block_{d};\n", .{blk}) catch {};
-                        } else {
-                            pw.print("goto 0x{x};\n", .{tb}) catch {};
-                        }
-                    } else {
-                        pw.writeAll("goto next;\n") catch {};
-                    }
-                }
-            },
-            .@"return" => {
-                pw.writeAll("return") catch {};
-                if (stmt.src) |src| pw.print(" {s}", .{sanitizeOperand(src)}) catch {};
-                pw.writeAll(";\n") catch {};
-            },
-            .load => {
-                if (stmt.dest) |dest| pw.print("{s} = *({s});\n", .{ sanitizeOperand(dest), sanitizeOperand(stmt.src orelse "?") }) catch {};
-            },
-            .store => {
-                pw.print("*({s}) = {s};\n", .{ sanitizeOperand(stmt.dest orelse "?"), sanitizeOperand(stmt.src orelse "?") }) catch {};
-            },
-            .nop => {},
-        }
-    }
-    pw.writeAll("}}") catch {};
-
-    try json.writeJsonString(w, pc.written());
-    try w.writeByte('}');
 }
 
 // ============================================================================
@@ -3778,9 +3525,17 @@ pub const LoadBudget = struct {
 /// be fully initialized before calling this.
 ///
 /// `budget` (optional) enforces a deadline. On exceed, returns
-/// `error.BudgetExceeded` and the caller is responsible for cleaning up
-/// `entry` and its resources.
+/// `error.BudgetExceeded`. Every error discards the unpublished `entry` and
+/// its resources; callers must not access or free it after failure.
 fn finalizeLoad(ctx: ToolContext, entry: *DocumentEntry, data: []const u8, budget: ?*LoadBudget) !void {
+    // Publication is the final fallible step. Any failure before it must
+    // release the unpublished document for single, batch and borrowed-data loads.
+    errdefer {
+        // Container loaders may replace doc.data with a view into this buffer.
+        // Free the owned allocation, rather than its embedded ELF sub-slice.
+        if (entry.owns_data) entry.doc.data = data;
+        teardownDocumentEntry(ctx.store.allocator, entry);
+    }
     // v7.4.2 F4: progress logging for slow loads. Per feedback_load_timeout
     // ("Slow loads are OK; empty/timeout responses are not"), the user just
     // needs to see that work is happening — silence is the bug, not slowness.
@@ -3817,17 +3572,17 @@ fn finalizeLoad(ctx: ToolContext, entry: *DocumentEntry, data: []const u8, budge
     // per-request arena.
     var analyze_result = pipeline.analyzeLean(store_alloc_inner, ctx.io, &entry.doc, data);
     if (analyze_result) |*result| {
+        errdefer result.deinit(store_alloc_inner);
         // Merge strings
         for (result.strings.items) |s| {
             entry.doc.strings.append(s) catch {};
             entry.db.addString(s) catch {};
         }
-        // Merge xrefs
-        var xref_it = result.xrefs.refs_from.iterator();
-        while (xref_it.next()) |xref_entry| {
-            for (xref_entry.value_ptr.items) |xref| {
-                entry.db.xrefs.addXref(xref.from, xref.to, xref.xref_type) catch {};
-            }
+        // Reserve before replaying hash-bucket order, avoiding probe clusters.
+        try entry.db.xrefs.mergeFrom(&result.xrefs);
+        // Seed the index before merging to avoid duplicating every loader entry.
+        for (entry.doc.procedures.items) |proc| {
+            entry.db.addProcedure(proc) catch {};
         }
         // Add detected procedures to database and document
         for (result.procedures) |dp| {
@@ -3865,18 +3620,11 @@ fn finalizeLoad(ctx: ToolContext, entry: *DocumentEntry, data: []const u8, budge
                     return a.entry < b.entry;
                 }
             }.lessThan);
-            for (procs[0 .. procs.len - 1], 0..) |*p, idx| {
-                if (p.size == 0) {
-                    p.size = procs[idx + 1].entry - p.entry;
-                }
-            }
-            if (procs[procs.len - 1].size == 0) {
-                procs[procs.len - 1].size = 64;
-            }
-        } else if (procs.len == 1) {
-            if (procs[0].size == 0) {
-                procs[0].size = 64;
-            }
+        }
+        for (procs, 0..) |*p, idx| {
+            var end = entry.doc.codeRangeEnd(p.entry) orelse (p.entry +| 64);
+            if (idx + 1 < procs.len) end = @min(end, procs[idx + 1].entry);
+            if (p.size == 0 or p.size > end - p.entry) p.size = end - p.entry;
         }
         // Update database with computed sizes
         for (procs) |p| {
@@ -3958,6 +3706,9 @@ fn finalizeLoad(ctx: ToolContext, entry: *DocumentEntry, data: []const u8, budge
     // 10. Store entry and queue notification
     ctx.store.put(entry) catch return error.OutOfMemory;
     ctx.queueNotification("notifications/tools/list_changed");
+    // v7.16 W5: loaded docs are exposed as `phora://doc/{id}` resources, so the
+    // resource list changed too — tell clients or their view goes stale.
+    ctx.queueNotification("notifications/resources/list_changed");
     finalizePhaseLog(ctx.io, "finalize_done", finalize_start);
     ctx.emitProgress(6, 6, "load complete");
 }
@@ -3970,8 +3721,29 @@ inline fn finalizePhaseLog(io: std.Io, name: []const u8, start_ms: i64) void {
     std.debug.print("[phora load] phase={s} elapsed={d}ms\n", .{ name, elapsed });
 }
 
+fn invalidLoadOptions(params: std.json.Value) ?[]const u8 {
+    if (params != .object) return "load_binary arguments must be an object";
+    for ([_][]const u8{ "arch", "base", "entry", "fat_arch", "analysis", "budget_ms" }) |key| {
+        if (params.object.contains(key)) return "load_binary option is misplaced at top level; move arch/base/entry/fat_arch/analysis/budget_ms under options, for example {path:...,options:{arch:arm64,base:4096,entry:4096}}";
+    }
+    if (params.object.get("options")) |opts| {
+        if (opts != .object) return "load_binary options must be an object";
+        for ([_][]const u8{ "arch", "fat_arch" }) |key| if (opts.object.get(key)) |value| {
+            if (value != .string or parseArchString(value.string) == null) return "unsupported options.arch or options.fat_arch; use arm64, arm32, x86_64, x86, or mips32";
+        };
+        for ([_][]const u8{ "base", "entry", "budget_ms" }) |key| if (opts.object.get(key)) |value| {
+            if (value != .integer or value.integer < 0) return "options.base, options.entry, and options.budget_ms must be nonnegative integers";
+        };
+    }
+    return null;
+}
+
 fn handleLoadBinary(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
     const start = timestampMs(ctx.io);
+    if (invalidLoadOptions(params)) |message| {
+        const resp = json.errorResponse(ctx.allocator, "load_binary", message, 0) catch return ToolError.OutOfMemory;
+        return .{ .json_response = resp, .is_error = true };
+    }
     // v7.11 W5: announce phase 0/6 immediately so the client sees activity even
     // before the file open. Subsequent phases fire from inside finalizeLoad.
     ctx.emitProgress(0, 6, "load_binary started — opening file");
@@ -4214,13 +3986,7 @@ fn handleLoadBinary(ctx: ToolContext, params: std.json.Value) ToolError!ToolResu
 
     finalizeLoad(ctx, entry, data, &load_budget) catch |err| {
         if (err == error.BudgetExceeded) {
-            // Clean up the partially-built doc/db. The entry is NOT in the
-            // store yet because finalizeLoad's last step (ctx.store.put) hasn't
-            // run when we hit the deadline.
-            // v7.15.0 B1: entry/doc/db now live on store_alloc.
-            entry.db.deinit();
-            entry.doc.deinit();
-            store_alloc.destroy(entry);
+            // finalizeLoad already discarded the unpublished entry.
             const elapsed_ms = timestampMs(ctx.io) - start;
             const err_msg = std.fmt.allocPrint(
                 ctx.allocator,
@@ -4658,6 +4424,7 @@ fn handleCloseDocument(ctx: ToolContext, params: std.json.Value) ToolError!ToolR
     const entry_to_free = freed_entry orelse return docNotFoundError(ctx, "close_document");
     teardownDocumentEntry(ctx.store.allocator, entry_to_free);
     ctx.queueNotification("notifications/tools/list_changed");
+    ctx.queueNotification("notifications/resources/list_changed"); // v7.16 W5: doc resource removed
 
     const elapsed = timestampMs(ctx.io) - start;
     const resp = json.successResponse(ctx.allocator, "close_document", "{\"closed\":true}", elapsed) catch return ToolError.OutOfMemory;
@@ -4698,6 +4465,134 @@ fn teardownDocumentEntry(store_alloc: Allocator, entry: *DocumentEntry) void {
     store_alloc.destroy(entry);
 }
 
+/// Decode a bounded entry prefix directly from immutable file bytes. Operand
+/// slices are copied because decoder-return buffers are transient.
+fn evidencePrefix(a: Allocator, entry: *DocumentEntry, proc: types.Procedure) ![]types.Instruction {
+    var out = std.array_list.Managed(types.Instruction).init(a);
+    var address = proc.entry;
+    const end = std.math.add(u64, proc.entry, @min(proc.size, 4096)) catch return out.toOwnedSlice();
+    while (address < end and out.items.len < 96) {
+        const info = resolveRawBytesInfo(entry, address) orelse break;
+        const off = std.math.add(u64, info.file_offset, address - info.section_base) catch break;
+        if (off >= entry.doc.data.len) break;
+        const bytes = entry.doc.data[@intCast(off)..][0..@intCast(@min(end - address, entry.doc.data.len - off))];
+        const inst = switch (entry.doc.arch) {
+            .arm64 => if (bytes.len >= 4) arm64.decodeInstruction(bytes, address) else break,
+            .arm32 => if (bytes.len >= 2) arm32.decodeInstruction(bytes, address) else break,
+            .mips32 => if (bytes.len >= 4) mips32.decodeInstruction(bytes, address) else break,
+            .x86_64 => @import("arch/x86_64.zig").decodeInstruction(bytes, address),
+            .x86 => break,
+        };
+        if (inst.size == 0 or inst.size > bytes.len) break;
+        var copy = inst;
+        copy.operands = try a.dupe(u8, inst.operands_buf[0..inst.operands_len]);
+        try out.append(copy);
+        address += inst.size;
+    }
+    return out.toOwnedSlice();
+}
+
+fn writeRecoveryStringArray(w: anytype, values: []const []const u8) !void {
+    try w.writeByte('[');
+    for (values, 0..) |value, i| {
+        if (i != 0) try w.writeByte(',');
+        try json.writeJsonString(w, value);
+    }
+    try w.writeByte(']');
+}
+
+fn appendRecoveryEvidence(a: Allocator, original: []const u8, proc: types.Procedure, db: *Database, entry: *DocumentEntry, flags: IncludeFlags, doc_id: u64, delta: i128, budget: usize) ![]const u8 {
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const temp = scratch.allocator();
+    var extra = std.Io.Writer.Allocating.init(a);
+    defer extra.deinit();
+    const w = &extra.writer;
+    if (flags.abi) {
+        const profile = abi_mod.profileForDocument(&entry.doc);
+        const prefix = try evidencePrefix(temp, entry, proc);
+        const candidates = try abi_mod.candidateArguments(temp, prefix, profile);
+        try w.writeAll(",\"abi_evidence\":{\"profile\":");
+        try json.writeJsonString(w, profile.name);
+        try w.writeAll(",\"confidence\":");
+        try json.writeJsonString(w, @tagName(profile.confidence));
+        try w.writeAll(",\"note\":");
+        try json.writeJsonString(w, profile.reason);
+        try w.writeAll(",\"candidate_order\":\"first observed read, not parameter position\"");
+        if (entry.doc.arch == .arm64)
+            try w.writeAll(",\"register_alias_note\":\"Wn and Xn share storage: writing Wn replaces Xn with the zero-extended 32-bit result. First-read width is not a parameter type.\"");
+        try w.writeAll(",\"integer_argument_registers\":");
+        try writeRecoveryStringArray(w, profile.integer_args);
+        try w.writeAll(",\"floating_argument_registers\":");
+        try writeRecoveryStringArray(w, profile.floating_args);
+        try w.writeAll(",\"return_registers\":");
+        try writeRecoveryStringArray(w, profile.return_registers);
+        if (profile.stack_alignment) |alignment| try w.print(",\"stack_alignment\":{d}", .{alignment});
+        try w.print(",\"shadow_space_bytes\":{d},\"prototype_recovered\":false,\"parameter_count\":null,\"candidate_scope\":\"entry prefix before the first control-flow or unsupported-instruction barrier; incomplete by design\",\"decoded_prefix_instructions\":{d},\"candidate_arguments\":[", .{ profile.shadow_space_bytes, prefix.len });
+        for (candidates, 0..) |candidate, i| {
+            if (i != 0) try w.writeByte(',');
+            try w.writeAll("{\"register\":");
+            try json.writeJsonString(w, candidate.register);
+            try w.writeAll(",\"first_read_address\":");
+            try json.writeAddress(w, applyRebaseDelta(candidate.first_read_address, delta));
+            if (candidate.width) |width| try w.print(",\"first_read_width_bytes\":{d}", .{width});
+            try w.writeByte('}');
+        }
+        try w.writeAll("]}");
+    }
+    if (flags.types) {
+        try w.writeAll(",\"type_evidence\":{");
+        if (db.getCachedIR(proc.entry)) |function| {
+            var bounded = function;
+            bounded.address = applyRebaseDelta(function.address, delta);
+            bounded.statements = function.statements[0..@min(function.statements.len, 256)];
+            const recovered = try type_recovery.recover(temp, &.{bounded});
+            const returned = @min(recovered.structs.len, 4);
+            try w.print("\"analysis_kind\":\"observed_memory_layouts\",\"source_statements\":{d},\"total_statements\":{d},\"total_layouts_in_prefix\":{d},\"returned_layouts\":{d},\"partial\":{},\"note\":\"Observed access offsets and widths, not proven C members or source types. Size hints are heuristic, including legacy frame padding, not proven object extents. Indexed and unknown-width evidence is excluded; arrays, unions, and reused base-register names remain possible. Follow lift for complete instruction evidence.\",\"layouts\":[", .{ bounded.statements.len, function.statements.len, recovered.structs.len, returned, bounded.statements.len < function.statements.len or returned < recovered.structs.len });
+            for (recovered.structs[0..returned], 0..) |layout, i| {
+                if (i != 0) try w.writeByte(',');
+                try w.writeAll("{\"name\":");
+                try json.writeJsonString(w, layout.name);
+                try w.print(",\"size_hint_bytes\":{d},\"overlapping_accesses\":{},\"total_fields\":{d},\"returned_fields\":{d},\"fields_partial\":{},\"pointer_origins\":", .{ layout.size_hint, layout.has_overlapping_accesses, layout.fields.len, @min(layout.fields.len, 16), layout.fields.len > 16 });
+                try writeRecoveryStringArray(w, layout.pointer_origins[0..@min(layout.pointer_origins.len, 8)]);
+                try w.print(",\"total_pointer_origins\":{d},\"pointer_origins_partial\":{}", .{ layout.pointer_origins.len, layout.pointer_origins.len > 8 });
+                try w.writeAll(",\"fields\":[");
+                for (layout.fields[0..@min(layout.fields.len, 16)], 0..) |field, j| {
+                    if (j != 0) try w.writeByte(',');
+                    try w.print("{{\"offset\":{d},\"maximum_access_width\":{d},\"reads\":{d},\"writes\":{d},\"signed_reads\":{d},\"unsigned_reads\":{d},\"observed_widths_bytes\":[", .{ field.offset, field.width, field.read_count, field.write_count, field.signed_read_count, field.unsigned_read_count });
+                    var comma = false;
+                    for (0..8) |bit| {
+                        if (field.observed_widths & (@as(u8, 1) << @intCast(bit)) != 0) {
+                            if (comma) try w.writeByte(',');
+                            try w.print("{d}", .{@as(u8, 1) << @intCast(bit)});
+                            comma = true;
+                        }
+                    }
+                    try w.writeAll("]}");
+                }
+                try w.writeAll("]}");
+            }
+            try w.writeByte(']');
+        } else try w.writeAll("\"status\":\"ir_unavailable\",\"partial\":true");
+        try w.print(",\"next_call\":{{\"tool\":\"lift\",\"arguments\":{{\"doc_id\":{d},\"addresses\":", .{doc_id});
+        try json.writeAddress(w, applyRebaseDelta(proc.entry, delta));
+        try w.writeAll(",\"offset\":0,\"max_results\":256}}}");
+    }
+    if (extra.written().len > budget) {
+        extra.clearRetainingCapacity();
+        try w.writeAll(",\"recovery_evidence\":{\"status\":\"batch_budget\",\"note\":\"Retry this function alone for bounded ABI and type evidence\",\"next_call\":{\"tool\":\"analyze_functions\",\"arguments\":{");
+        try w.print("\"doc_id\":{d},\"addresses\":", .{doc_id});
+        try json.writeAddress(w, applyRebaseDelta(proc.entry, delta));
+        try w.writeAll(",\"include\":[\"abi\",\"types\"]}}}");
+    }
+    var result = std.Io.Writer.Allocating.init(a);
+    errdefer result.deinit();
+    try result.writer.writeAll(original[0 .. original.len - 1]);
+    try result.writer.writeAll(extra.written());
+    try result.writer.writeByte('}');
+    return result.toOwnedSlice();
+}
+
 fn handleAnalyzeFunctions(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
     const doc_id: u64 = resolveDocId(ctx, params) orelse {
         return docNotFoundErrorFull(ctx, "analyze_functions", params);
@@ -4724,7 +4619,7 @@ fn handleAnalyzeFunctions(ctx: ToolContext, params: std.json.Value) ToolError!To
         // v7.9.3 W4: dylib entry-point fallback. If the caller passed address=0
         // AND the doc itself has no recorded entry_point AND we have at least
         // one detected procedure, substitute the first procedure's address.
-        // Mirrors the fallback in handleDecompile / handleLift so callers don't
+        // Mirrors the fallback in handleLift so callers don't
         // have to special-case dylibs. The substitution is surfaced via the
         // batch item's `input` label ("0x0 (dylib fallback -> 0x...)").
         var effective_addr: u64 = addr;
@@ -4765,15 +4660,23 @@ fn handleAnalyzeFunctions(ctx: ToolContext, params: std.json.Value) ToolError!To
                 continue;
             }
             // Lift IR on demand if requested and not yet cached
-            if (flags.ir and eff.db.getCachedIR(proc.entry) == null) {
+            if ((flags.ir or flags.types) and eff.db.getCachedIR(proc.entry) == null) {
                 ensureLiftedIR(ctx.allocator, proc, eff.db, eff.entry);
             }
+            if (flags.cfg) _ = ensureFunctionCfg(ctx.allocator, proc, eff.db, eff.entry);
             // Prime callees cache before serialization so semantic facts have data
             _ = ensureCalleesCached(eff.entry, eff.db, proc.entry, ctx.allocator);
-            const result_json = serializeProcedureJson(ctx.allocator, proc, eff.db, flags, eff.entry.call_index) catch {
+            const base_result_json = serializeProcedureJson(ctx.allocator, proc, eff.db, flags, eff.entry.call_index, doc_id, eff.delta, (max_response_chars - 8192) / (@max(addresses.len, 1) * @as(usize, if (flags.abi or flags.types) 2 else 1))) catch {
                 items.append(.{ .input = label_copy, .success = false, .err = "serialization error", .time_ms = timestampMs(ctx.io) - item_start }) catch {};
                 continue;
             };
+            const result_json = if (flags.abi or flags.types)
+                appendRecoveryEvidence(ctx.allocator, base_result_json, proc, eff.db, eff.entry, flags, doc_id, eff.delta, (max_response_chars - 8192) / (@max(addresses.len, 1) * 2)) catch {
+                    items.append(.{ .input = label_copy, .success = false, .err = "recovery evidence serialization failed", .time_ms = timestampMs(ctx.io) - item_start }) catch {};
+                    continue;
+                }
+            else
+                base_result_json;
             items.append(.{ .input = label_copy, .success = true, .result = result_json, .time_ms = timestampMs(ctx.io) - item_start }) catch {};
         } else if (eff.db.getProcedureContaining(eff_addr)) |containing| {
             const err_msg = std.fmt.allocPrint(
@@ -4949,18 +4852,25 @@ fn isCredentialPassword(s: []const u8) bool {
 /// Confidence level for a capability match.
 pub const CapConfidence = enum { high, medium, low };
 
+/// Max capability categories a single string can be tagged with. Sized well
+/// above the number of category blocks in `categorizeCapabilityImpl` so the
+/// `count += 1` writes can never overrun the caller's fixed array (each new
+/// block also guards with `if (count < cats_out.len)`). Bump this if you add
+/// more categories than the current headroom allows.
+pub const MAX_CAP_CATS = 24;
+
 /// Categorize a string for capability/surface extraction.
 /// Returns the number of categories written to `cats_out`, or 0 if no match.
 /// If `conf_out` is non-null, writes the confidence level for each category.
-pub fn categorizeCapabilityWithConfidence(s: []const u8, cats_out: *[10][]const u8, conf_out: ?*[10]CapConfidence) usize {
+pub fn categorizeCapabilityWithConfidence(s: []const u8, cats_out: *[MAX_CAP_CATS][]const u8, conf_out: ?*[MAX_CAP_CATS]CapConfidence) usize {
     return categorizeCapabilityImpl(s, cats_out, conf_out);
 }
 
-pub fn categorizeCapability(s: []const u8, cats_out: *[10][]const u8) usize {
+pub fn categorizeCapability(s: []const u8, cats_out: *[MAX_CAP_CATS][]const u8) usize {
     return categorizeCapabilityImpl(s, cats_out, null);
 }
 
-fn categorizeCapabilityImpl(s: []const u8, cats_out: *[10][]const u8, conf_out: ?*[10]CapConfidence) usize {
+fn categorizeCapabilityImpl(s: []const u8, cats_out: *[MAX_CAP_CATS][]const u8, conf_out: ?*[MAX_CAP_CATS]CapConfidence) usize {
     var count: usize = 0;
 
     // Runtime feature flags (FFlag/DFFlag/SFFlag/RFlag + generic patterns)
@@ -5145,7 +5055,224 @@ fn categorizeCapabilityImpl(s: []const u8, cats_out: *[10][]const u8, conf_out: 
         }
     }
 
+    // ------------------------------------------------------------------
+    // v7.16 W2 — modern app-surface markers. Shape-first so they fire
+    // identically on the pre-extracted string table AND on embedded-runtime
+    // (Bun __BUN) text. Each block guards `count` so it can never overrun
+    // cats_out even if every category matched.
+    // ------------------------------------------------------------------
+
+    // telemetry_event: analytics event names (product prefix or vendor SDK)
+    if (count < cats_out.len) {
+        const is_tengu = std.mem.startsWith(u8, s, "tengu_");
+        const has_vendor = std.mem.indexOf(u8, s, "amplitude") != null or
+            std.mem.indexOf(u8, s, "mixpanel") != null or
+            std.mem.indexOf(u8, s, "posthog") != null or
+            std.mem.indexOf(u8, s, "statsig") != null or
+            std.mem.indexOf(u8, s, "datadoghq") != null or
+            std.mem.indexOf(u8, s, "segment.io") != null or
+            std.mem.indexOf(u8, s, "bugsnag") != null;
+        if (is_tengu or has_vendor) {
+            cats_out[count] = "telemetry_event";
+            if (conf_out) |co| co[count] = if (is_tengu) .high else .medium;
+            count += 1;
+        }
+    }
+
+    // env_toggle: environment-variable feature switches. Require pure
+    // ALLCAPS_UNDERSCORE shape AND a recognized verb/product prefix or suffix.
+    if (count < cats_out.len and capIsEnvTokenShape(s)) {
+        const is_env = std.mem.startsWith(u8, s, "CLAUDE_CODE_") or
+            std.mem.startsWith(u8, s, "ANTHROPIC_") or
+            std.mem.startsWith(u8, s, "DISABLE_") or
+            std.mem.startsWith(u8, s, "ENABLE_") or
+            std.mem.startsWith(u8, s, "SKIP_") or
+            std.mem.startsWith(u8, s, "FORCE_") or
+            std.mem.startsWith(u8, s, "USE_") or
+            std.mem.startsWith(u8, s, "ALLOW_") or
+            std.mem.startsWith(u8, s, "NO_") or
+            std.mem.startsWith(u8, s, "BUN_") or
+            std.mem.startsWith(u8, s, "ELECTRON_") or
+            std.mem.endsWith(u8, s, "_ENABLED") or
+            std.mem.endsWith(u8, s, "_DISABLED") or
+            std.mem.endsWith(u8, s, "_OVERRIDE") or
+            std.mem.endsWith(u8, s, "_TOGGLE");
+        if (is_env) {
+            cats_out[count] = "env_toggle";
+            if (conf_out) |co| co[count] = .high;
+            count += 1;
+        }
+    }
+
+    // model_id: LLM model identifiers (prefix family + a digit guard to skip prose)
+    if (count < cats_out.len) {
+        const has_prefix = std.mem.startsWith(u8, s, "claude-") or
+            std.mem.startsWith(u8, s, "gpt-") or
+            std.mem.startsWith(u8, s, "gemini-") or
+            std.mem.startsWith(u8, s, "text-embedding-") or
+            std.mem.indexOf(u8, s, "anthropic.claude") != null or
+            std.mem.indexOf(u8, s, "models/gemini") != null;
+        if (has_prefix and s.len < 64 and capHasDigit(s) and std.mem.indexOfScalar(u8, s, ' ') == null) {
+            cats_out[count] = "model_id";
+            if (conf_out) |co| co[count] = .high;
+            count += 1;
+        }
+    }
+
+    // mcp_tool: MCP tool identifiers and JSON-RPC method names
+    if (count < cats_out.len) {
+        const is_mcp = std.mem.indexOf(u8, s, "mcp__") != null or
+            std.mem.eql(u8, s, "tools/call") or std.mem.eql(u8, s, "tools/list") or
+            std.mem.eql(u8, s, "resources/read") or std.mem.eql(u8, s, "resources/list") or
+            std.mem.eql(u8, s, "prompts/get") or std.mem.eql(u8, s, "prompts/list");
+        if (is_mcp) {
+            cats_out[count] = "mcp_tool";
+            if (conf_out) |co| co[count] = .high;
+            count += 1;
+        }
+    }
+
+    // oauth_scope: `word:word[:word]` scope tokens with recognized scope vocab
+    if (count < cats_out.len and capIsOAuthScope(s)) {
+        cats_out[count] = "oauth_scope";
+        if (conf_out) |co| co[count] = .medium;
+        count += 1;
+    }
+
+    // api_path: bare service route templates (not filesystem paths)
+    if (count < cats_out.len) {
+        const looks_api = s.len >= 4 and s.len < 200 and
+            std.mem.startsWith(u8, s, "/") and
+            std.mem.indexOfScalar(u8, s, ' ') == null and
+            !capIsFsPath(s) and
+            (std.mem.indexOf(u8, s, "/api/") != null or
+                std.mem.startsWith(u8, s, "/v1/") or
+                std.mem.startsWith(u8, s, "/v2/") or
+                std.mem.indexOf(u8, s, "/graphql") != null or
+                std.mem.startsWith(u8, s, "/.well-known/") or
+                std.mem.startsWith(u8, s, "/oauth"));
+        if (looks_api) {
+            cats_out[count] = "api_path";
+            if (conf_out) |co| co[count] = .medium;
+            count += 1;
+        }
+    }
+
     return count;
+}
+
+/// True when `s` is a pure ALLCAPS_UNDERSCORE env-var-shaped token (used by the
+/// env_toggle capability category to avoid matching prose containing an '=').
+fn capIsEnvTokenShape(s: []const u8) bool {
+    if (s.len < 3 or s.len > 80) return false;
+    var has_underscore = false;
+    for (s) |c| {
+        if (c == '_') {
+            has_underscore = true;
+            continue;
+        }
+        if (c >= 'A' and c <= 'Z') continue;
+        if (c >= '0' and c <= '9') continue;
+        return false;
+    }
+    return has_underscore;
+}
+
+fn capHasDigit(s: []const u8) bool {
+    for (s) |c| {
+        if (c >= '0' and c <= '9') return true;
+    }
+    return false;
+}
+
+/// True when `s` looks like a filesystem/library path (excluded from api_path).
+fn capIsFsPath(s: []const u8) bool {
+    const prefixes = [_][]const u8{
+        "/usr/",          "/lib/", "/System/", "/private/", "/Users/", "/opt/",
+        "/etc/",          "/var/", "/bin/",    "/sbin/",    "/tmp/",   "/Library/",
+        "/Applications/",
+    };
+    for (prefixes) |p| {
+        if (std.mem.startsWith(u8, s, p)) return true;
+    }
+    return std.mem.indexOf(u8, s, ".dylib") != null or
+        std.mem.indexOf(u8, s, ".framework") != null or
+        std.mem.endsWith(u8, s, ".so");
+}
+
+/// True when `s` is a plausible OAuth scope token: 2-3 lowercase `:`-separated
+/// parts containing a recognized scope word. Rejects C++ `::`, URLs, `C:` drives.
+fn capIsOAuthScope(s: []const u8) bool {
+    if (s.len < 5 or s.len > 48) return false;
+    if (std.mem.indexOf(u8, s, "::") != null) return false;
+    if (std.mem.indexOf(u8, s, "//") != null) return false;
+    var colon_count: usize = 0;
+    for (s) |c| {
+        if (c == ':') {
+            colon_count += 1;
+            continue;
+        }
+        const ok = (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or
+            c == '_' or c == '-' or c == '.';
+        if (!ok) return false;
+    }
+    if (colon_count < 1 or colon_count > 2) return false;
+    const vocab = [_][]const u8{
+        "user:",     "org:",   "repo:", "read:",     "write:", "admin:", "account:",
+        "team:",     "mcp:",   "api:",  "projects:", ":read",  ":write", ":inference",
+        ":projects", ":admin",
+    };
+    for (vocab) |v| {
+        if (std.mem.indexOf(u8, s, v) != null) return true;
+    }
+    return false;
+}
+
+/// Ranking weight for a capability category (higher = surfaced first). Security
+/// and "what's-new" markers outrank ubiquitous ones. Used to sort the
+/// `capabilities` search output so the scary/novel float to the top.
+fn capCategoryWeight(cat: []const u8) u8 {
+    const high = [_][]const u8{ "credential", "debug_bypass", "internal_infra", "model_id" };
+    const mid = [_][]const u8{ "telemetry_event", "endpoint", "api_path", "env_toggle", "oauth_scope", "mcp_tool", "pii_field" };
+    for (high) |h| {
+        if (std.mem.eql(u8, cat, h)) return 3;
+    }
+    for (mid) |m| {
+        if (std.mem.eql(u8, cat, m)) return 2;
+    }
+    return 1; // crypto, build_path, log_channel, feature_flag, telemetry
+}
+
+fn capConfRank(c: CapConfidence) u8 {
+    return switch (c) {
+        .high => 3,
+        .medium => 2,
+        .low => 1,
+    };
+}
+
+/// Leading identifier token of `s` up to the first delimiter (`_`, `.`, `/`,
+/// `-`, `:`). Prefix-clustering these is a codename detector — a dark-launched
+/// family surfaces as an unexpectedly large shared prefix (e.g. `tengu_`).
+/// Returns null when there's no delimiter or the prefix is too short to matter.
+fn capClusterPrefix(s: []const u8) ?[]const u8 {
+    // v7.16 W2 fix: don't cluster URLs — the ':' delimiter would collapse every
+    // endpoint under "https:"/"http:" and bury the codename signal this exists
+    // for. URLs are already their own category; skip them here.
+    if (std.mem.startsWith(u8, s, "http://") or std.mem.startsWith(u8, s, "https://") or
+        std.mem.startsWith(u8, s, "www."))
+    {
+        return null;
+    }
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c == '_' or c == '.' or c == '/' or c == '-' or c == ':') {
+            if (i >= 3) return s[0 .. i + 1]; // include the delimiter
+            return null;
+        }
+    }
+    return null;
 }
 
 fn handleSearch(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
@@ -5198,7 +5325,7 @@ fn handleSearch(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
         const offset_raw_cap: i64 = getInt(params, "offset") orelse 0;
         const offset_cap: u32 = if (offset_raw_cap > 0) @intCast(offset_raw_cap) else 0;
 
-        const CapResult = struct { address: u64, value: []const u8, cats: [10][]const u8, cat_count: usize, doc_id: ?u64, doc_name: ?[]const u8 };
+        const CapResult = struct { address: u64, value: []const u8, cats: [MAX_CAP_CATS][]const u8, confs: [MAX_CAP_CATS]CapConfidence = undefined, cat_count: usize, doc_id: ?u64, doc_name: ?[]const u8, count: usize = 1, weight: u8 = 0, best_conf: u8 = 0 };
         var cap_results = std.array_list.Managed(CapResult).init(ctx.allocator);
 
         // Determine if we filter by category name using the pattern field
@@ -5209,36 +5336,81 @@ fn handleSearch(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
             return docNotFoundError(ctx, "search");
         }
 
-        // Helper to scan one document's strings for capabilities
+        // v7.16 W1/W2: dedup categorized strings (same value collapses to one
+        // result with an occurrence `count`) AND scan packed runtime segments
+        // (Bun __BUN etc.) that the pre-extracted string table skips — so
+        // `capabilities` finally sees embedded-JS markers (tengu_*, CLAUDE_CODE_*,
+        // model IDs, /api/... paths) instead of returning 0 on Bun/Electron apps.
+        var cap_seen = std.StringHashMap(usize).init(ctx.allocator);
+        defer cap_seen.deinit();
+        var packed_truncated = false;
+
+        // Helper to scan one document (pre-extracted table + packed segments).
         const scanDoc = struct {
-            fn scan(alloc: Allocator, db: anytype, cat_f: ?[]const u8, results: *std.array_list.Managed(CapResult), max_res: u32, did: ?u64, dname: ?[]const u8) void {
-                const all_strings = db.getAllStrings(alloc) catch return;
-                for (all_strings) |str| {
-                    if (results.items.len >= max_res * 10) break; // hard cap to avoid OOM on huge binaries
-                    var cats: [10][]const u8 = undefined;
-                    const cat_count = categorizeCapability(str.value, &cats);
-                    if (cat_count == 0) continue;
-
-                    // If pattern is set, filter by category name (pipe-separated OR)
-                    if (cat_f) |cf| {
-                        var matched = false;
-                        for (cats[0..cat_count]) |cat| {
-                            if (matchesMultiPattern(cat, cf, false)) {
-                                matched = true;
-                                break;
-                            }
+            fn addCap(value: []const u8, addr: u64, cat_f: ?[]const u8, results: *std.array_list.Managed(CapResult), seen: *std.StringHashMap(usize), did: ?u64, dname: ?[]const u8) void {
+                var cats: [MAX_CAP_CATS][]const u8 = undefined;
+                var confs: [MAX_CAP_CATS]CapConfidence = undefined;
+                const cat_count = categorizeCapabilityWithConfidence(value, &cats, &confs);
+                if (cat_count == 0) return;
+                if (cat_f) |cf| {
+                    var matched = false;
+                    for (cats[0..cat_count]) |cat| {
+                        if (matchesMultiPattern(cat, cf, false)) {
+                            matched = true;
+                            break;
                         }
-                        if (!matched) continue;
                     }
+                    if (!matched) return;
+                }
+                // Dedup by string value: bump the occurrence count on repeat.
+                if (seen.get(value)) |idx| {
+                    results.items[idx].count += 1;
+                    return;
+                }
+                // Precompute the ranking key: strongest category weight + confidence.
+                var weight: u8 = 0;
+                var best_conf: u8 = 0;
+                for (cats[0..cat_count], confs[0..cat_count]) |cat, cf2| {
+                    const w = capCategoryWeight(cat);
+                    if (w > weight) weight = w;
+                    const cr = capConfRank(cf2);
+                    if (cr > best_conf) best_conf = cr;
+                }
+                const new_idx = results.items.len;
+                results.append(.{
+                    .address = addr,
+                    .value = value,
+                    .cats = cats,
+                    .confs = confs,
+                    .cat_count = cat_count,
+                    .doc_id = did,
+                    .doc_name = dname,
+                    .count = 1,
+                    .weight = weight,
+                    .best_conf = best_conf,
+                }) catch return;
+                seen.put(value, new_idx) catch {};
+            }
 
-                    results.append(.{
-                        .address = str.address,
-                        .value = str.value,
-                        .cats = cats,
-                        .cat_count = cat_count,
-                        .doc_id = did,
-                        .doc_name = dname,
-                    }) catch {};
+            fn scan(alloc: Allocator, db: anytype, doc: *const types.Document, cat_f: ?[]const u8, results: *std.array_list.Managed(CapResult), seen: *std.StringHashMap(usize), max_res: u32, did: ?u64, dname: ?[]const u8, packed_trunc: *bool) void {
+                const cap = max_res * 10; // distinct-result ceiling (avoids unbounded growth)
+                // Pass 1: pre-extracted string table.
+                if (db.getAllStrings(alloc) catch null) |all_strings| {
+                    for (all_strings) |str| {
+                        if (results.items.len >= cap) return;
+                        addCap(str.value, str.address, cat_f, results, seen, did, dname);
+                    }
+                }
+                // Pass 2: packed runtime segments (skipped at load — scan on demand).
+                if (strings_mod.hasPackedSegment(doc)) {
+                    const extraction_cap: usize = 1_000_000;
+                    var bundle = strings_mod.detectBundleStrings(alloc, doc, 5, extraction_cap) catch return;
+                    defer bundle.deinit();
+                    if (bundle.items.len >= extraction_cap) packed_trunc.* = true;
+                    for (bundle.items) |str| {
+                        if (results.items.len >= cap) return;
+                        addCap(str.value, str.address, cat_f, results, seen, did, dname);
+                    }
                 }
             }
         };
@@ -5248,14 +5420,44 @@ fn handleSearch(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
             const eff = resolveEffectiveDb(entry);
             eff.db.rw_lock.lockSharedUncancelable(eff.db.io);
             defer eff.db.rw_lock.unlockShared(eff.db.io);
-            scanDoc.scan(ctx.allocator, eff.db, cat_filter, &cap_results, max_results, null, null);
+            scanDoc.scan(ctx.allocator, eff.db, &eff.entry.doc, cat_filter, &cap_results, &cap_seen, max_results, null, null, &packed_truncated);
         } else {
             var doc_it = ctx.store.documents.iterator();
             while (doc_it.next()) |doc_entry| {
                 const de = doc_entry.value_ptr.*;
                 de.db.rw_lock.lockSharedUncancelable(de.db.io);
                 defer de.db.rw_lock.unlockShared(de.db.io);
-                scanDoc.scan(ctx.allocator, &de.db, cat_filter, &cap_results, max_results, doc_entry.key_ptr.*, std.fs.path.basename(de.doc.path));
+                scanDoc.scan(ctx.allocator, &de.db, &de.doc, cat_filter, &cap_results, &cap_seen, max_results, doc_entry.key_ptr.*, std.fs.path.basename(de.doc.path), &packed_truncated);
+            }
+        }
+
+        // v7.16 W2: rank so security/novel markers surface first (safe after
+        // scanning — `cap_seen` indices are no longer needed).
+        const CapSort = struct {
+            fn lessThan(_: void, a: CapResult, b: CapResult) bool {
+                if (a.weight != b.weight) return a.weight > b.weight;
+                if (a.best_conf != b.best_conf) return a.best_conf > b.best_conf;
+                return a.count > b.count;
+            }
+        };
+        std.sort.pdq(CapResult, cap_results.items, {}, CapSort.lessThan);
+
+        // Category histogram + prefix-cluster summary (codename detector).
+        var cap_hist = std.StringHashMap(usize).init(ctx.allocator);
+        defer cap_hist.deinit();
+        const ClusterInfo = struct { count: usize, example: []const u8 };
+        var cap_clusters = std.StringHashMap(ClusterInfo).init(ctx.allocator);
+        defer cap_clusters.deinit();
+        for (cap_results.items) |cr| {
+            for (cr.cats[0..cr.cat_count]) |cat| {
+                const g = cap_hist.getOrPut(cat) catch continue;
+                if (!g.found_existing) g.value_ptr.* = 0;
+                g.value_ptr.* += cr.count;
+            }
+            if (capClusterPrefix(cr.value)) |pfx| {
+                const g = cap_clusters.getOrPut(pfx) catch continue;
+                if (!g.found_existing) g.value_ptr.* = .{ .count = 0, .example = cr.value };
+                g.value_ptr.count += 1;
             }
         }
 
@@ -5272,9 +5474,51 @@ fn handleSearch(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
         cw.print("{d}", .{cap_returned.len}) catch {};
         cw.writeAll(",\"has_more\":") catch {};
         cw.writeAll(if (cap_offset + cap_returned.len < cap_total) "true" else "false") catch {};
+        if (packed_truncated) {
+            cw.writeAll(",\"packed_scan_truncated\":true,\"note\":\"embedded-runtime scan hit the 1,000,000-string cap; some bundle markers may be omitted\"") catch {};
+        }
         if (cap_doc_id == null) {
             cw.print(",\"searched_docs\":{d}", .{ctx.store.documents.count()}) catch {};
         }
+        // v7.16 W2: category histogram (occurrence-weighted) + prefix clusters.
+        cw.writeAll(",\"category_histogram\":{") catch {};
+        {
+            var hist_it = cap_hist.iterator();
+            var hist_first = true;
+            while (hist_it.next()) |e| {
+                if (!hist_first) cw.writeByte(',') catch {};
+                hist_first = false;
+                json.writeJsonString(cw, e.key_ptr.*) catch {};
+                cw.print(":{d}", .{e.value_ptr.*}) catch {};
+            }
+        }
+        cw.writeAll("}") catch {};
+        const ClusterRow = struct { prefix: []const u8, count: usize, example: []const u8 };
+        var cluster_rows = std.array_list.Managed(ClusterRow).init(ctx.allocator);
+        {
+            var cl_it = cap_clusters.iterator();
+            while (cl_it.next()) |e| {
+                if (e.value_ptr.count >= 2) cluster_rows.append(.{ .prefix = e.key_ptr.*, .count = e.value_ptr.count, .example = e.value_ptr.example }) catch {};
+            }
+            std.sort.pdq(ClusterRow, cluster_rows.items, {}, struct {
+                fn lt(_: void, a: ClusterRow, b: ClusterRow) bool {
+                    return a.count > b.count;
+                }
+            }.lt);
+        }
+        cw.writeAll(",\"clusters\":[") catch {};
+        {
+            const cl_n = @min(cluster_rows.items.len, 24);
+            for (cluster_rows.items[0..cl_n], 0..) |row, i| {
+                if (i > 0) cw.writeByte(',') catch {};
+                cw.writeAll("{\"prefix\":") catch {};
+                json.writeJsonString(cw, row.prefix) catch {};
+                cw.print(",\"count\":{d},\"example\":", .{row.count}) catch {};
+                json.writeJsonString(cw, row.example) catch {};
+                cw.writeByte('}') catch {};
+            }
+        }
+        cw.writeAll("]") catch {};
         cw.writeAll(",\"results\":[") catch {};
         for (cap_returned, 0..) |cr, ci| {
             if (ci > 0) cw.writeByte(',') catch {};
@@ -5289,6 +5533,15 @@ fn handleSearch(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
                 json.writeJsonString(cw, cat) catch {};
             }
             cw.writeByte(']') catch {};
+            cw.writeAll(",\"confidence\":") catch {};
+            cw.writeAll(switch (cr.best_conf) {
+                3 => "\"high\"",
+                2 => "\"medium\"",
+                else => "\"low\"",
+            }) catch {};
+            if (cr.count > 1) {
+                cw.print(",\"count\":{d}", .{cr.count}) catch {};
+            }
             if (cr.doc_id) |did| {
                 cw.print(",\"doc_id\":{d}", .{did}) catch {};
             }
@@ -5543,7 +5796,8 @@ fn handleSearch(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
                 if (packed_results) |*pr| {
                     defer pr.deinit();
                     fallback_ran = true; // we ran the byte-grep over packed segments
-                    fallback_runtime = "bun"; // currently the only packed runtime; expand alongside PACKED_SEGMENT_PREFIXES
+                    // v7.16 W1: report the actual detected runtime, not a hard-coded "bun".
+                    fallback_runtime = strings_mod.detectRuntime(&eff.entry.doc) orelse "packed";
                     if (pr.hits.items.len > 0) {
                         fallback_used = true;
                         for (pr.hits.items) |h| {
@@ -5695,7 +5949,7 @@ fn handleSearch(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
 
 fn computeSectionEntropy(data: []const u8) f64 {
     if (data.len == 0) return 0.0;
-    var freq: [256]u32 = [_]u32{0} ** 256;
+    var freq: [256]u32 = @splat(0);
     for (data) |byte| {
         freq[byte] += 1;
     }
@@ -5963,6 +6217,47 @@ fn handleGetCallGraph(ctx: ToolContext, params: std.json.Value) ToolError!ToolRe
     return .{ .json_response = resp, .meta_max_chars = 200_000 };
 }
 
+/// Decode the terminator itself: a predicated Thumb BX has a fallthrough
+/// successor but still lacks a known taken target. Pagination is unrelated.
+fn hasUnresolvedIndirectJump(entry: *DocumentEntry, block: types.BasicBlock) bool {
+    if (block.terminator != .jump and block.terminator != .branch) return false;
+    const info = resolveRawBytesInfo(entry, block.start) orelse return false;
+    const arch = entry.doc.arch;
+    const decode_fn: cfg_mod.DecodeFn = if (arch == .arm32) &cfg_mod.arm32CfgDecode else if (arch == .x86) &cfg_mod.x86CfgDecode else if (arch == .x86_64) &cfg_mod.x86_64CfgDecode else if (arch == .mips32) &mips32CfgDecode else &arm64CfgDecode;
+    const end = block.start +| block.size;
+    var address = if ((arch == .arm64 or arch == .mips32) and block.size >= 4) end - 4 else block.start;
+    while (address < end) {
+        const offset = info.file_offset + (address - info.section_base);
+        if (offset >= entry.doc.data.len) return false;
+        const raw = entry.doc.data[@intCast(offset)..][0..@intCast(@min(end - address, entry.doc.data.len - offset))];
+        const decoded = decode_fn(raw, address);
+        if (decoded.size == 0 or decoded.size > raw.len) return false;
+        address += decoded.size;
+        if (address == end) return decoded.is_branch and !decoded.is_call and !decoded.is_return and decoded.branch_target == null;
+    }
+    return false;
+}
+
+/// Cache an immutable graph with store lifetime. Analysis allocations are
+/// temporary; Database.cacheCfg copies every block, adjacency and edge slice.
+fn ensureFunctionCfg(allocator: Allocator, proc: types.Procedure, db: *Database, entry: *DocumentEntry) ?types.CfgResult {
+    if (entry.doc.arch == .mips32) return null;
+    if (db.getCachedCfg(proc.entry)) |cached| return cached;
+    if (proc.size > 1024 * 1024) return null;
+    const info = resolveRawBytesInfo(entry, proc.entry) orelse return null;
+    const arch = entry.doc.arch;
+    const decoder: cfg_mod.DecodeFn = if (arch == .arm32) &cfg_mod.arm32CfgDecode else if (arch == .x86) &cfg_mod.x86CfgDecode else if (arch == .x86_64) &cfg_mod.x86_64CfgDecode else &arm64CfgDecode;
+    // An unknown extent is only a request-local preview. Caching its 64-byte
+    // fallback would truncate a later lift that discovers a longer function.
+    if (proc.size == 0)
+        return cfg_mod.buildCfgWithRecovery(allocator, &entry.doc, info.file_offset, info.section_base, proc.entry, 64, decoder) catch null;
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const built = cfg_mod.buildCfgWithRecovery(scratch.allocator(), &entry.doc, info.file_offset, info.section_base, proc.entry, proc.size, decoder) catch return null;
+    db.cacheCfg(proc.entry, built) catch return null;
+    return db.getCachedCfg(proc.entry);
+}
+
 fn handleGetCfg(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
     const start = timestampMs(ctx.io);
     const doc_id: u64 = resolveDocId(ctx, params) orelse {
@@ -5973,12 +6268,26 @@ fn handleGetCfg(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
         return .{ .json_response = resp, .is_error = true };
     });
 
-    const include_disasm = getBool(params, "include_disassembly") orelse false;
+    const instruction_view = getString(params, "instruction_view");
+    if (params.object.get("instruction_view") != null and (instruction_view == null or (!eql(instruction_view.?, "execution") and !eql(instruction_view.?, "disassembly")))) {
+        const resp = try json.errorResponse(ctx.allocator, "get_cfg", "instruction_view must be execution or disassembly", 0);
+        return .{ .json_response = resp, .is_error = true };
+    }
+    const execution_view = if (instruction_view) |view| eql(view, "execution") else false;
+    const include_disasm = execution_view or (getBool(params, "include_disassembly") orelse false);
 
     const entry = ctx.store.get(doc_id) orelse return docNotFoundError(ctx, "get_cfg");
     const eff = resolveEffectiveDb(entry);
     eff.db.rw_lock.lockSharedUncancelable(eff.db.io);
     defer eff.db.rw_lock.unlockShared(eff.db.io);
+
+    if (execution_view and (eff.entry.doc.arch != .arm64 or eff.delta != 0)) {
+        const resp = try json.errorResponse(ctx.allocator, "get_cfg", if (eff.delta != 0)
+            "execution view is unavailable for rebased documents; request instruction_view=disassembly with include_disassembly=true, or execution on the original parent document and original function address"
+        else
+            "execution view supports ARM64 only; request instruction_view=disassembly with include_disassembly=true for this architecture", 0);
+        return .{ .json_response = resp, .is_error = true };
+    }
 
     if (eff.entry.doc.arch == .mips32) {
         const resp = json.errorResponse(ctx.allocator, "get_cfg", "MIPS32 CFG not yet supported (delay slot handling required). Use disassemble_range for instruction-level analysis.", 0) catch return ToolError.OutOfMemory;
@@ -5988,58 +6297,8 @@ fn handleGetCfg(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
     // Translate input address
     const eff_func_addr = removeRebaseDelta(func_addr, eff.delta);
 
-    var cfg_result = eff.db.getCachedCfg(eff_func_addr);
-
-    // H2 fix: build CFG on-demand if not cached
-    if (cfg_result == null) {
-        const proc = eff.db.getProcedure(eff_func_addr) orelse eff.db.getProcedureContaining(eff_func_addr);
-        if (proc) |p| {
-            const proc_entry_addr = p.entry;
-            const proc_sz = if (p.size > 0) p.size else 64;
-
-            // Find the text section containing this procedure
-            var text_offset: ?usize = null;
-            var text_base: u64 = 0;
-            for (eff.entry.doc.segments) |seg| {
-                if (!seg.permissions.execute) continue;
-                if (proc_entry_addr >= seg.start and proc_entry_addr < seg.start + seg.length) {
-                    text_offset = @intCast(seg.file_offset);
-                    text_base = seg.start;
-                    break;
-                }
-                // Also check sections
-                for (seg.sections) |sec| {
-                    if (proc_entry_addr >= sec.start and proc_entry_addr < sec.start + sec.length) {
-                        text_offset = @intCast(sec.file_offset);
-                        text_base = sec.start;
-                        break;
-                    }
-                }
-                if (text_offset != null) break;
-            }
-
-            if (text_offset) |foff| {
-                if (eff.entry.doc.data.len > 0) {
-                    // Build CFG using architecture-appropriate decoder adapter
-                    const decode_fn: cfg_mod.DecodeFn = if (eff.entry.doc.arch == .arm32) &arm32CfgDecode else if (eff.entry.doc.arch == .mips32) &mips32CfgDecode else if (eff.entry.doc.arch == .x86_64) &cfg_mod.x86_64CfgDecode else &arm64CfgDecode;
-                    const built_cfg = cfg_mod.buildCfg(
-                        ctx.allocator,
-                        eff.entry.doc.data,
-                        foff,
-                        text_base,
-                        proc_entry_addr,
-                        proc_sz,
-                        decode_fn,
-                    ) catch null;
-
-                    if (built_cfg) |built| {
-                        eff.db.cacheCfg(proc_entry_addr, built) catch {};
-                        cfg_result = eff.db.getCachedCfg(proc_entry_addr);
-                    }
-                }
-            }
-        }
-    }
+    const proc = eff.db.getProcedure(eff_func_addr) orelse eff.db.getProcedureContaining(eff_func_addr);
+    const cfg_result = if (proc) |p| ensureFunctionCfg(ctx.allocator, p, eff.db, eff.entry) else null;
 
     const final_cfg = cfg_result orelse {
         // #13: include the address that failed
@@ -6048,21 +6307,40 @@ fn handleGetCfg(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
         return .{ .json_response = resp, .is_error = true };
     };
 
+    const offset: usize = @intCast(@max(getInt(params, "offset") orelse 0, 0));
+    const max_blocks: usize = @intCast(@min(@max(getInt(params, "max_blocks") orelse 64, 1), 256));
+    const page_start = @min(offset, final_cfg.basic_blocks.len);
+    var page_end = @min(page_start + max_blocks, final_cfg.basic_blocks.len);
+    var page_edges = std.array_list.Managed(types.CfgEdge).init(ctx.allocator);
+    defer page_edges.deinit();
+    for (final_cfg.edges) |edge| {
+        for (final_cfg.basic_blocks[page_start..page_end]) |block| {
+            if (edge.from == block.start) {
+                try page_edges.append(edge);
+                break;
+            }
+        }
+    }
+    const loop_evidence = loops_mod.derive(final_cfg.basic_blocks, final_cfg.edges, if (proc) |p| p.entry else eff_func_addr);
+    var page_cfg = types.CfgResult{ .basic_blocks = final_cfg.basic_blocks[page_start..page_end], .edges = page_edges.items };
+
     // Note: CFG addresses in output are from the parent db; we need to apply delta.
     // For simplicity, we serialize and the addresses are already in the parent's space.
     // We apply delta at the serialization level below.
     var buf = std.Io.Writer.Allocating.init(ctx.allocator);
     if (eff.delta == 0) {
-        if (include_disasm) {
-            writeCfgJsonWithDisasm(&buf.writer, final_cfg, eff.db, eff.entry.doc.data, eff.entry.doc.arch) catch return ToolError.OutOfMemory;
+        if (execution_view) {
+            try writeCfgJsonExecution(&buf.writer, page_cfg, final_cfg, &loop_evidence, page_start, if (proc) |p| p.entry else eff_func_addr, eff.entry, doc_id, ctx.allocator, false);
+        } else if (include_disasm) {
+            writeCfgJsonWithDisasm(&buf.writer, page_cfg, eff.db, eff.entry) catch return ToolError.OutOfMemory;
         } else {
-            writeCfgJson(&buf.writer, final_cfg) catch return ToolError.OutOfMemory;
+            writeCfgJson(&buf.writer, page_cfg) catch return ToolError.OutOfMemory;
         }
     } else {
         // Write CFG with rebased addresses
         const cw = &buf.writer;
         cw.writeAll("{\"basic_blocks\":[") catch return ToolError.OutOfMemory;
-        for (final_cfg.basic_blocks, 0..) |block, i| {
+        for (page_cfg.basic_blocks, 0..) |block, i| {
             if (i > 0) cw.writeByte(',') catch {};
             cw.writeAll("{\"start\":") catch {};
             json.writeAddress(cw, applyRebaseDelta(block.start, eff.delta)) catch {};
@@ -6082,7 +6360,7 @@ fn handleGetCfg(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
             cw.writeAll("]}") catch {};
         }
         cw.writeAll("],\"edges\":[") catch {};
-        for (final_cfg.edges, 0..) |edge, i| {
+        for (page_cfg.edges, 0..) |edge, i| {
             if (i > 0) cw.writeByte(',') catch {};
             cw.writeAll("{\"from\":") catch {};
             json.writeAddress(cw, applyRebaseDelta(edge.from, eff.delta)) catch {};
@@ -6091,6 +6369,122 @@ fn handleGetCfg(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
             cw.writeAll("}") catch {};
         }
         cw.writeAll("]}") catch {};
+    }
+    // max_blocks is an upper bound. Prefer a smaller complete instruction
+    // page to discarding all inline evidence for an oversized graph page.
+    const instruction_page_budget = max_response_chars - @as(usize, if (execution_view) 8192 else 2048);
+    while (include_disasm and eff.delta == 0 and buf.written().len > instruction_page_budget and page_end - page_start > 1) {
+        page_end = page_start + @max((page_end - page_start) / 2, 1);
+        page_edges.clearRetainingCapacity();
+        for (final_cfg.edges) |edge| {
+            for (final_cfg.basic_blocks[page_start..page_end]) |block| {
+                if (edge.from == block.start) {
+                    try page_edges.append(edge);
+                    break;
+                }
+            }
+        }
+        page_cfg = .{ .basic_blocks = final_cfg.basic_blocks[page_start..page_end], .edges = page_edges.items };
+        buf.clearRetainingCapacity();
+        if (execution_view)
+            try writeCfgJsonExecution(&buf.writer, page_cfg, final_cfg, &loop_evidence, page_start, if (proc) |p| p.entry else eff_func_addr, eff.entry, doc_id, ctx.allocator, false)
+        else
+            try writeCfgJsonWithDisasm(&buf.writer, page_cfg, eff.db, eff.entry);
+    }
+    var disassembly_omitted = include_disasm and eff.delta != 0;
+    if (include_disasm and eff.delta == 0 and buf.written().len > instruction_page_budget) {
+        buf.clearRetainingCapacity();
+        if (execution_view)
+            try writeCfgJsonExecution(&buf.writer, page_cfg, final_cfg, &loop_evidence, page_start, if (proc) |p| p.entry else eff_func_addr, eff.entry, doc_id, ctx.allocator, true)
+        else
+            writeCfgJson(&buf.writer, page_cfg) catch return ToolError.OutOfMemory;
+        disassembly_omitted = true;
+    }
+    // Append page metadata to the existing graph object without changing its keys.
+    buf.writer.end -= 1;
+    const pw = &buf.writer;
+    try pw.print(",\"total_blocks\":{d},\"returned_blocks\":{d},\"offset\":{d},\"partial\":{},\"disassembly_omitted\":{}", .{
+        final_cfg.basic_blocks.len, page_end - page_start, page_start, page_end < final_cfg.basic_blocks.len, disassembly_omitted,
+    });
+    if (instruction_view) |view| {
+        try pw.writeAll(",\"instruction_view\":");
+        try json.writeJsonString(pw, view);
+    }
+    if (execution_view) {
+        try pw.writeAll(",\"execution_semantics\":");
+        try json.writeJsonString(pw, arm64_steps.text_legend);
+        try pw.writeAll(",\"execution_model\":\"a64_local_steps_v1\",\"detailed_provenance_call\":{\"tool\":\"get_cfg\",\"arguments\":{");
+        try pw.print("\"doc_id\":{d},\"function_address\":", .{doc_id});
+        try json.writeAddress(pw, func_addr);
+        try pw.print(",\"offset\":{d},\"max_blocks\":{d},\"include_disassembly\":true,\"instruction_view\":\"disassembly\"}}}}", .{ page_start, max_blocks });
+    }
+    var unknown_terminator_blocks: usize = 0;
+    for (final_cfg.basic_blocks) |block| {
+        if (block.terminator == .unknown) unknown_terminator_blocks += 1;
+    }
+    try pw.print(",\"unknown_terminator_blocks\":{d}", .{unknown_terminator_blocks});
+    var unresolved_jumps: usize = 0;
+    var recovered_jumps: usize = 0;
+    for (final_cfg.basic_blocks) |block| {
+        if (hasUnresolvedIndirectJump(eff.entry, block)) {
+            // ARM64 BR has no fallthrough: known successors here are validated
+            // table cases. A predicated Thumb BX may have only its fallthrough.
+            if (eff.entry.doc.arch == .arm64 and block.successors.len > 0)
+                recovered_jumps += 1
+            else
+                unresolved_jumps += 1;
+        }
+    }
+    try pw.print(",\"unresolved_indirect_jumps\":{d},\"recovered_indirect_jumps\":{d},\"edge_coverage\":\"reachable_direct_and_validated_table_branches\",\"coverage_note\":\"partial describes pagination only; unsupported indirect patterns and undecoded paths may be missing\"", .{ unresolved_jumps, recovered_jumps });
+    // Reuse the full-graph evidence, including headers outside this page.
+    var loop_buf = std.Io.Writer.Allocating.init(ctx.allocator);
+    defer loop_buf.deinit();
+    try loops_mod.write(&loop_buf.writer, &loop_evidence, final_cfg.basic_blocks, final_cfg.edges, eff.delta, page_start, page_end);
+    if (buf.written().len + loop_buf.written().len < max_response_chars - 4096) {
+        try pw.writeAll(loop_buf.written());
+    } else {
+        try pw.writeAll(",\"loop_evidence\":{\"status\":\"omitted_response_budget\",\"semantic_completeness\":\"unknown\",\"loops\":null}");
+    }
+    if (eff.entry.doc.arch == .arm64 and !execution_view) {
+        const Words = struct {
+            entry: *DocumentEntry,
+            pub fn word(self: @This(), addr: u64) ?u32 {
+                const info = resolveRawBytesInfo(self.entry, addr) orelse return null;
+                const off = info.file_offset + (addr - info.section_base);
+                const data = self.entry.doc.data;
+                if (off > data.len or data.len - off < 4) return null;
+                return std.mem.readInt(u32, data[off..][0..4], .little);
+            }
+        };
+        var flow_buf = std.Io.Writer.Allocating.init(ctx.allocator);
+        defer flow_buf.deinit();
+        try register_flow.write(&flow_buf.writer, final_cfg.basic_blocks, final_cfg.edges, Words{ .entry = eff.entry }, eff.delta, page_start, page_end, if (proc) |p| p.entry else eff_func_addr);
+        if (buf.written().len + flow_buf.written().len < max_response_chars - 4096) {
+            try pw.writeAll(flow_buf.written());
+        } else {
+            try pw.writeAll(",\"register_flow_evidence\":{\"status\":\"omitted_response_budget\",\"inputs\":null}");
+        }
+    }
+    if (page_end < final_cfg.basic_blocks.len) {
+        try pw.print(",\"next_offset\":{d},\"next_call\":{{\"tool\":\"get_cfg\",\"arguments\":{{\"doc_id\":{d},\"function_address\":", .{ page_end, doc_id });
+        try json.writeAddress(pw, func_addr);
+        try pw.print(",\"offset\":{d},\"max_blocks\":{d},\"include_disassembly\":{}", .{ page_end, max_blocks, include_disasm });
+        if (instruction_view) |view| {
+            try pw.writeAll(",\"instruction_view\":");
+            try json.writeJsonString(pw, view);
+        }
+        try pw.writeAll("}}");
+    }
+    if (disassembly_omitted) {
+        try pw.print(",\"next_disassembly_call\":{{\"tool\":\"disassemble_range\",\"arguments\":{{\"doc_id\":{d},\"start\":", .{doc_id});
+        try json.writeAddress(pw, if (page_cfg.basic_blocks.len > 0) applyRebaseDelta(page_cfg.basic_blocks[0].start, eff.delta) else func_addr);
+        try pw.writeAll(",\"byte_length\":256}}");
+    }
+    try pw.writeByte('}');
+    if (buf.written().len > max_response_chars - 2048) {
+        buf.deinit();
+        const resp = json.errorResponse(ctx.allocator, "get_cfg", "CFG adjacency exceeds the response budget. Retry with max_blocks=1 and include_disassembly=false. If one block still exceeds the limit, use disassemble_range; complete adjacency cannot be returned for this block.", 0) catch return ToolError.OutOfMemory;
+        return .{ .json_response = resp, .is_error = true };
     }
     const result_json = buf.toOwnedSlice() catch return ToolError.OutOfMemory;
 
@@ -6201,8 +6595,10 @@ fn handleLift(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
         return .{ .json_response = resp, .is_error = true };
     };
     defer ctx.allocator.free(addresses);
-    const format_str = getString(params, "format") orelse "pseudocode";
-    const use_pseudocode = !std.ascii.eqlIgnoreCase(format_str, "ir");
+    if (params == .object and params.object.contains("format")) {
+        const resp = json.errorResponse(ctx.allocator, "lift", "lift returns heuristic IR only; the format parameter has been removed", 0) catch return ToolError.OutOfMemory;
+        return .{ .json_response = resp, .is_error = true };
+    }
 
     const entry = ctx.store.get(doc_id) orelse return docNotFoundError(ctx, "lift");
     const eff = resolveEffectiveDb(entry);
@@ -6210,8 +6606,16 @@ fn handleLift(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
     eff.db.rw_lock.lockSharedUncancelable(eff.db.io);
     defer eff.db.rw_lock.unlockShared(eff.db.io);
 
+    if (eff.entry.doc.arch == .x86) {
+        const resp = json.errorResponse(ctx.allocator, "lift", "32-bit x86 lifting is not yet supported. Use get_cfg and disassemble_range for decoded instruction evidence; this is not a missing-procedure error.", 0) catch return ToolError.OutOfMemory;
+        return .{ .json_response = resp, .is_error = true };
+    }
+
     var items = std.array_list.Managed(json.BatchItem).init(ctx.allocator);
     var addr_buf: [32]u8 = undefined;
+    const offset: usize = @intCast(@max(getInt(params, "offset") orelse 0, 0));
+    const max_results: usize = @intCast(@min(@max(getInt(params, "max_results") orelse 128, 1), 256));
+    const page_budget = (max_response_chars - 8192) / @max(addresses.len, 1);
 
     for (addresses) |addr| {
         const item_start = timestampMs(ctx.io);
@@ -6246,26 +6650,8 @@ fn handleLift(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
         }
 
         if (eff.db.getCachedIR(if (proc) |p| p.entry else eff_addr)) |ir_func| {
-            var buf = std.Io.Writer.Allocating.init(ctx.allocator);
-            if (use_pseudocode) {
-                // W5: pass PLT resolution context so call targets render as import names.
-                const plt_ctx = PseudocodeCtx{
-                    .allocator = ctx.allocator,
-                    .db = eff.db,
-                    .doc = &eff.entry.doc,
-                };
-                writePseudocodeWithCtx(&buf.writer, ir_func, plt_ctx) catch {
-                    items.append(.{ .input = label_copy, .success = false, .err = "serialization error", .time_ms = timestampMs(ctx.io) - item_start }) catch {};
-                    continue;
-                };
-            } else {
-                writeIrJson(&buf.writer, ir_func) catch {
-                    items.append(.{ .input = label_copy, .success = false, .err = "serialization error", .time_ms = timestampMs(ctx.io) - item_start }) catch {};
-                    continue;
-                };
-            }
-            const result_json = buf.toOwnedSlice() catch {
-                items.append(.{ .input = label_copy, .success = false, .err = "serialization error", .time_ms = timestampMs(ctx.io) - item_start }) catch {};
+            const result_json = irPageJson(ctx.allocator, ir_func, doc_id, if (proc) |p| applyRebaseDelta(p.entry, eff.delta) else addr, offset, max_results, page_budget) catch |err| {
+                items.append(.{ .input = label_copy, .success = false, .err = if (err == error.RecordTooLarge) "IR record exceeds this batch's response budget. Retry lift with one address and max_results=1, or use disassemble_range for primary evidence." else "serialization error", .time_ms = timestampMs(ctx.io) - item_start }) catch {};
                 continue;
             };
             items.append(.{ .input = label_copy, .success = true, .result = result_json, .time_ms = timestampMs(ctx.io) - item_start }) catch {};
@@ -6287,8 +6673,15 @@ fn ensureLiftedIR(allocator: Allocator, proc: types.Procedure, db: *Database, do
     // x86_64 lifter added in v7.7.0.
     if (doc_entry.doc.arch == .x86) return;
 
-    // Already cached — nothing to do
-    if (db.getCachedIR(proc.entry) != null) return;
+    // v7.16 W4: serialize the whole check+lift+put. Callers hold only the
+    // SHARED rw_lock, so without this two concurrent lifts on one doc would
+    // race the (non-thread-safe) ir_arena + ir_cache. Use the RAW ir_cache map
+    // here (not getCachedIR/cacheIR) since those re-acquire ir_mutex.
+    db.ir_mutex.lockUncancelable(db.io);
+    defer db.ir_mutex.unlock(db.io);
+
+    // Already cached — nothing to do (re-check under the mutex).
+    if (db.ir_cache.get(proc.entry) != null) return;
 
     var lift_proc = proc;
     const is_arm32 = doc_entry.doc.arch == .arm32;
@@ -6393,6 +6786,12 @@ fn ensureLiftedIR(allocator: Allocator, proc: types.Procedure, db: *Database, do
         }
     }
 
+    // Reuse recovered case blocks and real joins when constructing IR.
+    // A fallback remains for architectures whose CFG is explicitly unsupported.
+    if (ensureFunctionCfg(allocator, lift_proc, db, doc_entry)) |graph| {
+        lift_proc.basic_blocks = graph.basic_blocks;
+    }
+
     // Create a synthetic basic block if needed
     const inst_size_avg: u32 = if (is_arm32) 2 else if (is_x86_64) 3 else 4;
     var synthetic_block: [1]types.BasicBlock = undefined;
@@ -6412,9 +6811,21 @@ fn ensureLiftedIR(allocator: Allocator, proc: types.Procedure, db: *Database, do
     // const_fold, dead_store, stack_slot, fp_alias, reg_to_var) actually run on
     // the IR that gets cached + rendered. Previously called liftProcedure, which
     // bypassed the entire maturity pipeline — so v7.8.0+ pass benefits never
-    // reached user-facing decompile/lift output.
-    const ir_func = lifter.liftProcedureMature(allocator, &lift_proc, db) catch return;
-    db.cacheIR(proc.entry, ir_func) catch {};
+    // reached user-facing IR output.
+    //
+    // v7.16 W4 (IR-cache cross-request UAF fix): lift into the STORE-OWNED
+    // allocator (`db.allocator`), not the per-request arena passed in. The
+    // resulting IRFunction (and every string/variable/statement it owns) is
+    // cached in `db.ir_cache`, which outlives the request. Allocating it from
+    // the request arena meant the next request read freed memory — a UAF only
+    // masked today by the deliberate per-request arena leak in server.zig.
+    // Same class of bug as `ensureCalleesCached`; here we lift into the db's
+    // dedicated IR arena (`db.irAllocator()`) so ALL cached-IR content is freed
+    // wholesale on `db.deinit` — no per-string ownership tracking (the trap the
+    // v7.15.x series kept hitting). The passed `allocator` is retained for
+    // signature compatibility.
+    const ir_func = lifter.liftProcedureMatureForArch(db.irAllocator(), &lift_proc, db, doc_entry.doc.arch) catch return;
+    db.ir_cache.put(proc.entry, ir_func) catch {}; // raw put — already holding ir_mutex
 }
 
 /// Info needed to resolve a virtual address to raw binary bytes.
@@ -6657,6 +7068,20 @@ fn handleSaveProject(ctx: ToolContext, params: std.json.Value) ToolError!ToolRes
     w.writeAll(",\"entry_point\":") catch {};
     json.writeAddress(w, save_doc.entry_point) catch {};
 
+    var source_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(save_doc.data, &source_digest, .{});
+    const source_hex = std.fmt.bytesToHex(source_digest, .lower);
+    w.writeAll(",\"source_sha256\":") catch {};
+    json.writeJsonString(w, &source_hex) catch {};
+
+    // Preserve entry provenance across project round trips.
+    w.writeAll(",\"linker_function_starts\":[") catch {};
+    for (save_doc.linker_function_starts, 0..) |address, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        json.writeAddress(w, address) catch {};
+    }
+    w.writeByte(']') catch {};
+
     // Procedures
     w.writeAll(",\"procedures\":[") catch {};
     for (save_doc.procedures.items, 0..) |proc, i| {
@@ -6730,6 +7155,10 @@ fn handleSaveProject(ctx: ToolContext, params: std.json.Value) ToolError!ToolRes
             w.print(",\"length\":{d}", .{sec.length}) catch {};
             w.print(",\"file_offset\":{d}", .{sec.file_offset}) catch {};
             w.print(",\"alignment\":{d}", .{sec.alignment}) catch {};
+            w.print(",\"is_code\":{s},\"is_zerofill\":{s}", .{
+                if (sec.isCode()) "true" else "false",
+                if (sec.is_zerofill) "true" else "false",
+            }) catch {};
             w.writeByte('}') catch {};
         }
         w.writeAll("]}") catch {};
@@ -6777,7 +7206,7 @@ fn handleSaveProject(ctx: ToolContext, params: std.json.Value) ToolError!ToolRes
         var xref_it = eff.db.xrefs.refs_from.iterator();
         while (xref_it.next()) |xref_entry| {
             for (xref_entry.value_ptr.items) |xref| {
-                const key = XrefKey{ .from = xref.from, .to = xref.to, .kind = @intFromEnum(xref.xref_type) };
+                const key = XrefKey{ .from = xref.from, .to = xref.to, .kind = @backingInt(xref.xref_type) };
                 if (xref_seen.contains(key)) continue;
                 xref_seen.put(key, {}) catch {};
                 if (!xref_first) w.writeByte(',') catch {};
@@ -6858,6 +7287,15 @@ fn handleLoadProject(ctx: ToolContext, params: std.json.Value) ToolError!ToolRes
     } else |_| {
         reload_warning = "original binary not found at saved path; disassembly unavailable";
     }
+    var source_matches = false;
+    if (getString(root, "source_sha256")) |saved_digest| {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(binary_data, &digest, .{});
+        const current_hex = std.fmt.bytesToHex(digest, .lower);
+        source_matches = reload_warning == null and std.mem.eql(u8, saved_digest, &current_hex);
+        if (!source_matches and reload_warning == null)
+            reload_warning = "source binary has changed since save; restored analysis is stale and linker provenance is omitted. Use load_binary to refresh analysis.";
+    }
     entry.* = .{
         .doc = types.Document.init(store_alloc, doc_id, orig_path, binary_data),
         .db = Database.init(store_alloc, ctx.io),
@@ -6906,6 +7344,8 @@ fn handleLoadProject(ctx: ToolContext, params: std.json.Value) ToolError!ToolRes
                         .length = sec_length,
                         .file_offset = sec_file_offset,
                         .alignment = sec_alignment,
+                        .is_code = getBool(secv, "is_code"),
+                        .is_zerofill = getBool(secv, "is_zerofill") orelse false,
                     }) catch {};
                 }
             }
@@ -6922,6 +7362,36 @@ fn handleLoadProject(ctx: ToolContext, params: std.json.Value) ToolError!ToolRes
         }
         entry.doc.segments = segments.toOwnedSlice() catch &.{};
     }
+
+    // Old projects lack this optional field. Reject the entire list if it is
+    // unsorted, duplicated or outside code, rather than inventing provenance.
+    if (source_matches) if (getArray(root, "linker_function_starts")) |starts_json| {
+        var starts = std.array_list.Managed(u64).init(store_alloc);
+        defer starts.deinit();
+        var valid = true;
+        for (starts_json.array.items) |value| {
+            const address: u64 = switch (value) {
+                .integer => |n| if (n >= 0) @intCast(n) else {
+                    valid = false;
+                    break;
+                },
+                .string => |v| std.fmt.parseInt(u64, v, 0) catch {
+                    valid = false;
+                    break;
+                },
+                else => {
+                    valid = false;
+                    break;
+                },
+            };
+            if (entry.doc.codeRangeEnd(address) == null or (starts.items.len > 0 and address <= starts.items[starts.items.len - 1])) {
+                valid = false;
+                break;
+            }
+            try starts.append(address);
+        }
+        if (valid) entry.doc.linker_function_starts = try starts.toOwnedSlice();
+    };
 
     // Pre-scan annotations to find addresses with user-set names (these take priority over proc names)
     var ann_name_addrs = std.AutoHashMap(u64, []const u8).init(ctx.allocator);
@@ -7036,6 +7506,9 @@ fn handleLoadProject(ctx: ToolContext, params: std.json.Value) ToolError!ToolRes
     }
 
     ctx.store.put(entry) catch return ToolError.OutOfMemory;
+    // v7.16 W5: restoring a project adds a doc (+ its phora://doc/{id} resource).
+    ctx.queueNotification("notifications/tools/list_changed");
+    ctx.queueNotification("notifications/resources/list_changed");
 
     const elapsed = timestampMs(ctx.io) - start;
     const warn_str: []const u8 = if (reload_warning) |w| w else "";
@@ -7428,6 +7901,68 @@ fn handleGetStrings(ctx: ToolContext, params: std.json.Value) ToolError!ToolResu
                 rw.writeAll("]}") catch {};
                 emitted_blocks += 1;
             }
+
+            // v7.16 W1: the default (grouped) path used to return before the
+            // packed-segment scan, so `get_strings pattern=X` silently missed
+            // embedded-runtime bundles (__BUN etc.). Run the on-demand byte-grep
+            // here too when a pattern is set and the segment filter (if any)
+            // names a packed segment. Emit hits as a `source:"bundle"` block.
+            if (effective_pattern) |pp| {
+                const seg_ok = segment_filter == null or strings_mod.isPackedSegment(segment_filter.?);
+                if (seg_ok and emitted_blocks < max_results and strings_mod.hasPackedSegment(&di.entry.doc)) {
+                    const budget: u32 = max_results - emitted_blocks;
+                    const BundleHit = struct { address: u64, excerpt: []const u8, full_length: usize, segment_name: []const u8 };
+                    var hits = std.array_list.Managed(BundleHit).init(ctx.allocator);
+                    var seen_addr = std.AutoHashMap(u64, void).init(ctx.allocator);
+                    defer seen_addr.deinit();
+                    // v7.16 W1 fix: searchPackedSegments byte-greps LITERALLY, so
+                    // split the pattern on '|' and run one search per alternative
+                    // (matchesMultiPattern's OR semantics), deduping by address.
+                    var alt_it = std.mem.tokenizeScalar(u8, pp, '|');
+                    while (alt_it.next()) |alt| {
+                        if (hits.items.len >= budget) break;
+                        const rem: u32 = budget - @as(u32, @intCast(hits.items.len));
+                        var packed_res = strings_mod.searchPackedSegments(ctx.allocator, &di.entry.doc, alt, .{
+                            .case_insensitive = case_insensitive,
+                            .max_results = rem,
+                            .excerpt_radius = 60,
+                        }) catch continue;
+                        defer packed_res.deinit();
+                        for (packed_res.hits.items) |h| {
+                            if (hits.items.len >= budget) break;
+                            // Honor an explicit packed segment_filter (searchPackedSegments scans ALL packed segments).
+                            if (segment_filter) |sf| {
+                                if (!std.mem.eql(u8, h.segment_name, sf)) continue;
+                            }
+                            if (seen_addr.contains(h.address)) continue;
+                            seen_addr.put(h.address, {}) catch {};
+                            hits.append(.{ .address = h.address, .excerpt = h.excerpt, .full_length = h.full_length, .segment_name = h.segment_name }) catch {};
+                        }
+                    }
+                    if (hits.items.len > 0) {
+                        if (!first_block) rw.writeByte(',') catch {};
+                        first_block = false;
+                        rw.writeAll("{\"source\":\"bundle\"") catch {};
+                        if (is_cross_doc) {
+                            rw.print(",\"doc_id\":{d}", .{di.doc_id}) catch {};
+                        }
+                        rw.writeAll(",\"strings\":[") catch {};
+                        for (hits.items, 0..) |h, i| {
+                            if (i > 0) rw.writeByte(',') catch {};
+                            rw.writeAll("{\"address\":") catch {};
+                            json.writeAddress(rw, applyRebaseDelta(h.address, di.eff_delta)) catch {};
+                            rw.writeAll(",\"text\":") catch {};
+                            json.writeJsonString(rw, h.excerpt) catch {};
+                            rw.print(",\"full_length\":{d},\"segment\":", .{h.full_length}) catch {};
+                            json.writeJsonString(rw, h.segment_name) catch {};
+                            rw.writeByte('}') catch {};
+                            total_strings += 1;
+                        }
+                        rw.writeAll("]}") catch {};
+                        emitted_blocks += 1;
+                    }
+                }
+            }
         }
 
         rw.writeAll("]") catch {};
@@ -7526,15 +8061,17 @@ fn handleGetStrings(ctx: ToolContext, params: std.json.Value) ToolError!ToolResu
         }
     }
 
-    // Byte-level scan: __BUN segments always, all segments when scan=true.
+    // Byte-level scan: packed runtime segments always, all segments when scan=true.
     // Grep-style: scan raw bytes for the pattern, extract surrounding printable string.
+    // v7.16 W1: consult the RuntimeAdapter registry instead of hard-coding "__BUN"
+    // so asar/ggml/j2objc/upb/etc. packed segments are covered too.
     if (effective_pattern != null and items.items.len < max_results) {
         const pat = effective_pattern.?;
         for (docs_to_search.items) |di| {
             for (di.entry.doc.segments) |seg| {
-                const is_bun = std.mem.startsWith(u8, seg.name, "__BUN");
-                if (!is_bun and !scan_mode) continue;
-                const source_tag: []const u8 = if (is_bun) "bundle" else "scan";
+                const is_packed = strings_mod.isPackedSegment(seg.name);
+                if (!is_packed and !scan_mode) continue;
+                const source_tag: []const u8 = if (is_packed) "bundle" else "scan";
                 for (seg.sections) |section| {
                     const sec_end = section.file_offset + section.length;
                     if (sec_end > di.entry.doc.data.len) continue;
@@ -8124,191 +8661,230 @@ fn handleGetExports(ctx: ToolContext, params: std.json.Value) ToolError!ToolResu
     return .{ .json_response = final_resp };
 }
 
+const InstructionBytes = struct {
+    data: []const u8,
+    file_offset: u64,
+};
+
+/// Restrict instruction evidence to file-backed code and the caller's byte budget.
+fn instructionBytes(doc: *const types.Document, address: u64, budget: u64) ?InstructionBytes {
+    const code_end = doc.codeRangeEnd(address) orelse return null;
+    for (doc.segments) |seg| {
+        if (!seg.permissions.execute or address < seg.start or address - seg.start >= seg.length) continue;
+        var offset: u64 = undefined;
+        var available: u64 = undefined;
+        if (doc.format == .elf or seg.sections.len == 0) {
+            const relative = address - seg.start;
+            if (relative >= seg.file_size) return null;
+            offset = std.math.add(u64, seg.file_offset, relative) catch return null;
+            available = seg.file_size - relative;
+        } else {
+            var section: ?types.Section = null;
+            for (seg.sections) |sec| {
+                if (sec.isCode() and address >= sec.start and address - sec.start < sec.length) {
+                    section = sec;
+                    break;
+                }
+            }
+            const sec = section orelse return null;
+            const relative = address - sec.start;
+            offset = std.math.add(u64, sec.file_offset, relative) catch return null;
+            available = sec.length - relative;
+        }
+        if (offset >= doc.data.len) return null;
+        const size = @min(available, doc.data.len - offset, code_end - address, budget);
+        return .{ .data = doc.data[@intCast(offset)..][0..@intCast(size)], .file_offset = offset };
+    }
+    return null;
+}
+
+fn x86DecodeGap(mnemonic: []const u8) bool {
+    return std.mem.eql(u8, mnemonic, "udf") or std.mem.eql(u8, mnemonic, "db") or std.mem.eql(u8, mnemonic, "unsupported");
+}
+
 fn handleDisassembleRange(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
-    const doc_id: u64 = resolveDocId(ctx, params) orelse {
-        return docNotFoundErrorFull(ctx, "disassemble_range", params);
-    };
-    const start_addr: u64 = @intCast(getInt(params, "start") orelse getInt(params, "address") orelse {
-        const resp = json.errorResponse(ctx.allocator, "disassemble_range", "missing required parameter: start", 0) catch return ToolError.OutOfMemory;
+    if (params == .object and (params.object.contains("end") or params.object.contains("end_address"))) {
+        const resp = json.errorResponse(ctx.allocator, "disassemble_range", "Use start plus byte_length (bytes, not instructions); end/end_address is unsupported. Compute byte_length = end_exclusive - start.", 0) catch return ToolError.OutOfMemory;
         return .{ .json_response = resp, .is_error = true };
-    });
+    }
+    const doc_id = resolveDocId(ctx, params) orelse return docNotFoundErrorFull(ctx, "disassemble_range", params);
+    const raw_start = getInt(params, "start") orelse getInt(params, "address") orelse -1;
     const raw_length = getInt(params, "byte_length") orelse getInt(params, "length") orelse blk: {
-        // Accept "count" as instruction count (×4 bytes for ARM)
-        if (getInt(params, "count")) |c| break :blk @as(i64, @max(c, 1)) * 4;
-        // Default 4096 bytes when omitted (matches schema default)
+        if (getInt(params, "count")) |count| break :blk count *| 4;
         break :blk @as(i64, 4096);
     };
-
-    if (raw_length <= 0) {
-        const resp = json.errorResponse(ctx.allocator, "disassemble_range", "byte_length must be positive", 0) catch return ToolError.OutOfMemory;
+    if (raw_start < 0 or raw_length <= 0) {
+        const resp = json.errorResponse(ctx.allocator, "disassemble_range", "start must be a non-negative address and byte_length must be positive", 0) catch return ToolError.OutOfMemory;
         return .{ .json_response = resp, .is_error = true };
     }
     const length: u64 = @intCast(@min(raw_length, 4096));
-
     const entry = ctx.store.get(doc_id) orelse return docNotFoundError(ctx, "disassemble_range");
     const eff = resolveEffectiveDb(entry);
     eff.db.rw_lock.lockSharedUncancelable(eff.db.io);
     defer eff.db.rw_lock.unlockShared(eff.db.io);
-
-    // Translate input address
-    const eff_start = removeRebaseDelta(start_addr, eff.delta);
+    const doc = &eff.entry.doc;
+    const eff_start = removeRebaseDelta(@intCast(raw_start), eff.delta);
+    if (doc.arch == .arm64 and eff_start % 4 != 0) {
+        const resp = json.errorResponse(ctx.allocator, "disassemble_range", "ARM64 instruction address must be 4-byte aligned", 0) catch return ToolError.OutOfMemory;
+        return .{ .json_response = resp, .is_error = true };
+    }
 
     var items = std.array_list.Managed(json.BatchItem).init(ctx.allocator);
     var addr_buf: [32]u8 = undefined;
-
-    // Walk through instructions in the range using the database's instruction cache.
     var addr = eff_start;
-    const end_addr = eff_start + length;
+    const end_addr = eff_start +| length;
+    var stop_reason: []const u8 = "complete";
+    var modeled: u32 = 0;
+    var unsupported: u32 = 0;
+    var invalid: u32 = 0;
+    var decode_gaps: u32 = 0;
+    var output_bytes: usize = 1024;
+    var thumb_state: arm32.ItState = .{};
     while (addr < end_addr) {
-        if (eff.db.getInstruction(addr)) |inst| {
-            const rebased_addr = applyRebaseDelta(addr, eff.delta);
-            const label_copy = ctx.allocator.dupe(u8, addrStr(&addr_buf, rebased_addr)) catch "?";
-
-            var buf = std.Io.Writer.Allocating.init(ctx.allocator);
-            const w = &buf.writer;
-            w.writeAll("{\"address\":") catch {};
-            json.writeAddress(w, applyRebaseDelta(inst.address, eff.delta)) catch {};
-            w.writeAll(",\"mnemonic\":") catch {};
-            json.writeJsonString(w, inst.mnemonic) catch {};
-            w.writeAll(",\"operands\":") catch {};
-            json.writeJsonString(w, eff.db.getInstructionOperands(addr)) catch {};
-            w.print(",\"size\":{d}", .{inst.size}) catch {};
-            w.writeByte('}') catch {};
-
-            const result_json = buf.toOwnedSlice() catch {
-                addr += inst.size;
-                continue;
-            };
-            items.append(.{ .input = label_copy, .success = true, .result = result_json }) catch {};
-            addr += inst.size;
+        const raw = instructionBytes(doc, addr, end_addr - addr) orelse {
+            stop_reason = "not_file_backed_code";
+            break;
+        };
+        const min_size: usize = switch (doc.arch) {
+            .arm64, .mips32 => 4,
+            .arm32 => 2,
+            .x86, .x86_64 => 1,
+        };
+        if (raw.data.len < min_size) {
+            stop_reason = "incomplete_instruction";
+            break;
+        }
+        const thumb_decoded: ?arm32.DecodedInstruction = if (doc.arch == .arm32) arm32.decode(raw.data, addr) else null;
+        const predicate = thumb_state.currentCondition();
+        const cached = eff.db.getInstruction(addr);
+        const inst = cached orelse switch (doc.arch) {
+            .arm64 => arm64.decodeInstruction(raw.data, addr),
+            .arm32 => arm32.decodeInstruction(raw.data, addr),
+            .mips32 => mips32.decodeInstruction(raw.data, addr),
+            .x86_64 => @import("arch/x86_64.zig").decodeInstruction(raw.data, addr),
+            .x86 => @import("arch/x86_64.zig").decodeInstruction32(raw.data, addr),
+        };
+        if ((doc.arch == .x86 or doc.arch == .x86_64) and x86DecodeGap(inst.mnemonic)) {
+            decode_gaps += 1;
+            stop_reason = "undecoded_instruction";
+            break;
+        }
+        if (inst.size == 0 or inst.size > raw.data.len or (doc.arch == .arm64 and inst.size != 4)) {
+            stop_reason = "incomplete_instruction";
+            break;
+        }
+        const rebased_addr = applyRebaseDelta(addr, eff.delta);
+        const label = ctx.allocator.dupe(u8, addrStr(&addr_buf, rebased_addr)) catch return ToolError.OutOfMemory;
+        var buf = std.Io.Writer.Allocating.init(ctx.allocator);
+        const w = &buf.writer;
+        w.writeAll("{\"address\":") catch return ToolError.OutOfMemory;
+        json.writeAddress(w, rebased_addr) catch return ToolError.OutOfMemory;
+        w.writeAll(",\"mnemonic\":") catch return ToolError.OutOfMemory;
+        const display_mnemonic = if (thumb_decoded) |d| (if (predicate != null and d.flags_suppressed_in_it and std.mem.endsWith(u8, d.mnemonic, "s")) d.mnemonic[0 .. d.mnemonic.len - 1] else d.mnemonic) else inst.mnemonic;
+        json.writeJsonString(w, display_mnemonic) catch return ToolError.OutOfMemory;
+        w.writeAll(",\"operands\":") catch return ToolError.OutOfMemory;
+        const operands = if (cached != null) eff.db.getInstructionOperands(addr) else inst.operands_buf[0..inst.operands_len];
+        json.writeJsonString(w, operands) catch return ToolError.OutOfMemory;
+        w.print(",\"size\":{d},\"file_offset\":{d},\"bytes\":\"", .{ inst.size, raw.file_offset }) catch return ToolError.OutOfMemory;
+        for (raw.data[0..inst.size]) |byte| w.print("{x:0>2}", .{byte}) catch return ToolError.OutOfMemory;
+        w.writeAll("\",\"semantics\":") catch return ToolError.OutOfMemory;
+        if (doc.arch == .arm64) {
+            const word = std.mem.readInt(u32, raw.data[0..4], .little);
+            arm64_semantics.writeJson(w, word) catch return ToolError.OutOfMemory;
+            arm64_addressing.writeJsonMember(w, word) catch return ToolError.OutOfMemory;
+            arm64_arithmetic.writeJsonMember(w, word) catch return ToolError.OutOfMemory;
+            arm64_bitfield.writeJsonMember(w, word) catch return ToolError.OutOfMemory;
+            if (addr >= eff_start +| 4) {
+                if (instructionBytes(doc, addr - 4, 4)) |previous_raw| {
+                    if (previous_raw.data.len >= 4)
+                        arm64_branch_predicate.writeJsonMember(w, std.mem.readInt(u32, previous_raw.data[0..4], .little), word, applyRebaseDelta(addr - 4, eff.delta)) catch return ToolError.OutOfMemory;
+                }
+            }
+            const status = arm64.decode(raw.data[0..4], addr).decode_status;
+            w.print(",\"decode_status\":\"{s}\"", .{@tagName(status)}) catch return ToolError.OutOfMemory;
+            if (status != .decoded) {
+                w.writeAll(",\"decode_warning\":\"Opaque ARM64 decoder fallback; fixed four-byte slots preserve raw bytes but establish no instruction identity, effects, or fallthrough.\"") catch return ToolError.OutOfMemory;
+            }
         } else {
-            // No stored instruction — decode on-demand from raw binary data.
-            const is_arm32 = eff.entry.doc.arch == .arm32;
-            const is_mips32 = eff.entry.doc.arch == .mips32;
-            const is_x86_64 = eff.entry.doc.arch == .x86_64;
-            const min_inst_size: usize = if (is_arm32) 2 else if (is_x86_64) 1 else 4;
-
-            // Find the executable segment/section containing this address.
-            // ELF: segment p_offset is the authoritative vaddr→file mapping.
-            // Mach-O: section offsets are preferred, segment is fallback.
-            var text_offset: ?usize = null;
-            var text_base: u64 = 0;
-            const is_elf_fmt = eff.entry.doc.format == .elf;
-            for (eff.entry.doc.segments) |seg| {
-                if (!seg.permissions.execute) continue;
-                if (is_elf_fmt) {
-                    // ELF: use segment directly (section headers may be stripped/unreliable)
-                    if (addr >= seg.start and addr < seg.start + seg.length) {
-                        text_offset = @intCast(seg.file_offset);
-                        text_base = seg.start;
-                        break;
-                    }
-                } else {
-                    // Mach-O/other: try sections first, then segment
-                    for (seg.sections) |sec| {
-                        if (addr >= sec.start and addr < sec.start + sec.length) {
-                            text_offset = @intCast(sec.file_offset);
-                            text_base = sec.start;
-                            break;
-                        }
-                    }
-                    if (text_offset != null) break;
-                    if (addr >= seg.start and addr < seg.start + seg.length) {
-                        text_offset = @intCast(seg.file_offset);
-                        text_base = seg.start;
-                        break;
-                    }
-                }
-            }
-
-            var decoded_mnemonic: []const u8 = "";
-            var decoded_operands: [128]u8 = [_]u8{0} ** 128;
-            var decoded_operands_len: u8 = 0;
-            var decoded_length: u8 = 0;
-            var have_decoded = false;
-
-            if (text_offset) |foff| {
-                const byte_offset = foff + (addr - text_base);
-                if (byte_offset + min_inst_size <= eff.entry.doc.data.len and eff.entry.doc.data.len > 0) {
-                    if (is_arm32) {
-                        const d = arm32.decode(eff.entry.doc.data[byte_offset..], addr);
-                        decoded_mnemonic = d.mnemonic;
-                        decoded_operands = d.operands;
-                        decoded_operands_len = d.operands_len;
-                        decoded_length = d.length;
-                        have_decoded = true;
-                    } else if (is_mips32) {
-                        const d = mips32.decode(eff.entry.doc.data[byte_offset..], addr);
-                        decoded_mnemonic = d.mnemonic;
-                        decoded_operands = d.operands;
-                        decoded_operands_len = d.operands_len;
-                        decoded_length = d.length;
-                        have_decoded = true;
-                    } else if (is_x86_64) {
-                        const x86 = @import("arch/x86_64.zig");
-                        const d = x86.decode(eff.entry.doc.data[byte_offset..], addr);
-                        decoded_mnemonic = d.mnemonic;
-                        decoded_operands = d.operands;
-                        decoded_operands_len = d.operands_len;
-                        decoded_length = d.length;
-                        have_decoded = true;
-                    } else {
-                        const d = arm64.decode(eff.entry.doc.data[byte_offset..], addr);
-                        decoded_mnemonic = d.mnemonic;
-                        decoded_operands = d.operands;
-                        decoded_operands_len = d.operands_len;
-                        decoded_length = d.length;
-                        have_decoded = true;
-                    }
-                }
-            }
-
-            if (have_decoded) {
-                const rebased_addr = applyRebaseDelta(addr, eff.delta);
-                const label_copy = ctx.allocator.dupe(u8, addrStr(&addr_buf, rebased_addr)) catch "?";
-
-                var buf = std.Io.Writer.Allocating.init(ctx.allocator);
-                const w = &buf.writer;
-                w.writeAll("{\"address\":") catch {};
-                json.writeAddress(w, rebased_addr) catch {};
-                w.writeAll(",\"mnemonic\":") catch {};
-                json.writeJsonString(w, decoded_mnemonic) catch {};
-                w.writeAll(",\"operands\":") catch {};
-                json.writeJsonString(w, decoded_operands[0..decoded_operands_len]) catch {};
-                w.print(",\"size\":{d}", .{@as(u32, decoded_length)}) catch {};
-                w.writeByte('}') catch {};
-
-                const result_json = buf.toOwnedSlice() catch {
-                    addr += decoded_length;
-                    continue;
-                };
-                items.append(.{ .input = label_copy, .success = true, .result = result_json }) catch {};
-                addr += decoded_length;
-            } else {
-                addr += min_inst_size;
+            w.writeAll("{\"status\":\"unsupported\",\"reason\":\"architecture_not_modeled\"}") catch return ToolError.OutOfMemory;
+        }
+        if (doc.arch == .x86 or doc.arch == .x86_64) {
+            const gap = std.mem.eql(u8, inst.mnemonic, "udf") or std.mem.eql(u8, inst.mnemonic, "db") or std.mem.eql(u8, inst.mnemonic, "unsupported");
+            w.print(",\"decode_status\":\"{s}\"", .{if (gap) "undecoded" else "decoded"}) catch return ToolError.OutOfMemory;
+            if (gap) {
+                decode_gaps += 1;
+                w.writeAll(",\"decode_warning\":\"Opaque decoder fallback; mnemonic does not establish an undefined CPU operation. Subsequent boundaries may be heuristic.\"") catch return ToolError.OutOfMemory;
             }
         }
+        if (thumb_decoded) |d| {
+            if (d.decode_status != .decoded) decode_gaps += 1;
+            w.print(",\"decode_status\":\"{s}\"", .{@tagName(d.decode_status)}) catch return ToolError.OutOfMemory;
+            if (predicate) |condition| {
+                w.print(",\"execution_condition\":\"{s}\"", .{arm32.conditionName(condition)}) catch return ToolError.OutOfMemory;
+            }
+            if (d.sets_flags) |sets_flags| {
+                w.print(",\"sets_flags\":{}", .{sets_flags and !(predicate != null and d.flags_suppressed_in_it)}) catch return ToolError.OutOfMemory;
+            }
+            thumb_state.advance();
+            if (d.it_block) |block| thumb_state.begin(block);
+        }
+        w.writeByte('}') catch return ToolError.OutOfMemory;
+        // Reserve per-item batch envelope space before the global safety cap.
+        if (output_bytes + buf.written().len + 192 > max_response_chars) {
+            buf.deinit();
+            stop_reason = "output_budget";
+            break;
+        }
+        output_bytes += buf.written().len + 192;
+        const result = buf.toOwnedSlice() catch return ToolError.OutOfMemory;
+        items.append(.{ .input = label, .success = true, .result = result }) catch return ToolError.OutOfMemory;
+        if (doc.arch == .arm64) {
+            if (arm64.decode(raw.data[0..4], addr).decode_status != .decoded) decode_gaps += 1;
+            switch (arm64_semantics.decode(std.mem.readInt(u32, raw.data[0..4], .little))) {
+                .modeled => modeled += 1,
+                .unsupported => unsupported += 1,
+                .invalid_encoding => invalid += 1,
+            }
+        } else unsupported += 1;
+        addr += inst.size;
     }
 
-    const total_instructions: u32 = @intCast(items.items.len);
-    var resp_buf = std.Io.Writer.Allocating.init(ctx.allocator);
-    const rw = &resp_buf.writer;
-    rw.print("{{\"total_instructions\":{d},\"results\":", .{total_instructions}) catch {};
-    const batch_json = json.batchResponse(ctx.allocator, items.items) catch return ToolError.OutOfMemory;
-    rw.writeAll(batch_json) catch {};
-    rw.writeByte('}') catch {};
-    const final_resp = resp_buf.toOwnedSlice() catch return ToolError.OutOfMemory;
-    return .{ .json_response = final_resp };
+    const partial = addr - eff_start < @as(u64, @intCast(raw_length));
+    if (partial and std.mem.eql(u8, stop_reason, "complete")) stop_reason = "byte_limit";
+    var response = std.Io.Writer.Allocating.init(ctx.allocator);
+    const w = &response.writer;
+    w.print("{{\"total_instructions\":{d},\"covered_bytes\":{d},\"partial\":{},\"stop_reason\":", .{ items.items.len, addr - eff_start, partial }) catch return ToolError.OutOfMemory;
+    json.writeJsonString(w, stop_reason) catch return ToolError.OutOfMemory;
+    if (partial) {
+        w.writeAll(",\"next_address\":") catch return ToolError.OutOfMemory;
+        json.writeAddress(w, applyRebaseDelta(addr, eff.delta)) catch return ToolError.OutOfMemory;
+    }
+    w.print(",\"decode_gaps\":{d}", .{decode_gaps}) catch return ToolError.OutOfMemory;
+    if (doc.arch == .arm64)
+        w.print(",\"decode_summary\":{{\"decoded\":{d},\"unsupported\":{d},\"inspected_slots\":{d}}}", .{ items.items.len - decode_gaps, decode_gaps, items.items.len }) catch return ToolError.OutOfMemory;
+    if (std.mem.eql(u8, stop_reason, "undecoded_instruction")) {
+        w.print(",\"next_call\":{{\"tool\":\"read_bytes\",\"arguments\":{{\"doc_id\":{d},\"address\":", .{doc_id}) catch return ToolError.OutOfMemory;
+        json.writeAddress(w, applyRebaseDelta(addr, eff.delta)) catch return ToolError.OutOfMemory;
+        w.writeAll(",\"length\":16}}") catch return ToolError.OutOfMemory;
+    }
+    if (doc.arch == .arm32) {
+        w.writeAll(",\"predication_note\":\"IT conditions are tracked within this range. Start at the function entry to include any preceding IT instruction; ranges starting inside an IT block have unknown initial predication.\"") catch return ToolError.OutOfMemory;
+    }
+    w.writeAll(",\"semantics_note\":\"unsupported means no formal effect model is available; it does not mean the instruction failed to decode. Do not treat unsupported instructions as no-ops.\"") catch return ToolError.OutOfMemory;
+    w.print(",\"semantics_summary\":{{\"modeled\":{d},\"unsupported\":{d},\"invalid_encoding\":{d}}},\"results\":", .{ modeled, unsupported, invalid }) catch return ToolError.OutOfMemory;
+    const batch = json.batchResponse(ctx.allocator, items.items) catch return ToolError.OutOfMemory;
+    w.writeAll(batch) catch return ToolError.OutOfMemory;
+    w.writeByte('}') catch return ToolError.OutOfMemory;
+    return .{ .json_response = response.toOwnedSlice() catch return ToolError.OutOfMemory };
 }
 
 // ============================================================================
-// v7.4.2 F2 — read_bytes tool: raw byte inspection escape hatch
+// read_bytes: primary raw byte evidence
 // ============================================================================
 //
-// When Phora's parsers can't help (opaque blob, packed runtime, custom format,
-// hand-crafted shellcode), this gives the LLM a clean in-tool way to inspect
-// raw memory without falling back to the OS shell. Hex + ASCII view, capped at
-// 16 KB per call. Read-only — Phora is a static analyzer.
+// Preserve file byte identity and distinguish virtual zero-fill from file backing.
+// Hex is exact; ASCII is a lossy preview. Bound pages to the response budget and
+// bound address reads to the selected mapping/backing range.
 
 fn handleReadBytes(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
     const start = timestampMs(ctx.io);
@@ -8316,8 +8892,19 @@ fn handleReadBytes(ctx: ToolContext, params: std.json.Value) ToolError!ToolResul
         return docNotFoundErrorFull(ctx, "read_bytes", params);
     };
 
-    const addr_raw = getInt(params, "address") orelse {
-        const resp = json.errorResponse(ctx.allocator, "read_bytes", "missing or invalid 'address' parameter (accepts integer or hex string like 0x100000000)", 0) catch return ToolError.OutOfMemory;
+    // v7.16 W1: allow reading by raw `file_offset` (as reported by
+    // get_embedded_resources) in addition to virtual `address` — lets the LLM
+    // carve an embedded bundle by offset without resolving its virtual base.
+    const has_address = params.object.contains("address");
+    const has_offset = params.object.contains("file_offset");
+    if (has_address == has_offset or (has_offset and (getInt(params, "file_offset") orelse -1) < 0)) {
+        const resp = json.errorResponse(ctx.allocator, "read_bytes", "provide exactly one of address or nonnegative integer file_offset", 0) catch return ToolError.OutOfMemory;
+        return .{ .json_response = resp, .is_error = true };
+    }
+    const fo_param: ?usize = if (getInt(params, "file_offset")) |f| (if (f >= 0) @as(?usize, @intCast(f)) else null) else null;
+    const addr_raw = getInt(params, "address") orelse blk: {
+        if (fo_param != null) break :blk @as(i64, 0);
+        const resp = json.errorResponse(ctx.allocator, "read_bytes", "missing 'address' or 'file_offset' parameter (address accepts integer or hex string like 0x100000000; file_offset is a raw byte offset into the file)", 0) catch return ToolError.OutOfMemory;
         return .{ .json_response = resp, .is_error = true };
     };
     const address: u64 = @bitCast(addr_raw);
@@ -8328,6 +8915,20 @@ fn handleReadBytes(ctx: ToolContext, params: std.json.Value) ToolError!ToolResul
         return .{ .json_response = resp, .is_error = true };
     }
     const length: usize = @intCast(@min(length_raw, 65536));
+    const element_size = getInt(params, "element_size");
+    const byte_order = getString(params, "byte_order");
+    if (params.object.contains("element_size") or params.object.contains("byte_order")) {
+        const width = element_size orelse 0;
+        const valid_order = if (byte_order) |order| eql(order, "little") or eql(order, "big") else false;
+        if ((width != 1 and width != 2 and width != 4 and width != 8) or !valid_order) {
+            const resp = json.errorResponse(ctx.allocator, "read_bytes", "integer interpretation requires element_size 1, 2, 4 or 8 and explicit byte_order little or big", 0) catch return ToolError.OutOfMemory;
+            return .{ .json_response = resp, .is_error = true };
+        }
+        if (length_raw > width * 256) {
+            const resp = json.errorResponse(ctx.allocator, "read_bytes", "typed reads allow at most 256 elements; reduce length to 256 * element_size and advance address or file_offset for subsequent reads", 0) catch return ToolError.OutOfMemory;
+            return .{ .json_response = resp, .is_error = true };
+        }
+    }
 
     const encoding = getString(params, "encoding") orelse "both";
     const want_hex_compact = std.ascii.eqlIgnoreCase(encoding, "hex_compact");
@@ -8352,25 +8953,59 @@ fn handleReadBytes(ctx: ToolContext, params: std.json.Value) ToolError!ToolResul
     var file_offset: ?usize = null;
     var found_segment_name: []const u8 = "";
     var in_zerofill: bool = false;
-    for (eff.entry.doc.segments) |seg| {
-        if (!seg.permissions.read) continue;
-        // Try sections first (more precise file offsets on Mach-O).
-        for (seg.sections) |sec| {
-            if (eff_address >= sec.start and eff_address < sec.start + sec.length) {
-                file_offset = @intCast(sec.file_offset + (eff_address - sec.start));
+    var mapping_available: u64 = std.math.maxInt(u64);
+    var invalid_mapping = false;
+    if (fo_param) |fo| {
+        // Direct file-offset read: no virtual-address resolution needed.
+        file_offset = fo;
+        for (eff.entry.doc.segments) |seg| {
+            if (fo >= seg.file_offset and fo - seg.file_offset < seg.file_size) {
                 found_segment_name = seg.name;
-                in_zerofill = sec.is_zerofill;
                 break;
             }
         }
-        if (file_offset != null) break;
-        if (eff_address >= seg.start and eff_address < seg.start + seg.length) {
-            file_offset = @intCast(seg.file_offset + (eff_address - seg.start));
+    } else for (eff.entry.doc.segments) |seg| {
+        if (!seg.permissions.read) continue;
+        if (eff_address < seg.start or eff_address - seg.start >= seg.length) continue;
+        // Try sections first (more precise file offsets on Mach-O).
+        for (seg.sections) |sec| {
+            if (eff_address >= sec.start and eff_address - sec.start < sec.length) {
+                file_offset = if (sec.is_zerofill) 0 else @intCast(std.math.add(u64, sec.file_offset, eff_address - sec.start) catch {
+                    invalid_mapping = true;
+                    break;
+                });
+                found_segment_name = seg.name;
+                in_zerofill = sec.is_zerofill;
+                mapping_available = @min(sec.length - (eff_address - sec.start), seg.length - (eff_address - seg.start));
+                if (!in_zerofill) {
+                    if (file_offset.? < seg.file_offset) {
+                        invalid_mapping = true;
+                        break;
+                    }
+                    const relative = file_offset.? - seg.file_offset;
+                    mapping_available = @min(mapping_available, seg.file_size -| relative);
+                }
+                break;
+            }
+        }
+        if (file_offset != null or invalid_mapping) break;
+        if (eff_address >= seg.start and eff_address - seg.start < seg.length) {
             found_segment_name = seg.name;
+            const relative = eff_address - seg.start;
+            in_zerofill = relative >= seg.file_size;
+            file_offset = if (in_zerofill) 0 else @intCast(std.math.add(u64, seg.file_offset, relative) catch {
+                invalid_mapping = true;
+                break;
+            });
+            mapping_available = if (in_zerofill) seg.length - relative else @min(seg.length - relative, seg.file_size - relative);
             break;
         }
     }
 
+    if (invalid_mapping or (file_offset != null and mapping_available == 0)) {
+        const resp = json.errorResponse(ctx.allocator, "read_bytes", "invalid mapping: file backing offset overflow or section outside segment backing", 0) catch return ToolError.OutOfMemory;
+        return .{ .json_response = resp, .is_error = true };
+    }
     if (file_offset == null) {
         // Build an actionable error listing the segment ranges.
         var err_buf = std.Io.Writer.Allocating.init(ctx.allocator);
@@ -8384,7 +9019,7 @@ fn handleReadBytes(ctx: ToolContext, params: std.json.Value) ToolError!ToolResul
             ew.print("{s}=0x{x}-0x{x}", .{
                 seg.name,
                 applyRebaseDelta(seg.start, eff.delta),
-                applyRebaseDelta(seg.start + seg.length, eff.delta),
+                @as(u64, @intCast(std.math.clamp(@as(i128, seg.start) + @as(i128, seg.length) + eff.delta, 0, std.math.maxInt(u64)))),
             }) catch {};
         }
         const err_msg = err_buf.toOwnedSlice() catch "address not in any readable segment";
@@ -8396,19 +9031,24 @@ fn handleReadBytes(ctx: ToolContext, params: std.json.Value) ToolError!ToolResul
 
     // Zerofill sections (Mach-O __bss/__common/__thread_bss, ELF SHT_NOBITS) have
     // no file backing. Return zeros instead of reading arbitrary file bytes.
+    // Expanded hex plus JSON-escaped ASCII costs at most five chars per byte.
+    // Leave headroom for metadata and the response envelope under 200 KB.
+    const page_limit: usize = if (want_hex and want_ascii) 32768 else if (want_hex and !want_hex_compact) 60000 else 65536;
+    const address_available = if (fo_param == null) (std.math.maxInt(u64) - address) +| 1 else std.math.maxInt(u64);
+    const bounded_length: usize = @intCast(@min(@as(u64, @min(length, page_limit)), @min(mapping_available, address_available)));
     var bytes: []const u8 = undefined;
     if (in_zerofill) {
-        const want = @min(length, 65536);
+        const want = bounded_length;
         const zbuf = ctx.allocator.alloc(u8, want) catch return ToolError.OutOfMemory;
         @memset(zbuf, 0);
         bytes = zbuf;
     } else {
-        if (foff >= eff.entry.doc.data.len) {
+        if (foff > eff.entry.doc.data.len or (foff == eff.entry.doc.data.len and fo_param == null)) {
             const resp = json.errorResponse(ctx.allocator, "read_bytes", "address resolves to file offset beyond loaded data", 0) catch return ToolError.OutOfMemory;
             return .{ .json_response = resp, .is_error = true };
         }
         const available = eff.entry.doc.data.len - foff;
-        const actual = @min(length, available);
+        const actual = @min(bounded_length, available);
         bytes = eff.entry.doc.data[foff .. foff + actual];
     }
     const actual_length = bytes.len;
@@ -8417,11 +9057,50 @@ fn handleReadBytes(ctx: ToolContext, params: std.json.Value) ToolError!ToolResul
     // for any byte outside printable range to keep the JSON safe.
     var buf = std.Io.Writer.Allocating.init(ctx.allocator);
     const w = &buf.writer;
+    // v7.16 W1: when reading purely by file_offset (no explicit address), emit
+    // address:null instead of a misleading 0x0 that reads as a real VA.
+    const addr_explicit = getInt(params, "address") != null;
     w.writeAll("{\"address\":") catch {};
-    json.writeAddress(w, address) catch {};
+    if (fo_param != null and !addr_explicit) {
+        w.writeAll("null") catch {};
+    } else {
+        json.writeAddress(w, address) catch {};
+    }
+    if (in_zerofill) w.writeAll(",\"file_offset\":null") catch {} else w.print(",\"file_offset\":{d}", .{foff}) catch {};
+    w.writeAll(",\"document_architecture\":") catch {};
+    json.writeJsonString(w, eff.entry.doc.arch.toString()) catch {};
+    w.writeAll(",\"architecture_source\":\"parsed_or_configured_document\"") catch {};
     w.writeAll(",\"segment\":") catch {};
     json.writeJsonString(w, found_segment_name) catch {};
-    w.print(",\"length\":{d}", .{actual_length}) catch {};
+    w.print(",\"length\":{d},\"requested_length\":{d},\"returned_length\":{d},\"backing\":\"{s}\",\"ascii_is_lossy_preview\":true", .{ actual_length, length_raw, actual_length, if (in_zerofill) "zero_fill" else "file" }) catch {};
+    const source_available = if (in_zerofill) mapping_available else @min(mapping_available, eff.entry.doc.data.len - foff);
+    const more = actual_length < @as(u64, @intCast(length_raw)) and actual_length < source_available and actual_length < address_available;
+    w.print(",\"partial\":{},\"stop_reason\":\"{s}\"", .{ actual_length < @as(u64, @intCast(length_raw)), if (more) "page_limit" else if (actual_length == @as(u64, @intCast(length_raw))) "requested_length" else if (fo_param == null and actual_length == address_available) "address_space_boundary" else if (source_available == mapping_available and fo_param == null) "mapping_boundary" else "end_of_file" }) catch {};
+    if (more) {
+        w.print(",\"next_call\":{{\"tool\":\"read_bytes\",\"arguments\":{{\"doc_id\":{d},", .{doc_id}) catch {};
+        if (fo_param != null) w.print("\"file_offset\":{d}", .{foff + actual_length}) catch {} else {
+            w.writeAll("\"address\":") catch {};
+            json.writeAddress(w, address + actual_length) catch {};
+        }
+        w.print(",\"length\":{d},\"encoding\":", .{@as(u64, @intCast(length_raw)) - actual_length}) catch {};
+        json.writeJsonString(w, encoding) catch {};
+        w.writeAll("}}") catch {};
+    }
+    if (element_size) |width| {
+        const size: usize = @intCast(width);
+        const little = eql(byte_order.?, "little");
+        try w.print(",\"integer_view\":{{\"element_size\":{d},\"byte_order\":\"{s}\",\"value_encoding\":\"unsigned_decimal_strings\",\"complete_elements\":{d},\"uninterpreted_trailing_bytes\":{d},\"values\":[", .{ size, byte_order.?, bytes.len / size, bytes.len % size });
+        for (0..bytes.len / size) |index| {
+            if (index != 0) try w.writeByte(',');
+            var value: u64 = 0;
+            for (bytes[index * size ..][0..size], 0..) |byte, i| {
+                const shift: u6 = @intCast((if (little) i else size - 1 - i) * 8);
+                value |= @as(u64, byte) << shift;
+            }
+            try w.print("\"{d}\"", .{value});
+        }
+        try w.writeAll("]}");
+    }
 
     if (want_hex) {
         w.writeAll(",\"hex\":\"") catch {};
@@ -8459,10 +9138,8 @@ fn handleReadBytes(ctx: ToolContext, params: std.json.Value) ToolError!ToolResul
     const result_json = buf.toOwnedSlice() catch return ToolError.OutOfMemory;
     const elapsed = timestampMs(ctx.io) - start;
     const resp = json.successResponse(ctx.allocator, "read_bytes", result_json, elapsed) catch return ToolError.OutOfMemory;
-    // v7.12 W5: cap raised from 16 KiB to 64 KiB; hex_compact at 64 KiB
-    // produces ~131 KB of JSON which exceeds the default 80 KB response
-    // limit. Bump the per-tool envelope to 200 KB to match other dense tools
-    // (search, get_strings, get_embedded_resources).
+    // Page limits above leave sufficient headroom in this response envelope,
+    // including worst-case JSON escaping of the ASCII preview.
     return .{ .json_response = resp, .meta_max_chars = 200_000 };
 }
 
@@ -8482,6 +9159,9 @@ fn handleGetEmbeddedResources(ctx: ToolContext, params: std.json.Value) ToolErro
     };
 
     const filter_runtime = getString(params, "runtime");
+    // v7.16 bonus: summarize WHAT'S IN the bundle (categorized surface markers +
+    // codename clusters), not just its metadata. Default on; opt out for speed.
+    const include_surface = getBool(params, "include_surface") orelse true;
 
     const entry = ctx.store.get(doc_id) orelse return docNotFoundError(ctx, "get_embedded_resources");
     const eff = resolveEffectiveDb(entry);
@@ -8559,12 +9239,111 @@ fn handleGetEmbeddedResources(ctx: ToolContext, params: std.json.Value) ToolErro
         }
         w.writeByte('}') catch {};
     }
-    w.writeAll("]}") catch {};
+    w.writeAll("]") catch {};
+
+    // v7.16 bonus — bundle surface summary: categorized markers + prefix
+    // clusters over the embedded-runtime text, so the tool an LLM calls right
+    // after runtime detection answers "what's IN it" instead of just "where".
+    if (include_surface and strings_mod.hasPackedSegment(&eff.entry.doc)) {
+        const surface_cap: usize = 500_000;
+        var bundle = strings_mod.detectBundleStrings(ctx.allocator, &eff.entry.doc, 5, surface_cap) catch null;
+        if (bundle) |*b| {
+            defer b.deinit();
+            const truncated = b.items.len >= surface_cap;
+            var seen = std.StringHashMap(void).init(ctx.allocator);
+            defer seen.deinit();
+            var hist = std.StringHashMap(usize).init(ctx.allocator);
+            defer hist.deinit();
+            var by_cat = std.StringHashMap(std.array_list.Managed([]const u8)).init(ctx.allocator);
+            defer by_cat.deinit();
+            const CI2 = struct { count: usize, example: []const u8 };
+            var clusters = std.StringHashMap(CI2).init(ctx.allocator);
+            defer clusters.deinit();
+            const per_cat_cap: usize = 12;
+
+            for (b.items) |s| {
+                if (seen.contains(s.value)) continue;
+                var cats: [MAX_CAP_CATS][]const u8 = undefined;
+                const n = categorizeCapability(s.value, &cats);
+                if (n == 0) continue;
+                seen.put(s.value, {}) catch {};
+                for (cats[0..n]) |cat| {
+                    const gh = hist.getOrPut(cat) catch continue;
+                    if (!gh.found_existing) gh.value_ptr.* = 0;
+                    gh.value_ptr.* += 1;
+                    const gc = by_cat.getOrPut(cat) catch continue;
+                    if (!gc.found_existing) gc.value_ptr.* = std.array_list.Managed([]const u8).init(ctx.allocator);
+                    if (gc.value_ptr.items.len < per_cat_cap) gc.value_ptr.append(s.value) catch {};
+                }
+                if (capClusterPrefix(s.value)) |pfx| {
+                    const g = clusters.getOrPut(pfx) catch continue;
+                    if (!g.found_existing) g.value_ptr.* = .{ .count = 0, .example = s.value };
+                    g.value_ptr.count += 1;
+                }
+            }
+
+            w.writeAll(",\"surface\":{\"scanned\":true") catch {};
+            if (truncated) w.writeAll(",\"truncated\":true") catch {};
+            w.writeAll(",\"category_histogram\":{") catch {};
+            {
+                var hi = hist.iterator();
+                var f = true;
+                while (hi.next()) |e| {
+                    if (!f) w.writeByte(',') catch {};
+                    f = false;
+                    json.writeJsonString(w, e.key_ptr.*) catch {};
+                    w.print(":{d}", .{e.value_ptr.*}) catch {};
+                }
+            }
+            w.writeAll("},\"top_markers\":{") catch {};
+            {
+                var bi = by_cat.iterator();
+                var f = true;
+                while (bi.next()) |e| {
+                    if (!f) w.writeByte(',') catch {};
+                    f = false;
+                    json.writeJsonString(w, e.key_ptr.*) catch {};
+                    w.writeAll(":[") catch {};
+                    for (e.value_ptr.items, 0..) |v, i| {
+                        if (i > 0) w.writeByte(',') catch {};
+                        json.writeJsonString(w, v) catch {};
+                    }
+                    w.writeAll("]") catch {};
+                }
+            }
+            w.writeAll("},\"clusters\":[") catch {};
+            {
+                const CRow2 = struct { prefix: []const u8, count: usize, example: []const u8 };
+                var rows = std.array_list.Managed(CRow2).init(ctx.allocator);
+                var ci = clusters.iterator();
+                while (ci.next()) |e| {
+                    if (e.value_ptr.count >= 2) rows.append(.{ .prefix = e.key_ptr.*, .count = e.value_ptr.count, .example = e.value_ptr.example }) catch {};
+                }
+                std.sort.pdq(CRow2, rows.items, {}, struct {
+                    fn lt(_: void, a: CRow2, bb: CRow2) bool {
+                        return a.count > bb.count;
+                    }
+                }.lt);
+                const rn = @min(rows.items.len, 24);
+                for (rows.items[0..rn], 0..) |row, i| {
+                    if (i > 0) w.writeByte(',') catch {};
+                    w.writeAll("{\"prefix\":") catch {};
+                    json.writeJsonString(w, row.prefix) catch {};
+                    w.print(",\"count\":{d},\"example\":", .{row.count}) catch {};
+                    json.writeJsonString(w, row.example) catch {};
+                    w.writeByte('}') catch {};
+                }
+            }
+            w.writeAll("]}") catch {};
+        }
+    }
+
+    w.writeAll("}") catch {};
 
     const result_json = buf.toOwnedSlice() catch return ToolError.OutOfMemory;
     const elapsed = timestampMs(ctx.io) - start;
     const resp = json.successResponse(ctx.allocator, "get_embedded_resources", result_json, elapsed) catch return ToolError.OutOfMemory;
-    return .{ .json_response = resp };
+    return .{ .json_response = resp, .meta_max_chars = 200_000 };
 }
 
 // ============================================================================
@@ -8656,6 +9435,9 @@ fn handleRebaseDocument(ctx: ToolContext, params: std.json.Value) ToolError!Tool
     new_entry.doc.entry_point = applyRebaseDelta(parent_entry.doc.entry_point, delta);
 
     ctx.store.put(new_entry) catch return ToolError.OutOfMemory;
+    // v7.16 W5: a rebased view is a new doc id (+ its phora://doc/{id} resource).
+    ctx.queueNotification("notifications/tools/list_changed");
+    ctx.queueNotification("notifications/resources/list_changed");
 
     const elapsed = timestampMs(ctx.io) - start;
     const result_str = std.fmt.allocPrint(ctx.allocator, "{{\"doc_id\":{d},\"parent_doc_id\":{d},\"old_base\":\"0x{x}\",\"new_base\":\"0x{x}\",\"delta\":{d}}}", .{ new_doc_id, doc_id, old_base, new_base, effective_delta }) catch return ToolError.OutOfMemory;
@@ -9825,6 +10607,271 @@ fn buildImportStubSet(allocator: Allocator, db: *const Database) std.StringHashM
     return import_set;
 }
 
+/// True when release_diff should include `name` in its `sources` (default: all
+/// enabled when `sources` is absent).
+fn releaseSourceEnabled(params: std.json.Value, name: []const u8) bool {
+    const sources = switch (params) {
+        .object => |o| o.get("sources"),
+        else => null,
+    } orelse return true;
+    switch (sources) {
+        .array => |a| {
+            for (a.items) |it| {
+                if (it == .string and std.mem.eql(u8, it.string, name)) return true;
+            }
+            return false;
+        },
+        else => return true,
+    }
+}
+
+// v7.16 W3 — release_diff: a directional, control-gated "what's NEW & HIDDEN
+// between two builds" tool. Unlike `compare` (symmetric, native-code oriented),
+// this diffs at the string + embedded-bundle + capability level with a
+// new-only default lens, classifies each new marker, ranks the security/novel
+// ones into `headlines[]`, and optionally tags ANNOUNCED vs HIDDEN against a
+// changelog the caller passes. Built for recurring per-release binary diffs.
+fn handleReleaseDiff(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
+    const start = timestampMs(ctx.io);
+    const alloc = ctx.allocator;
+
+    const old_id: u64 = resolveDocIdField(ctx, params, "doc_id_old") orelse {
+        const resp = json.errorResponse(alloc, "release_diff", "could not resolve doc_id_old — provide a valid document ID or name", 0) catch return ToolError.OutOfMemory;
+        return .{ .json_response = resp, .is_error = true };
+    };
+    const new_id: u64 = resolveDocIdField(ctx, params, "doc_id_new") orelse {
+        const resp = json.errorResponse(alloc, "release_diff", "could not resolve doc_id_new — provide a valid document ID or name", 0) catch return ToolError.OutOfMemory;
+        return .{ .json_response = resp, .is_error = true };
+    };
+    const entry_old = ctx.store.get(old_id) orelse return docNotFoundError(ctx, "release_diff");
+    const entry_new = ctx.store.get(new_id) orelse return docNotFoundError(ctx, "release_diff");
+    const eff_old = resolveEffectiveDb(entry_old);
+    const eff_new = resolveEffectiveDb(entry_new);
+
+    const include_bundle = releaseSourceEnabled(params, "bundle");
+    const include_imports = releaseSourceEnabled(params, "imports");
+    const changelog: ?[]const u8 = getString(params, "changelog");
+    const max_per_cluster: usize = if (getInt(params, "max_per_cluster")) |m| @intCast(@max(m, 1)) else 40;
+    const extraction_cap: usize = 1_000_000;
+
+    eff_old.db.rw_lock.lockSharedUncancelable(eff_old.db.io);
+    defer eff_old.db.rw_lock.unlockShared(eff_old.db.io);
+    // Compare the RESOLVED dbs, not the doc ids: resolveEffectiveDb follows
+    // rebase parents, so two distinct doc ids can alias one db — locking the
+    // same RwLock twice on this thread would deadlock a queued writer.
+    const same = (eff_old.db == eff_new.db);
+    if (!same) eff_new.db.rw_lock.lockSharedUncancelable(eff_new.db.io);
+    defer {
+        if (!same) eff_new.db.rw_lock.unlockShared(eff_new.db.io);
+    }
+
+    // --- Build the OLD string set (control corpus): table + bundle tokens. ---
+    var old_set = std.StringHashMap(void).init(alloc);
+    defer old_set.deinit();
+    if (eff_old.db.getAllStrings(alloc) catch null) |arr| {
+        for (arr) |s| old_set.put(s.value, {}) catch {};
+    }
+    var bundle_truncated = false;
+    if (include_bundle and strings_mod.hasPackedSegment(&eff_old.entry.doc)) {
+        var ob = strings_mod.detectBundleStrings(alloc, &eff_old.entry.doc, 5, extraction_cap) catch null;
+        if (ob) |*b| {
+            defer b.deinit();
+            if (b.items.len >= extraction_cap) bundle_truncated = true;
+            for (b.items) |s| old_set.put(s.value, {}) catch {};
+        }
+    }
+
+    // --- Walk NEW strings; keep the ones absent from OLD; classify + dedup. ---
+    const NewRec = struct { value: []const u8, cats: [MAX_CAP_CATS][]const u8, cat_count: usize, weight: u8, best_conf: u8, announced: bool };
+    var new_recs = std.array_list.Managed(NewRec).init(alloc);
+    var new_seen = std.StringHashMap(void).init(alloc);
+    defer new_seen.deinit();
+
+    const classifyNew = struct {
+        fn go(value: []const u8, old_s: *std.StringHashMap(void), seen: *std.StringHashMap(void), recs: *std.array_list.Managed(NewRec), cl: ?[]const u8) void {
+            if (old_s.contains(value)) return;
+            if (seen.contains(value)) return;
+            var cats: [MAX_CAP_CATS][]const u8 = undefined;
+            var confs: [MAX_CAP_CATS]CapConfidence = undefined;
+            const n = categorizeCapabilityWithConfidence(value, &cats, &confs);
+            if (n == 0) return; // only surface classified markers (signal, not noise)
+            seen.put(value, {}) catch {};
+            var weight: u8 = 0;
+            var best_conf: u8 = 0;
+            for (cats[0..n], confs[0..n]) |cat, cf| {
+                const w = capCategoryWeight(cat);
+                if (w > weight) weight = w;
+                const cr = capConfRank(cf);
+                if (cr > best_conf) best_conf = cr;
+            }
+            const announced = if (cl) |c| (std.mem.indexOf(u8, c, value) != null) else false;
+            recs.append(.{ .value = value, .cats = cats, .cat_count = n, .weight = weight, .best_conf = best_conf, .announced = announced }) catch {};
+        }
+    };
+
+    if (releaseSourceEnabled(params, "strings")) {
+        if (eff_new.db.getAllStrings(alloc) catch null) |arr| {
+            for (arr) |s| classifyNew.go(s.value, &old_set, &new_seen, &new_recs, changelog);
+        }
+    }
+    if (include_bundle and strings_mod.hasPackedSegment(&eff_new.entry.doc)) {
+        var nb = strings_mod.detectBundleStrings(alloc, &eff_new.entry.doc, 5, extraction_cap) catch null;
+        if (nb) |*b| {
+            defer b.deinit();
+            if (b.items.len >= extraction_cap) bundle_truncated = true;
+            for (b.items) |s| classifyNew.go(s.value, &old_set, &new_seen, &new_recs, changelog);
+        }
+    }
+
+    // --- NEW imports (name set diff). ---
+    var new_imports = std.array_list.Managed([]const u8).init(alloc);
+    if (include_imports) {
+        var old_imp = std.StringHashMap(void).init(alloc);
+        defer old_imp.deinit();
+        var it_o = eff_old.db.imports.iterator();
+        while (it_o.next()) |e| old_imp.put(e.value_ptr.name, {}) catch {};
+        var seen_imp = std.StringHashMap(void).init(alloc);
+        defer seen_imp.deinit();
+        var it_n = eff_new.db.imports.iterator();
+        while (it_n.next()) |e| {
+            const nm = e.value_ptr.name;
+            if (old_imp.contains(nm) or seen_imp.contains(nm)) continue;
+            seen_imp.put(nm, {}) catch {};
+            new_imports.append(nm) catch {};
+        }
+    }
+
+    // --- Rank: hidden first, then weight, then confidence. ---
+    const RSort = struct {
+        fn lt(_: void, a: NewRec, b: NewRec) bool {
+            if (a.announced != b.announced) return !a.announced; // hidden first
+            if (a.weight != b.weight) return a.weight > b.weight;
+            return a.best_conf > b.best_conf;
+        }
+    };
+    std.sort.pdq(NewRec, new_recs.items, {}, RSort.lt);
+
+    var announced_count: usize = 0;
+    for (new_recs.items) |r| {
+        if (r.announced) announced_count += 1;
+    }
+
+    // Category histogram + prefix clusters over new-only markers.
+    var hist = std.StringHashMap(usize).init(alloc);
+    defer hist.deinit();
+    const CI = struct { count: usize, example: []const u8 };
+    var clusters = std.StringHashMap(CI).init(alloc);
+    defer clusters.deinit();
+    for (new_recs.items) |r| {
+        for (r.cats[0..r.cat_count]) |cat| {
+            const g = hist.getOrPut(cat) catch continue;
+            if (!g.found_existing) g.value_ptr.* = 0;
+            g.value_ptr.* += 1;
+        }
+        if (capClusterPrefix(r.value)) |pfx| {
+            const g = clusters.getOrPut(pfx) catch continue;
+            if (!g.found_existing) g.value_ptr.* = .{ .count = 0, .example = r.value };
+            g.value_ptr.count += 1;
+        }
+    }
+
+    // --- Emit. ---
+    var buf = std.Io.Writer.Allocating.init(alloc);
+    const w = &buf.writer;
+    w.print("{{\"old\":{{\"doc_id\":{d},\"name\":", .{old_id}) catch {};
+    json.writeJsonString(w, std.fs.path.basename(eff_old.entry.doc.path)) catch {};
+    w.print("}},\"new\":{{\"doc_id\":{d},\"name\":", .{new_id}) catch {};
+    json.writeJsonString(w, std.fs.path.basename(eff_new.entry.doc.path)) catch {};
+    w.writeAll("},\"lens\":\"new_only\"") catch {};
+    w.print(",\"summary\":{{\"new_classified\":{d},\"announced\":{d},\"hidden\":{d},\"new_imports\":{d},\"changelog_provided\":{s},\"bundle_truncated\":{s}}}", .{
+        new_recs.items.len,
+        announced_count,
+        new_recs.items.len - announced_count,
+        new_imports.items.len,
+        if (changelog != null) "true" else "false",
+        if (bundle_truncated) "true" else "false",
+    }) catch {};
+
+    // category_histogram
+    w.writeAll(",\"category_histogram\":{") catch {};
+    {
+        var hi = hist.iterator();
+        var first = true;
+        while (hi.next()) |e| {
+            if (!first) w.writeByte(',') catch {};
+            first = false;
+            json.writeJsonString(w, e.key_ptr.*) catch {};
+            w.print(":{d}", .{e.value_ptr.*}) catch {};
+        }
+    }
+    w.writeAll("}") catch {};
+
+    // prefix clusters (>=2), top 24 by size
+    const CRow = struct { prefix: []const u8, count: usize, example: []const u8 };
+    var crows = std.array_list.Managed(CRow).init(alloc);
+    {
+        var ci = clusters.iterator();
+        while (ci.next()) |e| {
+            if (e.value_ptr.count >= 2) crows.append(.{ .prefix = e.key_ptr.*, .count = e.value_ptr.count, .example = e.value_ptr.example }) catch {};
+        }
+        std.sort.pdq(CRow, crows.items, {}, struct {
+            fn lt(_: void, a: CRow, b: CRow) bool {
+                return a.count > b.count;
+            }
+        }.lt);
+    }
+    w.writeAll(",\"clusters\":[") catch {};
+    {
+        const n = @min(crows.items.len, 24);
+        for (crows.items[0..n], 0..) |row, i| {
+            if (i > 0) w.writeByte(',') catch {};
+            w.writeAll("{\"prefix\":") catch {};
+            json.writeJsonString(w, row.prefix) catch {};
+            w.print(",\"count\":{d},\"example\":", .{row.count}) catch {};
+            json.writeJsonString(w, row.example) catch {};
+            w.writeByte('}') catch {};
+        }
+    }
+    w.writeAll("]") catch {};
+
+    // headlines: top-ranked new-only classified markers
+    w.writeAll(",\"headlines\":[") catch {};
+    {
+        const n = @min(new_recs.items.len, max_per_cluster);
+        for (new_recs.items[0..n], 0..) |r, i| {
+            if (i > 0) w.writeByte(',') catch {};
+            w.writeAll("{\"value\":") catch {};
+            json.writeJsonString(w, r.value) catch {};
+            w.writeAll(",\"category\":") catch {};
+            json.writeJsonString(w, r.cats[0]) catch {};
+            w.writeAll(",\"confidence\":") catch {};
+            w.writeAll(switch (r.best_conf) {
+                3 => "\"high\"",
+                2 => "\"medium\"",
+                else => "\"low\"",
+            }) catch {};
+            w.print(",\"announced\":{s}}}", .{if (r.announced) "true" else "false"}) catch {};
+        }
+    }
+    w.writeAll("]") catch {};
+
+    // new_imports (cap 60)
+    w.writeAll(",\"new_imports\":[") catch {};
+    {
+        const n = @min(new_imports.items.len, 60);
+        for (new_imports.items[0..n], 0..) |nm, i| {
+            if (i > 0) w.writeByte(',') catch {};
+            json.writeJsonString(w, nm) catch {};
+        }
+    }
+    w.writeAll("]}") catch {};
+
+    const result_json = buf.toOwnedSlice() catch return ToolError.OutOfMemory;
+    const elapsed = timestampMs(ctx.io) - start;
+    const resp = json.successResponse(alloc, "release_diff", result_json, elapsed) catch return ToolError.OutOfMemory;
+    return .{ .json_response = resp, .meta_max_chars = 200_000 };
+}
+
 fn handleCompare(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
     const start = timestampMs(ctx.io);
 
@@ -10669,8 +11716,8 @@ fn handleCompare(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult 
 
             // Mnemonic histogram cosine similarity. We hash mnemonic into a
             // bucket index 0..63 — small fixed bins keep this O(proc.size).
-            var hist_a: [64]u32 = [_]u32{0} ** 64;
-            var hist_b: [64]u32 = [_]u32{0} ** 64;
+            var hist_a: [64]u32 = @splat(0);
+            var hist_b: [64]u32 = @splat(0);
             {
                 var addr = a_info.proc.entry;
                 var n_inst: u32 = 0;
@@ -11147,22 +12194,18 @@ fn handleSuggestNames(ctx: ToolContext, params: std.json.Value) ToolError!ToolRe
             json.writeJsonString(w, name) catch {};
         }
 
-        // Lift to pseudocode
-        var has_pseudocode = false;
-        ensureLiftedIR(ctx.allocator, p, eff.db, eff.entry);
-        if (eff.db.getCachedIR(p.entry)) |ir_func| {
-            var pseudo_buf = std.Io.Writer.Allocating.init(ctx.allocator);
-            const plt_ctx = PseudocodeCtx{
-                .allocator = ctx.allocator,
-                .db = eff.db,
-                .doc = &eff.entry.doc,
-            };
-            writePseudocodeWithCtx(&pseudo_buf.writer, ir_func, plt_ctx) catch {};
-            const pseudo_json = pseudo_buf.toOwnedSlice() catch null;
-            if (pseudo_json) |pj| {
-                w.writeAll(",\"pseudocode\":") catch {};
-                w.writeAll(pj) catch {};
-                has_pseudocode = true;
+        var has_bytes = false;
+        if (resolveRawBytesInfo(eff.entry, p.entry)) |info| {
+            const offset = info.file_offset + p.entry - info.section_base;
+            const code_end = eff.entry.doc.codeRangeEnd(p.entry) orelse p.entry;
+            if (offset < eff.entry.doc.data.len) {
+                const len = @min(@min(@min(p.size, code_end - p.entry), 32), eff.entry.doc.data.len - offset);
+                w.writeAll(",\"byte_evidence\":{\"address\":") catch {};
+                json.writeAddress(w, applyRebaseDelta(p.entry, eff.delta)) catch {};
+                w.print(",\"file_offset\":{d},\"hex\":\"", .{offset}) catch {};
+                for (eff.entry.doc.data[offset..][0..len]) |byte| w.print("{x:0>2}", .{byte}) catch {};
+                w.writeAll("\"}") catch {};
+                has_bytes = len > 0;
             }
         }
 
@@ -11253,7 +12296,7 @@ fn handleSuggestNames(ctx: ToolContext, params: std.json.Value) ToolError!ToolRe
         w.writeByte(']') catch {};
 
         // Context quality signal: count how many of the 5 signal types are non-empty
-        const signal_count: u32 = @as(u32, @intFromBool(has_pseudocode)) +
+        const signal_count: u32 = @as(u32, @intFromBool(has_bytes)) +
             @as(u32, @intFromBool(total_str_count > 0)) +
             @as(u32, @intFromBool(total_caller_count > 0)) +
             @as(u32, @intFromBool(callees.len > 0)) +
@@ -11265,7 +12308,7 @@ fn handleSuggestNames(ctx: ToolContext, params: std.json.Value) ToolError!ToolRe
         // Suggested analysis hint based on collected context
         w.writeAll(",\"suggested_analysis\":") catch {};
         if (signal_count == 0) {
-            json.writeJsonString(w, "Insufficient context \u{2014} no string refs, callers, callees, or pseudocode available. Try analyzing a callee or a function that references this one.") catch {};
+            json.writeJsonString(w, "Insufficient context: no string refs, callers, callees, or code bytes available. Try analyzing a callee or a function that references this one.") catch {};
         } else {
             var hint_buf = std.Io.Writer.Allocating.init(ctx.allocator);
             const hw = &hint_buf.writer;
@@ -11872,7 +12915,7 @@ fn handleSuggestNames(ctx: ToolContext, params: std.json.Value) ToolError!ToolRe
 // Ranks the next functions for an LLM/harness to inspect when remaking a
 // binary. Read-only. Performs no full decompilation — emits `next[]` MCP
 // calls so the harness fans out using other tools (get_semantic_slice,
-// decompile, suggest_names, get_xrefs, get_call_graph).
+// get_cfg, suggest_names, get_xrefs, get_call_graph).
 //
 // Score weights live as named consts so v7.10.1 can tune them. Any change to
 // the schemas of the tools referenced in `next[]` / `parallel_batches[].calls`
@@ -12376,7 +13419,7 @@ fn handleGetRemakeFrontier(ctx: ToolContext, params: std.json.Value) ToolError!T
                     pattern_string_hit = s.value;
                 }
                 if (!has_resource_string) {
-                    var cats: [10][]const u8 = undefined;
+                    var cats: [MAX_CAP_CATS][]const u8 = undefined;
                     const cat_count = categorizeCapability(s.value, &cats);
                     if (cat_count > 0) {
                         has_resource_string = true;
@@ -12620,38 +13663,44 @@ fn handleGetRemakeFrontier(ctx: ToolContext, params: std.json.Value) ToolError!T
         var absorbed = std.AutoHashMap(usize, void).init(allocator);
         defer absorbed.deinit();
 
-        var i: usize = 0;
-        while (i + 1 < addr_idx_list.items.len) : (i += 1) {
-            const a_view = addr_idx_list.items[i];
-            if (absorbed.contains(a_view.src_idx)) continue;
-            var j: usize = i + 1;
-            while (j < addr_idx_list.items.len) : (j += 1) {
-                const b_view = addr_idx_list.items[j];
-                if (absorbed.contains(b_view.src_idx)) continue;
-                // Distance check: ±64 bytes.
-                const dist = if (b_view.addr > a_view.addr) b_view.addr - a_view.addr else a_view.addr - b_view.addr;
-                if (dist > 64) break;
+        {
+            // Pairwise merging borrows candidate pointers while nested alias
+            // lists grow. End the borrow before compacting the outer list.
+            candidates.lockPointers();
+            defer candidates.unlockPointers();
+            var i: usize = 0;
+            while (i + 1 < addr_idx_list.items.len) : (i += 1) {
+                const a_view = addr_idx_list.items[i];
+                if (absorbed.contains(a_view.src_idx)) continue;
+                var j: usize = i + 1;
+                while (j < addr_idx_list.items.len) : (j += 1) {
+                    const b_view = addr_idx_list.items[j];
+                    if (absorbed.contains(b_view.src_idx)) continue;
+                    // Distance check: ±64 bytes.
+                    const dist = if (b_view.addr > a_view.addr) b_view.addr - a_view.addr else a_view.addr - b_view.addr;
+                    if (dist > 64) break;
 
-                // String-signal overlap: any shared string in strings_seen.
-                const a_c = &candidates.items[a_view.src_idx];
-                const b_c = &candidates.items[b_view.src_idx];
-                var overlap = false;
-                for (a_c.strings_seen.items) |sa| {
-                    for (b_c.strings_seen.items) |sb| {
-                        if (std.mem.eql(u8, sa, sb)) {
-                            overlap = true;
-                            break;
+                    // String-signal overlap: any shared string in strings_seen.
+                    const a_c = &candidates.items[a_view.src_idx];
+                    const b_c = &candidates.items[b_view.src_idx];
+                    var overlap = false;
+                    for (a_c.strings_seen.items) |sa| {
+                        for (b_c.strings_seen.items) |sb| {
+                            if (std.mem.eql(u8, sa, sb)) {
+                                overlap = true;
+                                break;
+                            }
                         }
+                        if (overlap) break;
                     }
-                    if (overlap) break;
-                }
-                if (!overlap) continue;
+                    if (!overlap) continue;
 
-                // Absorb the lower-scored. Preserve the higher-scored.
-                const winner_idx = if (a_c.score >= b_c.score) a_view.src_idx else b_view.src_idx;
-                const loser_idx = if (winner_idx == a_view.src_idx) b_view.src_idx else a_view.src_idx;
-                candidates.items[winner_idx].aliases.append(candidates.items[loser_idx].address) catch {};
-                absorbed.put(loser_idx, {}) catch {};
+                    // Absorb the lower-scored. Preserve the higher-scored.
+                    const winner_idx = if (a_c.score >= b_c.score) a_view.src_idx else b_view.src_idx;
+                    const loser_idx = if (winner_idx == a_view.src_idx) b_view.src_idx else a_view.src_idx;
+                    candidates.items[winner_idx].aliases.append(candidates.items[loser_idx].address) catch {};
+                    absorbed.put(loser_idx, {}) catch {};
+                }
             }
         }
 
@@ -12788,12 +13837,17 @@ fn handleGetRemakeFrontier(ctx: ToolContext, params: std.json.Value) ToolError!T
         // get_semantic_slice view=remake, scope=cluster
         w.writeAll("{\"tool\":\"get_semantic_slice\",\"args\":{") catch {};
         w.print("\"doc_id\":{d},\"addresses\":\"{s}\",\"view\":\"remake\",\"scope\":\"cluster\"}}}}", .{ doc_id, hex }) catch {};
-        // decompile, scope=cluster, max_cluster=5
-        w.writeAll(",{\"tool\":\"decompile\",\"args\":{") catch {};
-        w.print("\"doc_id\":{d},\"address\":\"{s}\",\"scope\":\"cluster\",\"max_cluster\":5}}}}", .{ doc_id, hex }) catch {};
+        // Inspect control flow before requesting speculative source rendering.
+        if (eff.entry.doc.arch == .mips32) {
+            w.writeAll(",{\"tool\":\"disassemble_range\",\"args\":{") catch {};
+            w.print("\"doc_id\":{d},\"start\":\"{s}\",\"byte_length\":128}}}}", .{ doc_id, hex }) catch {};
+        } else {
+            w.writeAll(",{\"tool\":\"get_cfg\",\"args\":{") catch {};
+            w.print("\"doc_id\":{d},\"function_address\":\"{s}\",\"include_disassembly\":true}}}}", .{ doc_id, hex }) catch {};
+        }
         // suggest_names
         w.writeAll(",{\"tool\":\"suggest_names\",\"args\":{") catch {};
-        w.print("\"doc_id\":{d},\"address\":\"{s}\"}}}}", .{ doc_id, hex }) catch {};
+        w.print("\"doc_id\":{d},\"addresses\":\"{s}\"}}}}", .{ doc_id, hex }) catch {};
         w.writeAll("]") catch {};
 
         w.writeByte('}') catch {};
@@ -13189,20 +14243,22 @@ fn emitSubsystemHints(
     db: *Database,
     delta: i128,
 ) !void {
-    const protocol_keywords = [_][]const u8{ "jsonrpc", "protocolVersion", "tools/list", "tools/call", "prompts/list", "resources/list", "McpServer", "initialize" };
+    // Generic initialize/protocolVersion strings also occur in TLS, crypto and runtimes.
+    // Require actual RPC/MCP markers before surfacing this hypothesis.
+    const protocol_keywords = [_][]const u8{ "jsonrpc", "tools/list", "tools/call", "prompts/list", "resources/list", "McpServer" };
     const persistence_keywords = [_][]const u8{ "save_project", "load_project", ".phora", "phora_version", "close_document", "list_documents" };
     const concurrency_keywords = [_][]const u8{ "session", "thread", "mutex", "rw_lock", "lockShared", "ThreadPool", "notifications" };
     const loader_keywords = [_][]const u8{ "Mach-O", "ELF", "PE", "APK", "ZIP", "PBP", "PSX-EXE", "dyld", "raw" };
     const runtime_keywords = [_][]const u8{ "__BUN", "v8_context_snapshot", ".asar", "j2objc", "upb", "python3.", "gguf", "ggml" };
-    const analysis_keywords = [_][]const u8{ "decompile", "get_semantic_slice", "get_remake_frontier", "annotate", "suggest_names", "get_binary_context" };
+    const analysis_keywords = [_][]const u8{ "disassemble_range", "get_semantic_slice", "get_remake_frontier", "annotate", "suggest_names", "get_binary_context" };
 
     const specs = [_]SubsystemHintSpec{
-        .{ .name = "mcp_protocol", .reason = "Protocol strings or symbols suggest MCP/JSON-RPC server behavior.", .pattern = "jsonrpc|tools/list|tools/call|McpServer|initialize", .keywords = protocol_keywords[0..] },
+        .{ .name = "mcp_protocol", .reason = "RPC/MCP-specific markers suggest protocol handling; verify methods before identifying the protocol.", .pattern = "jsonrpc|tools/list|tools/call|McpServer", .keywords = protocol_keywords[0..] },
         .{ .name = "persistence", .reason = "Project/document lifecycle clues suggest save/load or close/list behavior.", .pattern = "save_project|load_project|.phora|close_document|list_documents", .keywords = persistence_keywords[0..] },
         .{ .name = "concurrency", .reason = "Session, notification, thread, or lock clues suggest concurrent server behavior.", .pattern = "session|thread|mutex|rw_lock|ThreadPool|notifications", .keywords = concurrency_keywords[0..] },
         .{ .name = "loaders", .reason = "Format names suggest loader and container support worth mapping early.", .pattern = "Mach-O|ELF|PE|APK|ZIP|PBP|PSX-EXE|dyld|raw", .keywords = loader_keywords[0..] },
         .{ .name = "embedded_runtimes", .reason = "Runtime markers suggest packed resources or secondary analysis targets.", .pattern = "__BUN|v8_context_snapshot|.asar|j2objc|upb|python3.|gguf|ggml", .keywords = runtime_keywords[0..] },
-        .{ .name = "analysis_surface", .reason = "Analysis-tool strings or symbols suggest primary user-facing reverse-engineering workflows.", .pattern = "decompile|get_semantic_slice|get_remake_frontier|annotate|suggest_names|get_binary_context", .keywords = analysis_keywords[0..] },
+        .{ .name = "analysis_surface", .reason = "Analysis-tool strings or symbols suggest primary user-facing reverse-engineering workflows.", .pattern = "disassemble_range|get_semantic_slice|get_remake_frontier|annotate|suggest_names|get_binary_context", .keywords = analysis_keywords[0..] },
     };
 
     try w.writeAll(",\"subsystem_hints\":[");
@@ -13527,6 +14583,50 @@ fn handleGetBinaryContext(ctx: ToolContext, params: std.json.Value) ToolError!To
         return .{ .json_response = wrapped, .meta_max_chars = @max(max_chars + 1024, 200_000) };
     }
 
+    // Tiny single-procedure contexts expose graph provenance on the first call.
+    // Delegate before taking this handler's shared lock; get_cfg owns its lock.
+    var automatic_cfg: ?[]const u8 = null;
+    defer if (automatic_cfg) |payload| ctx.allocator.free(payload);
+    var automatic_cfg_address: ?u64 = null;
+    var automatic_cfg_bytes: u64 = 0;
+    const automatic_execution = eff.entry.doc.arch == .arm64 and eff.delta == 0;
+    var executable_bytes: u64 = 0;
+    for (entry.doc.segments) |seg| {
+        if (!seg.permissions.execute) continue;
+        if (seg.sections.len == 0) {
+            executable_bytes +|= seg.length;
+        } else {
+            for (seg.sections) |sec| {
+                if (sec.isCode()) executable_bytes +|= sec.length;
+            }
+        }
+    }
+    if (chosen == .full and entry.doc.procedures.items.len == 1 and executable_bytes <= 512) {
+        const p = entry.doc.procedures.items[0];
+        if (p.size > 0 and p.size <= 512) {
+            const addr = applyRebaseDelta(p.entry, eff.delta);
+            automatic_cfg_address = addr;
+            const args = if (automatic_execution)
+                try json.stringify(ctx.allocator, .{ .doc_id = doc_id, .function_address = addr, .instruction_view = "execution", .max_blocks = 128 })
+            else
+                try json.stringify(ctx.allocator, .{ .doc_id = doc_id, .function_address = addr, .include_disassembly = true, .max_blocks = 128 });
+            defer ctx.allocator.free(args);
+            const parsed_args = std.json.parseFromSlice(std.json.Value, ctx.allocator, args, .{}) catch return ToolError.OutOfMemory;
+            defer parsed_args.deinit();
+            const result = try handleGetCfg(ctx, parsed_args.value);
+            defer ctx.allocator.free(result.json_response);
+            if (!result.is_error) {
+                const parsed_result = std.json.parseFromSlice(std.json.Value, ctx.allocator, result.json_response, .{}) catch return ToolError.OutOfMemory;
+                defer parsed_result.deinit();
+                const payload = parsed_result.value.object.get("results").?.array.items[0].object.get("result").?;
+                for (payload.object.get("basic_blocks").?.array.items) |block| {
+                    automatic_cfg_bytes +|= @intCast(block.object.get("size").?.integer);
+                }
+                automatic_cfg = try json.stringify(ctx.allocator, payload);
+            }
+        }
+    }
+
     eff.db.rw_lock.lockSharedUncancelable(eff.db.io);
     defer eff.db.rw_lock.unlockShared(eff.db.io);
 
@@ -13555,6 +14655,25 @@ fn handleGetBinaryContext(ctx: ToolContext, params: std.json.Value) ToolError!To
         entry.doc.strings.items.len,
         entry.doc.imports.items.len,
     }) catch {};
+    if (automatic_cfg_address) |addr| {
+        if (automatic_cfg != null and rb.written().len + automatic_cfg.?.len + reconstruction_workflow.len + execution_rows_note.len + 1024 < max_chars) {
+            try w.writeAll(",\"control_flow_evidence\":{\"status\":\"included\",\"selection\":\"single_procedure_and_executable_bytes_at_most_512\",\"semantic_completeness\":\"unknown\",\"function_address\":");
+            try json.writeAddress(w, addr);
+            try w.writeAll(",\"instruction_view\":");
+            try json.writeJsonString(w, if (automatic_execution) "execution" else "disassembly");
+            try w.writeByte(',');
+            try writeReconstructionGuide(w, if (automatic_execution) "cfg.basic_blocks[].execution.text" else "cfg.basic_blocks[].instructions", automatic_execution);
+            try w.writeAll(",\"cfg\":");
+            try w.writeAll(automatic_cfg.?);
+            try w.writeByte('}');
+        } else {
+            try w.writeAll(",\"control_flow_evidence\":{\"status\":\"deferred\",\"reason\":\"context_budget_or_CFG_unavailable\",\"next_call\":{\"tool\":\"get_cfg\",\"arguments\":{");
+            try w.print("\"doc_id\":{d},\"function_address\":", .{doc_id});
+            try json.writeAddress(w, addr);
+            if (automatic_execution) try w.writeAll(",\"instruction_view\":\"execution\"");
+            try w.writeAll(",\"include_disassembly\":true,\"max_blocks\":128}}}");
+        }
+    }
     if (entry.doc.note) |n| {
         w.writeAll(",\"note\":") catch {};
         json.writeJsonString(w, n) catch {};
@@ -13595,8 +14714,8 @@ fn handleGetBinaryContext(ctx: ToolContext, params: std.json.Value) ToolError!To
                         zero_count += 1;
                     };
                     if (zero_count * 10 > sec_data.len * 9) {
-                        // >90% zeros — note as omitted padding.
-                        w.print(",\"omitted_zero_bytes\":{d}", .{zero_count}) catch {};
+                        // Report zero density without assuming padding or omission.
+                        w.print(",\"zero_byte_count\":{d}", .{zero_count}) catch {};
                     }
                 }
             }
@@ -13632,7 +14751,7 @@ fn handleGetBinaryContext(ctx: ToolContext, params: std.json.Value) ToolError!To
         // Capability counts: scan strings, bucket by category.
         var cap_counts = std.StringHashMap(u32).init(ctx.allocator);
         for (entry.doc.strings.items) |s| {
-            var cats: [10][]const u8 = undefined;
+            var cats: [MAX_CAP_CATS][]const u8 = undefined;
             const n = categorizeCapability(s.value, &cats);
             for (cats[0..n]) |c| {
                 const gop = cap_counts.getOrPut(c) catch continue;
@@ -13789,16 +14908,43 @@ fn handleGetBinaryContext(ctx: ToolContext, params: std.json.Value) ToolError!To
         var total_exec_bytes: u64 = 0;
         for (entry.doc.segments) |seg| {
             if (!seg.permissions.execute) continue;
-            for (seg.sections) |sec| total_exec_bytes += sec.length;
+            for (seg.sections) |sec| {
+                if (sec.isCode()) total_exec_bytes += sec.length;
+            }
             if (seg.sections.len == 0) total_exec_bytes += seg.length;
         }
         const disasm_cap: u64 = 32 * 1024;
-        if (total_exec_bytes <= disasm_cap) {
+        if (automatic_execution and automatic_cfg_address != null) {
+            try w.writeAll(",\"instruction_evidence\":\"control_flow_evidence.cfg execution steps, or its exact next_call when deferred\"");
+            if (automatic_cfg != null and automatic_cfg_bytes < total_exec_bytes) {
+                try w.print(",\"executable_coverage\":{{\"status\":\"bytes_outside_recovered_cfg\",\"recovered_cfg_bytes\":{d},\"executable_bytes\":{d},\"note\":\"CFG recovery does not cover all executable bytes; these calls expose complete executable ranges including unvisited or undecoded tails. No effects or edges are inferred for uncovered bytes.\",\"range_calls\":[", .{ automatic_cfg_bytes, total_exec_bytes });
+                var first_range = true;
+                for (entry.doc.segments) |seg| {
+                    if (!seg.permissions.execute) continue;
+                    if (seg.sections.len == 0) {
+                        if (!first_range) try w.writeByte(',');
+                        first_range = false;
+                        try w.print("{{\"tool\":\"disassemble_range\",\"arguments\":{{\"doc_id\":{d},\"start\":", .{doc_id});
+                        try json.writeAddress(w, seg.start);
+                        try w.print(",\"byte_length\":{d}}}}}", .{seg.length});
+                    } else for (seg.sections) |sec| {
+                        if (!sec.isCode()) continue;
+                        if (!first_range) try w.writeByte(',');
+                        first_range = false;
+                        try w.print("{{\"tool\":\"disassemble_range\",\"arguments\":{{\"doc_id\":{d},\"start\":", .{doc_id});
+                        try json.writeAddress(w, sec.start);
+                        try w.print(",\"byte_length\":{d}}}}}", .{sec.length});
+                    }
+                }
+                try w.writeAll("]}");
+            }
+        } else if (total_exec_bytes <= disasm_cap) {
             w.writeAll(",\"disasm\":[") catch {};
             var first_inst = true;
             for (entry.doc.segments) |seg| {
                 if (!seg.permissions.execute) continue;
                 for (seg.sections) |sec| {
+                    if (!sec.isCode()) continue;
                     var addr = sec.start;
                     const sec_end = sec.start + sec.length;
                     while (addr < sec_end) {
@@ -13818,7 +14964,7 @@ fn handleGetBinaryContext(ctx: ToolContext, params: std.json.Value) ToolError!To
                             addr += inst.size;
                         } else {
                             // No cached instruction — best-effort decode.
-                            const min_size: usize = if (entry.doc.arch == .arm32) 2 else if (entry.doc.arch == .x86_64) 1 else 4;
+                            const min_size: usize = if (entry.doc.arch == .arm32) 2 else if (entry.doc.arch == .x86_64 or entry.doc.arch == .x86) 1 else 4;
                             const file_off = sec.file_offset + (addr - sec.start);
                             if (file_off + min_size > entry.doc.data.len) break;
                             // Decode via arch decoder.
@@ -13848,15 +14994,15 @@ fn handleGetBinaryContext(ctx: ToolContext, params: std.json.Value) ToolError!To
                                     ops_len = d.operands_len;
                                     inst_size = d.length;
                                 },
-                                .x86_64 => {
+                                .x86_64, .x86 => {
                                     const x86 = @import("arch/x86_64.zig");
-                                    const d = x86.decode(entry.doc.data[file_off..], addr);
+                                    const d = if (entry.doc.arch == .x86) x86.decode32(entry.doc.data[file_off..], addr) else x86.decode(entry.doc.data[file_off..], addr);
+                                    if (x86DecodeGap(d.mnemonic)) break;
                                     mnem = d.mnemonic;
                                     @memcpy(ops_buf[0..d.operands_len], d.operands[0..d.operands_len]);
                                     ops_len = d.operands_len;
                                     inst_size = d.length;
                                 },
-                                else => break,
                             }
                             if (inst_size == 0) break;
                             if (!first_inst) w.writeByte(',') catch {};
@@ -13877,28 +15023,39 @@ fn handleGetBinaryContext(ctx: ToolContext, params: std.json.Value) ToolError!To
             }
             w.writeAll("]") catch {};
         } else {
-            w.print(",\"disasm_omitted\":\"exec_bytes={d} > 32 KiB cap; call disassemble_range or decompile to inspect specific addresses\"", .{total_exec_bytes}) catch {};
+            w.print(",\"disasm_omitted\":\"exec_bytes={d} > 32 KiB cap; call disassemble_range or get_cfg to inspect specific addresses\"", .{total_exec_bytes}) catch {};
         }
     }
 
-    // ---- Optional bytes (compact hex with zero-run squelch) ----
+    // Optional primary-byte previews are bounded before serialization. Zero
+    // markers preserve actual zeros; they never classify bytes as padding.
     if (include_bytes) {
-        w.writeAll(",\"bytes\":[") catch {};
-        var first_byte_sec = true;
+        w.writeAll(",\"byte_encoding\":\"compact_hex_with_zero_runs\",\"zero_run_syntax\":\"[ZERO*N] means N actual zero bytes; zeros are not assumed padding\",\"bytes\":[") catch {};
+        var byte_budget: usize = @min(16384, max_chars / 4);
+        var byte_sections: usize = 0;
+        var omitted_sections: usize = 0;
+        var bytes_partial = false;
         for (entry.doc.segments) |seg| {
             for (seg.sections) |sec| {
                 if (sec.is_zerofill or sec.length == 0) continue;
-                const sec_end = sec.file_offset + sec.length;
-                if (sec_end > entry.doc.data.len) continue;
-                if (!first_byte_sec) w.writeByte(',') catch {};
-                first_byte_sec = false;
+                if (sec.file_offset > entry.doc.data.len or sec.length > entry.doc.data.len - sec.file_offset or byte_sections >= 32) {
+                    omitted_sections += 1;
+                    bytes_partial = true;
+                    continue;
+                }
+                if (byte_sections != 0) w.writeByte(',') catch {};
+                byte_sections += 1;
+                const count: usize = @intCast(@min(sec.length, @min(byte_budget, 4096)));
+                byte_budget -= count;
+                const partial = count < sec.length;
+                bytes_partial = bytes_partial or partial;
                 w.writeAll("{\"section\":") catch {};
                 json.writeJsonString(w, sec.name) catch {};
                 w.writeAll(",\"start\":") catch {};
-                json.writeAddress(w, applyRebaseDelta(sec.start, eff.delta)) catch {};
-                const data_slice = entry.doc.data[sec.file_offset..sec_end];
-                w.writeAll(",\"hex\":\"") catch {};
-                // Squelch runs of >=8 zero bytes by collapsing them to a marker.
+                const out_start = applyRebaseDelta(sec.start, eff.delta);
+                json.writeAddress(w, out_start) catch {};
+                w.print(",\"file_offset\":{d},\"section_length\":{d},\"returned_length\":{d},\"partial\":{},\"hex\":\"", .{ sec.file_offset, sec.length, count, partial }) catch {};
+                const data_slice = entry.doc.data[sec.file_offset..][0..count];
                 var i: usize = 0;
                 while (i < data_slice.len) {
                     if (data_slice[i] == 0) {
@@ -13914,10 +15071,14 @@ fn handleGetBinaryContext(ctx: ToolContext, params: std.json.Value) ToolError!To
                     w.print("{x:0>2}", .{data_slice[i]}) catch {};
                     i += 1;
                 }
-                w.writeAll("\"}") catch {};
+                w.writeByte('"') catch {};
+                if (partial) {
+                    w.print(",\"next_call\":{{\"tool\":\"read_bytes\",\"arguments\":{{\"doc_id\":{d},\"file_offset\":{d},\"length\":{d},\"encoding\":\"hex_compact\"}}}}", .{ doc_id, sec.file_offset + count, sec.length - count }) catch {};
+                }
+                w.writeByte('}') catch {};
             }
         }
-        w.writeAll("]") catch {};
+        w.print("],\"bytes_partial\":{},\"byte_sections_omitted\":{d}", .{ bytes_partial, omitted_sections }) catch {};
     }
 
     // Finalize. Truncate at max_chars if we overflowed.
@@ -13984,7 +15145,15 @@ fn handleGetBinaryContext(ctx: ToolContext, params: std.json.Value) ToolError!To
         } else {
             // Couldn't find a clean break — emit a minimal valid response.
             rb.clearRetainingCapacity();
-            rb.writer.writeAll("{\"strategy\":\"manifest\",\"truncated\":true,\"truncation_note\":\"no safe truncation point; retry with mode=manifest\"}") catch {};
+            try rb.writer.writeAll("{\"strategy\":\"manifest\",\"truncated\":true,\"truncation_note\":\"no safe truncation point; retry with mode=manifest\"");
+            if (automatic_cfg_address) |addr| {
+                try rb.writer.writeAll(",\"control_flow_evidence\":{\"status\":\"deferred\",\"next_call\":{\"tool\":\"get_cfg\",\"arguments\":{");
+                try rb.writer.print("\"doc_id\":{d},\"function_address\":", .{doc_id});
+                try json.writeAddress(&rb.writer, addr);
+                if (automatic_execution) try rb.writer.writeAll(",\"instruction_view\":\"execution\"");
+                try rb.writer.writeAll(",\"include_disassembly\":true,\"max_blocks\":128}}}");
+            }
+            try rb.writer.writeByte('}');
         }
     } else {
         w.writeAll(",\"truncated\":false}") catch {};
@@ -14048,7 +15217,7 @@ fn handleGetSemanticSlice(ctx: ToolContext, params: std.json.Value) ToolError!To
 
     // Route to pack/remake formatter if requested
     if (is_pack or is_remake) {
-        return buildContextPack(ctx, eff, addresses, snapshot, max_chars, is_remake, is_cluster, max_chars_was_clamped, max_cluster_param, start);
+        return buildContextPack(ctx, eff, doc_id, addresses, snapshot, max_chars, is_remake, is_cluster, max_chars_was_clamped, max_cluster_param, start);
     }
 
     // Seed diagnostics — match the schema emitted by buildContextPack so all
@@ -14225,6 +15394,7 @@ fn handleGetSemanticSlice(ctx: ToolContext, params: std.json.Value) ToolError!To
 fn buildContextPack(
     ctx: ToolContext,
     eff: EffectiveDb,
+    doc_id: u64,
     addresses: []const u64,
     snapshot: u64,
     max_chars: u32,
@@ -14271,6 +15441,8 @@ fn buildContextPack(
             funcs.append(.{ .proc = proc, .label = idx }) catch {};
         }
     }
+
+    const seed_count = funcs.items.len;
 
     // Import calls (declared early so cluster expansion can add thunk resolutions)
     const ImpRef = struct { func_label: u32, imp_name: []const u8 };
@@ -14444,102 +15616,124 @@ fn buildContextPack(
 
     // Section: Functions
     tw.writeAll("--- FUNCTIONS ---\n") catch {};
-    for (funcs.items) |fi| {
+    var instruction_evidence_truncated = false;
+    var coverage = std.Io.Writer.Allocating.init(ctx.allocator);
+    defer coverage.deinit();
+    const cw = &coverage.writer;
+    const instruction_budget = max_chars * 60 / 100;
+    const seed_budget = if (funcs.items.len > seed_count) instruction_budget * 80 / 100 else instruction_budget;
+    for (funcs.items, 0..) |fi, func_index| {
         const rebased = applyRebaseDelta(fi.proc.entry, eff.delta);
         const name = fi.proc.name orelse eff.db.resolveName(fi.proc.entry) orelse "unnamed";
         tw.print("F{d}: {s} (0x{x}, {d} bytes)\n", .{ fi.label, name, rebased, fi.proc.size }) catch {};
 
-        // Lift pseudocode — budget: 60% of max_chars shared across all functions
-        const pseudo_budget = max_chars * 60 / 100;
-        const per_func_budget = if (funcs.items.len > 0) pseudo_budget / @as(u32, @intCast(funcs.items.len)) else pseudo_budget;
-        if (text.written().len < pseudo_budget) {
-            ensureLiftedIR(ctx.allocator, fi.proc, eff.db, eff.entry);
-            if (eff.db.getCachedIR(fi.proc.entry)) |ir_func| {
-                var pseudo_buf = std.Io.Writer.Allocating.init(ctx.allocator);
-                defer pseudo_buf.deinit();
-                const plt_ctx = PseudocodeCtx{
-                    .allocator = ctx.allocator,
-                    .db = eff.db,
-                    .doc = &eff.entry.doc,
-                };
-                writePseudocodeTextWithCtx(&pseudo_buf.writer, ir_func, plt_ctx) catch {};
-                if (pseudo_buf.written().len > 0) {
-                    const max_pseudo = @min(pseudo_buf.written().len, per_func_budget);
-                    tw.writeAll(pseudo_buf.written()[0..max_pseudo]) catch {};
-                    if (pseudo_buf.written().len > max_pseudo) tw.writeAll("\n  [... truncated]\n") catch {};
-                    tw.writeByte('\n') catch {};
-                }
-            } else {
-                // No IR available — emit disassembly excerpt as fallback
-                tw.writeAll("  ; [disassembly — no lifter available]\n") catch {};
+        // Requested seeds retain their evidence budget when a cluster grows.
+        const per_func_budget = if (func_index < seed_count)
+            seed_budget / @max(seed_count, 1)
+        else
+            (instruction_budget - seed_budget) / @max(funcs.items.len - seed_count, 1);
+        var covered_bytes: u64 = 0;
+        var decode_gaps: usize = 0;
+        if (per_func_budget > 0) {
+            tw.writeAll("  ; instruction evidence\n") catch {};
 
-                const proc_addr = fi.proc.entry;
-                const proc_size = fi.proc.size;
-                const doc_data = eff.entry.doc.data;
-                const doc_arch = eff.entry.doc.arch;
+            const proc_addr = fi.proc.entry;
+            const proc_size = fi.proc.size;
+            const doc_data = eff.entry.doc.data;
+            const doc_arch = eff.entry.doc.arch;
 
-                // Resolve file offset for this procedure's virtual address
-                const raw_info = resolveRawBytesInfo(eff.entry, proc_addr);
+            // Resolve file offset for this procedure's virtual address
+            const raw_info = resolveRawBytesInfo(eff.entry, proc_addr);
 
-                if (raw_info) |info| {
-                    const byte_off = info.file_offset + (proc_addr - info.section_base);
-                    // Decode up to per_func_budget characters worth of instructions
-                    const max_disasm: usize = per_func_budget;
-                    const is_arm32_disasm = doc_arch == .arm32;
-                    const is_mips32_disasm = doc_arch == .mips32;
-                    const is_x86_64_disasm = doc_arch == .x86_64;
-                    const step: usize = if (is_arm32_disasm) 2 else if (is_x86_64_disasm) 1 else 4;
-                    const max_bytes: usize = if (proc_size > 0) @min(proc_size, 256) else 256;
-                    var off: usize = 0;
-                    const disasm_start = text.written().len;
+            if (raw_info) |info| {
+                const byte_off = info.file_offset + (proc_addr - info.section_base);
+                // Decode up to per_func_budget characters worth of instructions
+                const max_disasm: usize = per_func_budget;
+                const is_arm32_disasm = doc_arch == .arm32;
+                const is_mips32_disasm = doc_arch == .mips32;
+                const is_x86_64_disasm = doc_arch == .x86_64 or doc_arch == .x86;
+                const step: usize = if (is_arm32_disasm) 2 else if (is_x86_64_disasm) 1 else 4;
+                const code_end = eff.entry.doc.codeRangeEnd(proc_addr) orelse proc_addr;
+                const max_bytes: usize = @intCast(@min(code_end - proc_addr, if (proc_size > 0) @min(proc_size, 4096) else 256));
+                var off: usize = 0;
+                var thumb_state: arm32.ItState = .{};
+                const disasm_start = text.written().len;
 
-                    while (off < max_bytes and (text.written().len - disasm_start) < max_disasm) {
-                        const abs_off = byte_off + off;
-                        if (abs_off + step > doc_data.len) break;
+                while (off < max_bytes and (text.written().len - disasm_start) < max_disasm) {
+                    const abs_off = byte_off + off;
+                    if (abs_off >= doc_data.len) break;
+                    const remaining = @min(max_bytes - off, doc_data.len - abs_off);
+                    if (remaining < step) break;
+                    const raw = doc_data[abs_off..][0..remaining];
 
-                        const addr = proc_addr + off;
+                    const addr = proc_addr + off;
+                    const display_addr = applyRebaseDelta(addr, eff.delta);
 
-                        if (is_arm32_disasm) {
-                            const d = arm32.decode(doc_data[abs_off..], addr);
-                            tw.print("  0x{x}: {s}", .{ addr, d.mnemonic }) catch break;
-                            const ops = d.operands[0..d.operands_len];
-                            if (ops.len > 0) {
-                                tw.print(" {s}", .{ops}) catch break;
-                            }
-                            tw.writeByte('\n') catch break;
-                            off += d.length;
-                        } else if (is_mips32_disasm) {
-                            const d = mips32.decode(doc_data[abs_off..], addr);
-                            tw.print("  0x{x}: {s}", .{ addr, d.mnemonic }) catch break;
-                            const ops = d.operands[0..d.operands_len];
-                            if (ops.len > 0) {
-                                tw.print(" {s}", .{ops}) catch break;
-                            }
-                            tw.writeByte('\n') catch break;
-                            off += 4;
-                        } else if (is_x86_64_disasm) {
-                            const x86 = @import("arch/x86_64.zig");
-                            const d = x86.decode(doc_data[abs_off..], addr);
-                            tw.print("  0x{x}: {s}", .{ addr, d.mnemonic }) catch break;
-                            const ops = d.operands[0..d.operands_len];
-                            if (ops.len > 0) {
-                                tw.print(" {s}", .{ops}) catch break;
-                            }
-                            tw.writeByte('\n') catch break;
-                            off += d.length;
-                        } else {
-                            const d = arm64.decode(doc_data[abs_off..], addr);
-                            tw.print("  0x{x}: {s}", .{ addr, d.mnemonic }) catch break;
-                            const ops = d.operands[0..d.operands_len];
-                            if (ops.len > 0) {
-                                tw.print(" {s}", .{ops}) catch break;
-                            }
-                            tw.writeByte('\n') catch break;
-                            off += 4;
+                    if (is_arm32_disasm) {
+                        const d = arm32.decode(raw, addr);
+                        if (d.length == 0 or d.length > remaining) break;
+                        const predicate = thumb_state.currentCondition();
+                        const mnemonic = if (predicate != null and d.flags_suppressed_in_it and std.mem.endsWith(u8, d.mnemonic, "s")) d.mnemonic[0 .. d.mnemonic.len - 1] else d.mnemonic;
+                        tw.print("  0x{x}: {s}", .{ display_addr, mnemonic }) catch break;
+                        const ops = d.operands[0..d.operands_len];
+                        if (ops.len > 0) {
+                            tw.print(" {s}", .{ops}) catch break;
                         }
+                        if (predicate) |condition| tw.print(" ; if {s}", .{arm32.conditionName(condition)}) catch break;
+                        if (predicate != null and d.flags_suppressed_in_it) tw.writeAll(", flags unchanged") catch break;
+                        tw.writeByte('\n') catch break;
+                        thumb_state.advance();
+                        if (d.it_block) |block| thumb_state.begin(block);
+                        off += d.length;
+                    } else if (is_mips32_disasm) {
+                        const d = mips32.decode(raw, addr);
+                        tw.print("  0x{x}: {s}", .{ display_addr, d.mnemonic }) catch break;
+                        const ops = d.operands[0..d.operands_len];
+                        if (ops.len > 0) {
+                            tw.print(" {s}", .{ops}) catch break;
+                        }
+                        tw.writeByte('\n') catch break;
+                        off += 4;
+                    } else if (is_x86_64_disasm) {
+                        const x86 = @import("arch/x86_64.zig");
+                        const d = if (doc_arch == .x86) x86.decode32(raw, addr) else x86.decode(raw, addr);
+                        if (x86DecodeGap(d.mnemonic)) break;
+                        if (d.length == 0 or d.length > remaining) break;
+                        tw.print("  0x{x}: {s}", .{ display_addr, d.mnemonic }) catch break;
+                        const ops = d.operands[0..d.operands_len];
+                        if (ops.len > 0) {
+                            tw.print(" {s}", .{ops}) catch break;
+                        }
+                        tw.writeByte('\n') catch break;
+                        off += d.length;
+                    } else {
+                        writeArm64PackInstruction(tw, raw, addr, display_addr, &decode_gaps, if (off >= 4) std.mem.readInt(u32, doc_data[abs_off - 4 ..][0..4], .little) else null) catch break;
+                        off += 4;
                     }
                 }
+                covered_bytes = off;
             }
+        }
+        if (decode_gaps > 0)
+            unknowns.append("opaque ARM64 decoder slots: instruction identity, effects, and control flow unknown") catch {};
+        const complete = fi.proc.size > 0 and covered_bytes == fi.proc.size;
+        if (func_index > 0) try cw.writeByte(',');
+        try cw.writeAll("{\"function_address\":");
+        try json.writeAddress(cw, rebased);
+        try cw.print(",\"known_bytes\":{d},\"covered_bytes\":{d},\"complete\":{},\"boundary_kind\":\"{s}\"", .{ fi.proc.size, covered_bytes, complete, if (eff.entry.doc.isLinkerFunctionStart(fi.proc.entry)) @as([]const u8, "linker_start_next_boundary") else "inferred" });
+        try cw.print(",\"decode_gaps\":{d},\"decoded_bytes\":{d},\"decode_complete\":{}", .{ decode_gaps, covered_bytes - @as(u64, @intCast(decode_gaps)) * 4, complete and decode_gaps == 0 });
+        if (!complete) {
+            const next_length = if (fi.proc.size > covered_bytes) @min(fi.proc.size - covered_bytes, 256) else 256;
+            try cw.print(",\"next_call\":{{\"tool\":\"disassemble_range\",\"arguments\":{{\"doc_id\":{d},\"start\":", .{doc_id});
+            try json.writeAddress(cw, applyRebaseDelta(fi.proc.entry + covered_bytes, eff.delta));
+            try cw.print(",\"byte_length\":{d}}}}}", .{next_length});
+        }
+        try cw.writeByte('}');
+        if (!complete) {
+            instruction_evidence_truncated = true;
+            tw.print("  ; partial instruction evidence ({d}/{d} known bytes); continue with disassemble_range start=0x{x} byte_length=256\n", .{
+                covered_bytes, fi.proc.size, applyRebaseDelta(fi.proc.entry + covered_bytes, eff.delta),
+            }) catch {};
         }
     }
 
@@ -14549,8 +15743,8 @@ fn buildContextPack(
         var cap_started = false;
         for (str_refs.items) |sr| {
             if (cap_count >= 30) break;
-            var cats: [10][]const u8 = undefined;
-            var confs: [10]CapConfidence = undefined;
+            var cats: [MAX_CAP_CATS][]const u8 = undefined;
+            var confs: [MAX_CAP_CATS]CapConfidence = undefined;
             const n_cats = categorizeCapabilityWithConfidence(sr.value, &cats, &confs);
             if (n_cats > 0) {
                 if (!cap_started) {
@@ -14691,7 +15885,7 @@ fn buildContextPack(
             }
         }
         if (hypothesis_count == 0) {
-            tw.writeAll("Purpose unclear from strings and imports. Examine pseudocode for control flow patterns.\n") catch {};
+            tw.writeAll("Purpose unclear from strings and imports. Inspect get_cfg with include_disassembly=true and follow address references.\n") catch {};
             purpose_hyps.append("Purpose unclear from strings and imports") catch {};
         }
 
@@ -14716,11 +15910,18 @@ fn buildContextPack(
     try w.writeAll("\"text\":");
     try json.writeJsonString(w, text.written());
 
+    try w.writeAll(",\"instruction_coverage\":[");
+    try w.writeAll(coverage.written());
+    try w.writeAll("],\"evidence_note\":\"covered_bytes and complete describe inspected raw instruction slots within reported bounds; decoded_bytes and decode_complete exclude opaque ARM64 fallbacks. No coverage field verifies semantics or source equivalence. linker_start_next_boundary uses a validated linker entry through the next entry or section end; padding and split code may remain. Follow next_call before reconstructing omitted code.\"");
+
     // Emit stats
     try w.print(",\"functions\":{d},\"string_refs\":{d},\"import_calls\":{d},\"unknowns\":{d}", .{
         funcs.items.len, str_refs.items.len, imp_refs.items.len, unknowns.items.len,
     });
-    try w.print(",\"truncated\":{s}", .{if (text.written().len >= max_chars) "true" else "false"});
+    try w.print(",\"truncated\":{s},\"instruction_evidence_truncated\":{s}", .{
+        if (text.written().len >= max_chars or instruction_evidence_truncated) "true" else "false",
+        if (instruction_evidence_truncated) "true" else "false",
+    });
     if (max_chars_was_clamped) {
         try w.print(",\"max_chars_clamped\":{d}", .{max_chars});
     }
@@ -14809,1074 +16010,6 @@ fn buildContextPack(
     const elapsed = timestampMs(ctx.io) - start_time;
     const resp = json.successResponse(ctx.allocator, "get_semantic_slice", result_json, elapsed) catch return ToolError.OutOfMemory;
     return .{ .json_response = resp, .is_error = false, .meta_max_chars = 200_000 };
-}
-
-// ============================================================================
-// decompile handler (#30) — W7 of v7.8.0
-// ============================================================================
-
-/// Walk a StructuredNode tree, emitting C-like control flow. Leaf `.block`
-/// nodes call back into `writeBlockBody` (which knows how to render the
-/// underlying IR statements via writePseudocodeText). Falls back to plain
-/// pseudocode if the tree is empty.
-fn renderStructuredNode(
-    w: anytype,
-    node: structure_mod.StructuredNode,
-    ir_func: types.IRFunction,
-    plt_ctx: PseudocodeCtx,
-    indent: u32,
-) anyerror!void {
-    return renderStructuredNodeCtx(w, node, ir_func, plt_ctx, null, indent);
-}
-
-/// B3 + B6 (v7.8.1): version of renderStructuredNode that takes the CFG so
-/// it can inline the actual compare expression (replacing the historical
-/// `cond_0x<addr>` placeholder) and so it can detect IR-level `return`
-/// terminators inside leaf blocks for B6 epilogue emission.
-fn renderStructuredNodeCtx(
-    w: anytype,
-    node: structure_mod.StructuredNode,
-    ir_func: types.IRFunction,
-    plt_ctx: PseudocodeCtx,
-    cfg: ?types.CfgResult,
-    indent: u32,
-) anyerror!void {
-    var ind_buf: [64]u8 = undefined;
-    const ind_n = @min(indent * 2, ind_buf.len);
-    for (0..ind_n) |i| ind_buf[i] = ' ';
-    const ind = ind_buf[0..ind_n];
-
-    switch (node.kind) {
-        .sequence => {
-            for (node.children) |child| {
-                try renderStructuredNodeCtx(w, child, ir_func, plt_ctx, cfg, indent);
-            }
-        },
-        .if_then => {
-            try w.print("{s}if (", .{ind});
-            try writeConditionExpr(w, ir_func, node.condition_block, node.condition_negated);
-            try w.writeAll(") {\n");
-            for (node.children) |child| {
-                try renderStructuredNodeCtx(w, child, ir_func, plt_ctx, cfg, indent + 1);
-            }
-            try w.print("{s}}}\n", .{ind});
-        },
-        .if_then_else => {
-            try w.print("{s}if (", .{ind});
-            try writeConditionExpr(w, ir_func, node.condition_block, node.condition_negated);
-            try w.writeAll(") {\n");
-            if (node.children.len > 0) try renderStructuredNodeCtx(w, node.children[0], ir_func, plt_ctx, cfg, indent + 1);
-            try w.print("{s}}} else {{\n", .{ind});
-            if (node.children.len > 1) try renderStructuredNodeCtx(w, node.children[1], ir_func, plt_ctx, cfg, indent + 1);
-            try w.print("{s}}}\n", .{ind});
-        },
-        .while_loop => {
-            try w.print("{s}while (", .{ind});
-            try writeConditionExpr(w, ir_func, node.condition_block, node.condition_negated);
-            try w.writeAll(") {\n");
-            for (node.children) |child| {
-                try renderStructuredNodeCtx(w, child, ir_func, plt_ctx, cfg, indent + 1);
-            }
-            try w.print("{s}}}\n", .{ind});
-        },
-        .do_while => {
-            try w.print("{s}do {{\n", .{ind});
-            for (node.children) |child| {
-                try renderStructuredNodeCtx(w, child, ir_func, plt_ctx, cfg, indent + 1);
-            }
-            try w.print("{s}}} while (", .{ind});
-            try writeConditionExpr(w, ir_func, node.condition_block, node.condition_negated);
-            try w.writeAll(");\n");
-        },
-        .infinite_loop => {
-            try w.print("{s}for (;;) {{\n", .{ind});
-            for (node.children) |child| {
-                try renderStructuredNodeCtx(w, child, ir_func, plt_ctx, cfg, indent + 1);
-            }
-            try w.print("{s}}}\n", .{ind});
-        },
-        .switch_stmt => {
-            try w.print("{s}switch (", .{ind});
-            if (node.condition_block) |ca| {
-                try w.print("dispatch_0x{x}", .{ca});
-            } else {
-                try w.writeAll("dispatch");
-            }
-            try w.writeAll(") {\n");
-            for (node.children, 0..) |child, ci| {
-                try w.print("{s}  case {d}:\n", .{ ind, ci });
-                try renderStructuredNodeCtx(w, child, ir_func, plt_ctx, cfg, indent + 2);
-                try w.print("{s}    break;\n", .{ind});
-            }
-            try w.print("{s}}}\n", .{ind});
-        },
-        .block => {
-            // Leaf — render any IR statements that fall in this block.
-            if (node.block_addr) |ba| {
-                try renderBlockStatements(w, ir_func, plt_ctx, ba, indent);
-                // B6 (v7.8.1): if this block ends in a `return` IR statement,
-                // emit a `return ...;` line so the function epilogue is visible.
-                try writeReturnIfTerminator(w, ir_func, cfg, ba, ind);
-            }
-        },
-        .goto => {
-            if (node.goto_target) |t| {
-                // G3 (v7.8.3): normalize a relative offset that escaped the
-                // structured-CF builder back to an absolute address. Anything
-                // that's clearly inside the function range (entry .. entry+size)
-                // is already absolute; anything smaller is a relative offset.
-                const fn_entry = ir_func.address;
-                const abs = if (t < fn_entry) fn_entry + t else t;
-                try w.print("{s}goto L_0x{x};\n", .{ ind, abs });
-            } else {
-                try w.print("{s}goto unknown;\n", .{ind});
-            }
-        },
-        .break_stmt => try w.print("{s}break;\n", .{ind}),
-        .continue_stmt => try w.print("{s}continue;\n", .{ind}),
-        .return_stmt => {
-            if (node.block_addr) |ba| {
-                try renderBlockStatements(w, ir_func, plt_ctx, ba, indent);
-            }
-            // B6: prefer the source operand of the last `return` IR stmt if any.
-            try writeReturnEpilogue(w, ir_func, node.block_addr, ind);
-        },
-    }
-}
-
-/// B3 helper: map an ARM/ARM64-style condition code to a C-like infix operator.
-/// Returns null if the code isn't recognized (caller should fall back).
-fn condCodeToInfix(cc: []const u8, signed: bool) ?[]const u8 {
-    if (std.mem.eql(u8, cc, "eq")) return "==";
-    if (std.mem.eql(u8, cc, "ne")) return "!=";
-    // Signed comparisons.
-    if (std.mem.eql(u8, cc, "lt")) return "<";
-    if (std.mem.eql(u8, cc, "le")) return "<=";
-    if (std.mem.eql(u8, cc, "gt")) return ">";
-    if (std.mem.eql(u8, cc, "ge")) return ">=";
-    // Unsigned comparisons (ARM "higher"/"lower" mnemonics).
-    if (std.mem.eql(u8, cc, "hi")) return ">"; // unsigned higher
-    if (std.mem.eql(u8, cc, "hs") or std.mem.eql(u8, cc, "cs")) return ">="; // unsigned higher-or-same
-    if (std.mem.eql(u8, cc, "lo") or std.mem.eql(u8, cc, "cc")) return "<"; // unsigned lower
-    if (std.mem.eql(u8, cc, "ls")) return "<="; // unsigned lower-or-same
-    _ = signed;
-    return null;
-}
-
-/// Negate a C-like infix operator (used when condition_negated is true and
-/// we still want a clean readable expression rather than `!(a == b)`).
-fn negateInfix(op: []const u8) []const u8 {
-    if (std.mem.eql(u8, op, "==")) return "!=";
-    if (std.mem.eql(u8, op, "!=")) return "==";
-    if (std.mem.eql(u8, op, "<")) return ">=";
-    if (std.mem.eql(u8, op, "<=")) return ">";
-    if (std.mem.eql(u8, op, ">")) return "<=";
-    if (std.mem.eql(u8, op, ">=")) return "<";
-    return op;
-}
-
-/// B3: write the C-like condition expression for a structured if/while/do-while
-/// node by walking the IR for the block's terminator (compare + branch).
-/// Falls back to `cond_0x<addr>` (or `cond`) if no compare is found.
-fn writeConditionExpr(
-    w: anytype,
-    ir_func: types.IRFunction,
-    condition_block: ?u64,
-    negated: bool,
-) !void {
-    // G1 (v7.8.3): when fallbacks fire, emit a parseable but honest expression
-    // instead of `cond_0xADDR` — readers may treat that as a real variable.
-    // Use `/* cond@0xADDR */ 1` so the AST parses, the predicate is always
-    // truthy, and the address is captured for diagnosis.
-
-    // Without a condition_block we can't do anything useful.
-    const ca = condition_block orelse {
-        if (negated) try w.writeAll("!");
-        try w.writeAll("/* cond unknown */ 1");
-        return;
-    };
-
-    // Find the last compare statement at or after `ca` and before the next
-    // branch — that's the one whose flags the branch consumes.
-    var last_cmp: ?types.IRStatement = null;
-    var br: ?types.IRStatement = null;
-    for (ir_func.statements) |stmt| {
-        if (stmt.address < ca) continue;
-        switch (stmt.type) {
-            .compare => last_cmp = stmt,
-            .branch => {
-                br = stmt;
-                break;
-            },
-            else => {},
-        }
-    }
-
-    // v7.13.0 B6a — fallback: when no cmp at/after ca, the maturity pass may
-    // have folded the cmp into a predecessor block. Scan the WHOLE function
-    // for the latest .compare statement strictly before the branch (or before
-    // ca if no branch was seen). Pre-fix: every `if (/* cond@0x... no_compare
-    // */ 1)` in /bin/mv sub_0x100000ad4 was a flag-cmp emitted upstream of the
-    // condition_block. Post-fix: those render as `if (w8 == #0x4000)` etc.
-    if (last_cmp == null) {
-        const upper_addr: u64 = if (br) |b| b.address else ca;
-        for (ir_func.statements) |stmt| {
-            if (stmt.type != .compare) continue;
-            if (stmt.address >= upper_addr) break;
-            last_cmp = stmt;
-        }
-    }
-
-    // Final fallback: emit the disassembly-level cmp address itself as a
-    // boolean expression so the LLM can read it. We surface the branch's
-    // condition mnemonic when available; otherwise we mark the address.
-    const cmp = last_cmp orelse {
-        if (negated) try w.writeAll("!");
-        const branch_cc: []const u8 = if (br) |b| (b.condition orelse "?") else "?";
-        // Emit a parseable expression that captures the address AND the cc so
-        // the LLM can correlate with the disassembly. Stays truthy (predicate=1)
-        // so generated code still compiles.
-        try w.print("/* cmp_at_0x{x} cc={s} */ (cmp_at_0x{x} != 0)", .{ ca, branch_cc, ca });
-        return;
-    };
-
-    // Branch condition tells us which operator (eq/ne/lt/...). If we don't
-    // have a branch (e.g. unconditional) the compare alone isn't enough.
-    const branch_cond = if (br) |b| b.condition else null;
-    const cc_str = branch_cond orelse {
-        // Best effort: emit the compare's two operands as a "boolean" with
-        // an explicit unresolved-cc marker, so the LLM at least sees the
-        // values that drive the branch.
-        if (negated) try w.writeAll("!");
-        try w.print("/* cond@0x{x} no_branch */ ({s} ? {s} : {s})", .{
-            ca,
-            sanitizeOperand(cmp.dest orelse "?"),
-            sanitizeOperand(cmp.src orelse "?"),
-            sanitizeOperand(cmp.target orelse "?"),
-        });
-        return;
-    };
-
-    // Special case: cbz / cbnz / bit-test variants encode the operand directly
-    // in the branch condition string ("eq_zero", "ne_zero", "bit_set", ...).
-    if (std.mem.eql(u8, cc_str, "eq_zero") or std.mem.eql(u8, cc_str, "ne_zero")) {
-        const op_txt: []const u8 = if (std.mem.eql(u8, cc_str, "eq_zero")) "==" else "!=";
-        const final = if (negated) negateInfix(op_txt) else op_txt;
-        // The compare's `dest` is the register we tested.
-        try w.print("{s} {s} 0", .{ sanitizeOperand(cmp.dest orelse "?"), final });
-        return;
-    }
-
-    // Map cc to infix.
-    const infix_opt = condCodeToInfix(cc_str, false);
-    if (infix_opt == null) {
-        // Render the compare operands with the raw cc as a comment so
-        // the LLM can reason about it even without our infix mapping.
-        if (negated) try w.writeAll("!");
-        const lhs = sanitizeOperand(cmp.dest orelse "?");
-        const rhs = sanitizeOperand(cmp.src orelse cmp.target orelse "?");
-        try w.print("/* cc={s} */ ({s} <op> {s})", .{ cc_str, lhs, rhs });
-        return;
-    }
-    const infix = if (negated) negateInfix(infix_opt.?) else infix_opt.?;
-    const lhs = sanitizeOperand(cmp.dest orelse "?");
-    const rhs = sanitizeOperand(cmp.src orelse cmp.target orelse "?");
-    try w.print("{s} {s} {s}", .{ lhs, infix, rhs });
-}
-
-/// G6 (v7.8.3): shared ABI parameter filter used by both `lift` and
-/// `decompile` so their function signatures stay in sync. Returns true when
-/// `name`/`register` look like a real ABI argument register (arg0..arg7 on
-/// ARM64, rdi/rsi/rdx/rcx/r8/r9 on x86_64) and not a callee-saved register,
-/// frame/link pointer, or synthesized helper.
-fn isArgumentVariable(name: []const u8, register_opt: ?[]const u8) bool {
-    // Filter by name first — these are always non-args even if the register
-    // field happens to look arg-like.
-    if (std.mem.startsWith(u8, name, "frame_ptr") or
-        std.mem.startsWith(u8, name, "link_reg") or
-        std.mem.startsWith(u8, name, "saved_") or
-        std.mem.startsWith(u8, name, "stack_") or
-        std.mem.startsWith(u8, name, "tmp") or
-        std.mem.startsWith(u8, name, "local_") or
-        std.mem.startsWith(u8, name, "indirect_result") or
-        std.mem.eql(u8, name, "zero") or
-        std.mem.eql(u8, name, "fp") or
-        std.mem.eql(u8, name, "lr") or
-        std.mem.eql(u8, name, "sp") or
-        std.mem.eql(u8, name, "result"))
-    {
-        return false;
-    }
-    const reg = register_opt orelse return false;
-    // Reject obvious non-arg register names.
-    if (std.mem.eql(u8, reg, "fp") or std.mem.eql(u8, reg, "lr") or
-        std.mem.eql(u8, reg, "sp") or std.mem.eql(u8, reg, "x29") or
-        std.mem.eql(u8, reg, "x30") or std.mem.eql(u8, reg, "x31"))
-    {
-        return false;
-    }
-    // ARM64: exactly x0..x7 (length 2). Reject x10..x29, x30/lr, etc.
-    const arm_arg = (reg.len == 2 and reg[0] == 'x' and reg[1] >= '0' and reg[1] <= '7');
-    const x86_arg = std.mem.eql(u8, reg, "rdi") or std.mem.eql(u8, reg, "rsi") or
-        std.mem.eql(u8, reg, "rdx") or std.mem.eql(u8, reg, "rcx") or
-        std.mem.eql(u8, reg, "r8") or std.mem.eql(u8, reg, "r9");
-    return arm_arg or x86_arg;
-}
-
-/// B6: emit a `return <src>;` if the last statement inside `block_addr`'s
-/// IR range is a `.return` statement. Doesn't emit anything if the block
-/// already ends in something else.
-fn writeReturnIfTerminator(
-    w: anytype,
-    ir_func: types.IRFunction,
-    cfg: ?types.CfgResult,
-    block_addr: u64,
-    ind: []const u8,
-) !void {
-    // Determine the upper bound of statements that belong to this block.
-    var upper: u64 = std.math.maxInt(u64);
-    if (cfg) |c| {
-        for (c.basic_blocks) |bb| {
-            if (bb.start == block_addr) {
-                upper = bb.start + bb.size;
-                break;
-            }
-        }
-    }
-    // Scan IR statements in this block for a return; emit the FIRST one we
-    // see (subsequent ones would be unreachable). We also check the very
-    // last statement of the entire function as a fallback.
-    var found_ret = false;
-    var ret_src: ?[]const u8 = null;
-    for (ir_func.statements) |stmt| {
-        if (stmt.address < block_addr) continue;
-        if (stmt.address >= upper) break;
-        if (stmt.type == .@"return") {
-            found_ret = true;
-            ret_src = stmt.src;
-            break;
-        }
-    }
-    if (!found_ret) return;
-    try w.writeAll(ind);
-    if (ret_src) |s| {
-        try w.print("return {s};\n", .{sanitizeOperand(s)});
-    } else {
-        try w.writeAll("return;\n");
-    }
-}
-
-/// B6 helper for explicit `.return_stmt` structural nodes — the structural
-/// node may not have a populated block_addr, so we look at the function's
-/// final return as a best-effort source operand.
-fn writeReturnEpilogue(
-    w: anytype,
-    ir_func: types.IRFunction,
-    block_addr: ?u64,
-    ind: []const u8,
-) !void {
-    var ret_src: ?[]const u8 = null;
-    if (block_addr) |ba| {
-        for (ir_func.statements) |stmt| {
-            if (stmt.address < ba) continue;
-            if (stmt.type == .@"return") {
-                ret_src = stmt.src;
-                break;
-            }
-        }
-    }
-    if (ret_src == null) {
-        // Fallback: scan from the end for the last return.
-        var i: usize = ir_func.statements.len;
-        while (i > 0) {
-            i -= 1;
-            if (ir_func.statements[i].type == .@"return") {
-                ret_src = ir_func.statements[i].src;
-                break;
-            }
-        }
-    }
-    try w.writeAll(ind);
-    if (ret_src) |s| {
-        try w.print("return {s};\n", .{sanitizeOperand(s)});
-    } else {
-        try w.writeAll("return;\n");
-    }
-}
-
-/// Render the IR statements that physically belong to the basic block at
-/// `block_addr`. We don't have a precise (block_addr → statement_range) map,
-/// so we use a heuristic: emit all statements whose address is >= block_addr
-/// and < the next block address found in the tree (or the next branch).
-/// In the common single-block case this just emits everything once.
-fn renderBlockStatements(
-    w: anytype,
-    ir_func: types.IRFunction,
-    plt_ctx: PseudocodeCtx,
-    block_addr: u64,
-    indent: u32,
-) !void {
-    var ind_buf: [64]u8 = undefined;
-    const ind_n = @min(indent * 2, ind_buf.len);
-    for (0..ind_n) |i| ind_buf[i] = ' ';
-    const ind = ind_buf[0..ind_n];
-
-    for (ir_func.statements) |stmt| {
-        if (stmt.address < block_addr) continue;
-        // Bail at the next branch — that's where the next block starts.
-        if (stmt.address > block_addr and stmt.type == .branch) break;
-        if (stmt.type == .nop) continue;
-
-        try w.writeAll(ind);
-        switch (stmt.type) {
-            .assign => {
-                if (stmt.dest) |dest| {
-                    try w.print("{s} = ", .{sanitizeOperand(dest)});
-                    // B7: escape control chars in source operand (may be a string literal).
-                    if (stmt.src) |src| try writeEscapedOperand(w, src);
-                    try w.writeAll(";\n");
-                }
-            },
-            .call => {
-                if (stmt.dest) |dest| try w.print("{s} = ", .{sanitizeOperand(dest)});
-                if (stmt.target) |target| {
-                    if (resolvePltImportName(plt_ctx.allocator, plt_ctx.db, plt_ctx.doc, target)) |r| {
-                        try w.print("{s}(", .{sanitizeOperand(r)});
-                    } else {
-                        try w.print("{s}(", .{sanitizeOperand(target)});
-                    }
-                } else try w.writeAll("?(");
-                if (stmt.args) |args| {
-                    for (args, 0..) |arg, j| {
-                        if (j > 0) try w.writeAll(", ");
-                        // B7: arg may be a literal string from the binary.
-                        try writeEscapedOperand(w, arg);
-                    }
-                }
-                try w.writeAll(");\n");
-            },
-            .compare => {
-                // G5: emit only the two operands; stmt.op is the mnemonic
-                // ("cmp") and would print as `cmp(src, cmp, target)`.
-                try w.writeAll("flags = cmp(");
-                var wrote_first = false;
-                if (stmt.src) |src| {
-                    try writeEscapedOperand(w, src);
-                    wrote_first = true;
-                }
-                if (stmt.target) |t| {
-                    if (wrote_first) try w.writeAll(", ");
-                    try writeEscapedOperand(w, t);
-                }
-                try w.writeAll(");\n");
-            },
-            .branch => {
-                // G3: normalize relative offsets to absolute addresses.
-                if (stmt.condition) |cond| {
-                    try w.print("if ({s}) goto L_0x", .{sanitizeOperand(cond)});
-                    if (stmt.true_block) |tb| {
-                        const abs = if (tb < ir_func.address) ir_func.address + tb else tb;
-                        try w.print("{x};\n", .{abs});
-                    } else try w.writeAll("?;\n");
-                } else {
-                    if (stmt.true_block) |tb| {
-                        const abs = if (tb < ir_func.address) ir_func.address + tb else tb;
-                        try w.print("goto L_0x{x};\n", .{abs});
-                    } else try w.writeAll("goto L_?;\n");
-                }
-            },
-            .@"return" => {
-                try w.writeAll("return");
-                if (stmt.src) |src| {
-                    try w.writeAll(" ");
-                    try writeEscapedOperand(w, src);
-                }
-                try w.writeAll(";\n");
-            },
-            .load => {
-                if (stmt.dest) |dest| {
-                    // B2 (v7.8.1): substitute struct field accesses if VAR has
-                    // an inferred struct type. Falls back to the literal memory
-                    // expression when no substitution is possible.
-                    try w.print("{s} = ", .{sanitizeOperand(dest)});
-                    const src = stmt.src orelse "?";
-                    if (try writeFieldAccessIfStruct(w, src, ir_func.address, plt_ctx)) {
-                        // wrote VAR->f_NN
-                    } else {
-                        try w.writeAll("*(");
-                        try writeEscapedOperand(w, src);
-                        try w.writeAll(")");
-                    }
-                    try w.writeAll(";\n");
-                }
-            },
-            .store => {
-                const dest = stmt.dest orelse "?";
-                if (try writeFieldAccessIfStruct(w, dest, ir_func.address, plt_ctx)) {
-                    // wrote VAR->f_NN
-                } else {
-                    try w.writeAll("*(");
-                    try writeEscapedOperand(w, dest);
-                    try w.writeAll(")");
-                }
-                try w.writeAll(" = ");
-                if (stmt.src) |src| try writeEscapedOperand(w, src) else try w.writeAll("?");
-                try w.writeAll(";\n");
-            },
-            .nop => {},
-        }
-    }
-}
-
-/// Build the CFG for a procedure (cached if already built) — used by the
-/// decompile handler to feed structure recovery.
-fn buildOrGetCfg(ctx: ToolContext, eff: EffectiveDb, proc: types.Procedure) ?types.CfgResult {
-    if (eff.db.getCachedCfg(proc.entry)) |c| return c;
-    if (eff.entry.doc.arch == .mips32) return null;
-
-    const proc_sz = if (proc.size > 0) proc.size else 64;
-    var text_offset: ?usize = null;
-    var text_base: u64 = 0;
-    for (eff.entry.doc.segments) |seg| {
-        if (!seg.permissions.execute) continue;
-        if (proc.entry >= seg.start and proc.entry < seg.start + seg.length) {
-            text_offset = @intCast(seg.file_offset);
-            text_base = seg.start;
-            break;
-        }
-        for (seg.sections) |sec| {
-            if (proc.entry >= sec.start and proc.entry < sec.start + sec.length) {
-                text_offset = @intCast(sec.file_offset);
-                text_base = sec.start;
-                break;
-            }
-        }
-        if (text_offset != null) break;
-    }
-    if (text_offset == null) return null;
-    if (eff.entry.doc.data.len == 0) return null;
-
-    const decode_fn: cfg_mod.DecodeFn = if (eff.entry.doc.arch == .arm32)
-        &arm32CfgDecode
-    else if (eff.entry.doc.arch == .x86_64)
-        &cfg_mod.x86_64CfgDecode
-    else
-        &arm64CfgDecode;
-
-    const built = cfg_mod.buildCfg(
-        ctx.allocator,
-        eff.entry.doc.data,
-        text_offset.?,
-        text_base,
-        proc.entry,
-        proc_sz,
-        decode_fn,
-    ) catch return null;
-
-    eff.db.cacheCfg(proc.entry, built) catch {};
-    return eff.db.getCachedCfg(proc.entry);
-}
-
-fn handleDecompile(ctx: ToolContext, params: std.json.Value) ToolError!ToolResult {
-    const start_ts = timestampMs(ctx.io);
-
-    // ---- Parameter parsing ---------------------------------------------------
-    // Accept "address" as a string (hex or decimal) OR an integer for robustness.
-    var seed_addr: u64 = blk: {
-        if (getString(params, "address")) |s| {
-            const parsed = parseIntLenient(s) orelse {
-                const resp = json.errorResponse(ctx.allocator, "decompile", "invalid 'address' — could not parse as integer (try \"0x1234\" or \"4660\")", 0) catch return ToolError.OutOfMemory;
-                return .{ .json_response = resp, .is_error = true };
-            };
-            break :blk @bitCast(parsed);
-        }
-        if (getInt(params, "address")) |raw| {
-            break :blk @bitCast(raw);
-        }
-        const resp = json.errorResponse(ctx.allocator, "decompile", "missing required parameter: address (hex or decimal string)", 0) catch return ToolError.OutOfMemory;
-        return .{ .json_response = resp, .is_error = true };
-    };
-
-    const doc_id: u64 = resolveDocId(ctx, params) orelse {
-        return docNotFoundErrorFull(ctx, "decompile", params);
-    };
-
-    const scope_str = getString(params, "scope") orelse "single";
-    const is_cluster = std.ascii.eqlIgnoreCase(scope_str, "cluster");
-    const max_cluster_raw: i64 = getInt(params, "max_cluster") orelse 5;
-    const max_cluster: u32 = @intCast(@min(@max(max_cluster_raw, 1), 30));
-    const include_types = getBool(params, "include_types") orelse true;
-    const include_data_refs = getBool(params, "include_data_refs") orelse true;
-    const include_addresses = getBool(params, "include_addresses") orelse false;
-    _ = include_data_refs;
-    const max_chars_raw: i64 = getInt(params, "max_chars") orelse 30_000;
-    const max_chars: usize = @intCast(@min(@max(max_chars_raw, 1000), 100_000));
-
-    // ---- Doc / DB lookup -----------------------------------------------------
-    const entry = ctx.store.get(doc_id) orelse return docNotFoundError(ctx, "decompile");
-    const eff = resolveEffectiveDb(entry);
-    eff.db.rw_lock.lockSharedUncancelable(eff.db.io);
-    defer eff.db.rw_lock.unlockShared(eff.db.io);
-
-    var warnings = std.array_list.Managed([]const u8).init(ctx.allocator);
-    defer warnings.deinit();
-
-    // v7.9.1 Q2: dylib entry-point fallback. If the caller passed address=0
-    // AND the doc itself has no recorded entry_point AND we have at least
-    // one detected procedure, substitute the first procedure's address and
-    // emit a warning. This covers .dylib / .so / static libs that don't
-    // expose a single entry but still have callable code.
-    if (seed_addr == 0 and entry.doc.entry_point == 0 and entry.doc.procedures.items.len > 0) {
-        const sub_addr = entry.doc.procedures.items[0].entry;
-        const msg = std.fmt.allocPrint(
-            ctx.allocator,
-            "No entry_point for this dylib; substituted first procedure at 0x{x}",
-            .{sub_addr},
-        ) catch "No entry_point for this dylib; substituted first procedure";
-        warnings.append(msg) catch {};
-        seed_addr = sub_addr;
-    }
-
-    // ---- Resolve seed procedure ---------------------------------------------
-    const eff_seed_addr = removeRebaseDelta(seed_addr, eff.delta);
-    const seed_proc: types.Procedure = eff.db.getProcedure(eff_seed_addr) orelse
-        eff.db.getProcedureContaining(eff_seed_addr) orelse {
-        const err_msg = std.fmt.allocPrint(ctx.allocator, "no procedure at address 0x{x}", .{seed_addr}) catch "no procedure at address";
-        const resp = json.errorResponse(ctx.allocator, "decompile", err_msg, 0) catch return ToolError.OutOfMemory;
-        return .{ .json_response = resp, .is_error = true };
-    };
-
-    // ---- Build function set (single or cluster BFS) -------------------------
-    var funcs = std.array_list.Managed(types.Procedure).init(ctx.allocator);
-    defer funcs.deinit();
-    var func_set = std.AutoHashMap(u64, void).init(ctx.allocator);
-    defer func_set.deinit();
-
-    funcs.append(seed_proc) catch return ToolError.OutOfMemory;
-    func_set.put(seed_proc.entry, {}) catch return ToolError.OutOfMemory;
-
-    if (is_cluster and max_cluster > 1) {
-        // BFS callees, then callers, capped at max_cluster total.
-        const proc_end = seed_proc.entry + @max(seed_proc.size, 1);
-        const xrefs = eff.db.xrefs.getRefsFromRange(seed_proc.entry, proc_end);
-        for (xrefs) |xref| {
-            if (funcs.items.len >= max_cluster) break;
-            if (xref.xref_type != .call) continue;
-            if (func_set.contains(xref.to)) continue;
-            if (eff.db.getProcedure(xref.to)) |callee| {
-                funcs.append(callee) catch break;
-                func_set.put(callee.entry, {}) catch {};
-            }
-        }
-        if (funcs.items.len < max_cluster) {
-            const callers = eff.db.xrefs.getRefsTo(seed_proc.entry);
-            for (callers) |xref| {
-                if (funcs.items.len >= max_cluster) break;
-                if (xref.xref_type != .call) continue;
-                const cp = eff.db.getProcedureContaining(xref.from) orelse continue;
-                if (func_set.contains(cp.entry)) continue;
-                funcs.append(cp) catch break;
-                func_set.put(cp.entry, {}) catch {};
-            }
-        }
-    }
-
-    // ---- Lift IR for each function & collect resolved calls -----------------
-    const ResolvedCall = struct { addr: u64, name: []const u8, source: []const u8 };
-    var resolved_calls = std.array_list.Managed(ResolvedCall).init(ctx.allocator);
-    defer resolved_calls.deinit();
-
-    var ir_funcs = std.array_list.Managed(types.IRFunction).init(ctx.allocator);
-    defer ir_funcs.deinit();
-
-    for (funcs.items) |p| {
-        ensureLiftedIR(ctx.allocator, p, eff.db, eff.entry);
-        if (eff.db.getCachedIR(p.entry)) |irf| {
-            ir_funcs.append(irf) catch {};
-            // B1 (v7.8.1): Collect resolved-call metadata for EVERY call,
-            // regardless of whether the lifter has already rewritten the
-            // target into a symbolic name. Pre-fix this branch only ran when
-            // the target started with "0x" and was therefore unreachable for
-            // the common case.
-            for (irf.statements) |stmt| {
-                if (stmt.type != .call) continue;
-                const tgt = stmt.target orelse continue;
-                if (tgt.len == 0) continue;
-
-                // Hex target → resolve to symbol/import/proc.
-                const is_hex = (tgt.len >= 3 and tgt[0] == '0' and (tgt[1] == 'x' or tgt[1] == 'X'));
-                if (is_hex) {
-                    const tgt_addr = std.fmt.parseInt(u64, tgt[2..], 16) catch {
-                        resolved_calls.append(.{ .addr = 0, .name = tgt, .source = "unresolved" }) catch {};
-                        continue;
-                    };
-                    // PLT/stub via document imports list.
-                    var matched = false;
-                    for (eff.entry.doc.imports.items) |imp| {
-                        if (imp.stub_address) |sa| {
-                            if (sa == tgt_addr) {
-                                resolved_calls.append(.{ .addr = tgt_addr, .name = imp.name, .source = "plt" }) catch {};
-                                matched = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (matched) continue;
-                    // Import table by direct address.
-                    if (eff.db.imports.get(tgt_addr)) |imp| {
-                        resolved_calls.append(.{ .addr = tgt_addr, .name = imp.name, .source = "import" }) catch {};
-                        continue;
-                    }
-                    // User annotation.
-                    const anns = eff.db.getAnnotations(tgt_addr);
-                    var ann_hit = false;
-                    for (anns) |ann| {
-                        if (ann.kind == .name) {
-                            resolved_calls.append(.{ .addr = tgt_addr, .name = ann.value, .source = "user_annotation" }) catch {};
-                            ann_hit = true;
-                            break;
-                        }
-                    }
-                    if (ann_hit) continue;
-                    // Local procedure.
-                    if (eff.db.getProcedure(tgt_addr)) |callee_proc| {
-                        if (callee_proc.name) |nm| {
-                            resolved_calls.append(.{ .addr = tgt_addr, .name = nm, .source = "local" }) catch {};
-                            continue;
-                        }
-                    }
-                    // Symbol-only resolution (PLT/stub via symbol table).
-                    if (eff.db.getSymbolName(tgt_addr)) |sn| {
-                        resolved_calls.append(.{ .addr = tgt_addr, .name = sn, .source = "plt" }) catch {};
-                        continue;
-                    }
-                    // v7.12 W8(c): before flagging as unresolved, consult
-                    // getProcedureContaining() for an enclosing local proc.
-                    // If we land inside a known procedure (mid-body call,
-                    // tail-call to an unnamed proc, etc.), surface it as
-                    // sub_<addr> rather than the raw 0x... hex. This
-                    // prevents the LLM from seeing `0x10018627c()` for
-                    // perfectly local intra-binary calls.
-                    if (eff.db.getProcedureContaining(tgt_addr)) |containing| {
-                        if (containing.name) |nm| {
-                            resolved_calls.append(.{ .addr = tgt_addr, .name = nm, .source = "local" }) catch {};
-                        } else {
-                            const sub_name = std.fmt.allocPrint(ctx.allocator, "sub_{x}", .{tgt_addr}) catch tgt;
-                            resolved_calls.append(.{ .addr = tgt_addr, .name = sub_name, .source = "local" }) catch {};
-                        }
-                        continue;
-                    }
-                    // Couldn't resolve.
-                    resolved_calls.append(.{ .addr = tgt_addr, .name = tgt, .source = "unresolved" }) catch {};
-                    continue;
-                }
-
-                // Symbolic target → classify by which table it lives in.
-                // Default to "local" (intra-binary call resolved by the lifter).
-                var src_kind: []const u8 = "local";
-                var rc_addr: u64 = 0;
-                // Match against doc.imports (lifter rewrote stub_address → name).
-                for (eff.entry.doc.imports.items) |imp| {
-                    if (std.mem.eql(u8, imp.name, tgt)) {
-                        src_kind = "import";
-                        if (imp.stub_address) |sa| rc_addr = sa;
-                        break;
-                    }
-                }
-                // Match against symbols table by name (rare but possible).
-                if (std.mem.eql(u8, src_kind, "local")) {
-                    var sym_it = eff.db.symbols.iterator();
-                    while (sym_it.next()) |se| {
-                        if (std.mem.eql(u8, se.value_ptr.*, tgt)) {
-                            // If a procedure exists at that address, it's local;
-                            // otherwise treat as user_annotation/symbol.
-                            if (eff.db.getProcedure(se.key_ptr.*) != null) {
-                                src_kind = "local";
-                            } else {
-                                src_kind = "user_annotation";
-                            }
-                            rc_addr = se.key_ptr.*;
-                            break;
-                        }
-                    }
-                }
-                resolved_calls.append(.{ .addr = rc_addr, .name = tgt, .source = src_kind }) catch {};
-            }
-        }
-    }
-
-    // ---- Type recovery ------------------------------------------------------
-    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer arena.deinit();
-
-    var maybe_types: ?analysis_types.TypeRecoveryResult = null;
-    if (include_types and ir_funcs.items.len > 0) {
-        maybe_types = analysis_types.recover(arena.allocator(), ir_funcs.items) catch null;
-        if (maybe_types == null) {
-            warnings.append("type recovery failed; emitting decompilation without typedefs") catch {};
-        } else {
-            // B4 (v7.8.1): merge near-duplicate structs whose field sets are
-            // a subset/superset of one another (or overlap >70% by offset).
-            // The merged struct keeps the larger member; variable_types entries
-            // pointing at the smaller struct are remapped to the larger.
-            dedupStructs(arena.allocator(), &maybe_types.?) catch {};
-        }
-    } else if (include_types) {
-        warnings.append("no IR available — type recovery skipped") catch {};
-    }
-
-    // ---- Build the decompilation text ---------------------------------------
-    var body_buf = std.Io.Writer.Allocating.init(ctx.allocator);
-    defer body_buf.deinit();
-    const bw = &body_buf.writer;
-
-    // Confidence: heuristic — high if every function has IR + structured tree,
-    // medium if missing structured tree, low if any function couldn't lift.
-    const all_lifted = ir_funcs.items.len == funcs.items.len;
-
-    var n_structs: u32 = 0;
-    if (maybe_types) |tr| n_structs = @intCast(tr.structs.len);
-
-    const confidence: []const u8 = if (all_lifted) "medium" else "low";
-    bw.print("// decompiled by phora — confidence: {s}\n", .{confidence}) catch {};
-    bw.print("// {d} functions, {d} inferred structs\n", .{ funcs.items.len, n_structs }) catch {};
-    if (include_addresses) {
-        bw.print("// seed: 0x{x}, scope: {s}\n", .{ seed_addr, scope_str }) catch {};
-    }
-    bw.writeAll("\n") catch {};
-
-    // Typedefs
-    if (include_types) {
-        if (maybe_types) |tr| {
-            for (tr.structs) |s| {
-                bw.print("struct {s} {{\n", .{s.name}) catch {};
-                for (s.fields) |f| {
-                    const c_type: []const u8 = switch (f.width) {
-                        1 => "uint8_t",
-                        2 => "uint16_t",
-                        4 => "uint32_t",
-                        8 => "uint64_t",
-                        else => "uint64_t",
-                    };
-                    bw.print("    {s} {s};  // +0x{x}\n", .{ c_type, f.name, f.offset }) catch {};
-                }
-                bw.writeAll("};\n\n") catch {};
-            }
-        }
-    }
-
-    // Per-function
-    pl_loop: for (funcs.items) |p| {
-        const maybe_ir: ?types.IRFunction = eff.db.getCachedIR(p.entry);
-        const fname: []const u8 = if (p.name) |n| n else if (eff.db.resolveName(p.entry)) |n| n else "sub";
-        const ret_type: []const u8 = "uint64_t";
-
-        if (maybe_ir == null) {
-            bw.print("// 0x{x} — no IR available, skipping\n\n", .{p.entry}) catch {};
-            warnings.append("no IR for one or more functions; rendered as comment stub") catch {};
-            continue;
-        }
-        const ir_func = maybe_ir.?;
-
-        bw.print("{s} {s}_0x{x}(", .{ ret_type, fname, p.entry }) catch {};
-        // Params: take vars whose register is x0..x7 (ARM64) or rdi/rsi/etc.
-        // G6 (v7.8.3): shared ABI filter with `lift` — see isArgumentVariable.
-        var first_param = true;
-        for (ir_func.variables) |v| {
-            if (!isArgumentVariable(v.name, v.register)) continue;
-            if (!first_param) bw.writeAll(", ") catch {};
-            first_param = false;
-            // Inferred type from recovered_types if available.
-            var typed_name: []const u8 = "uint64_t";
-            if (maybe_types) |tr| {
-                const key = std.fmt.allocPrint(ctx.allocator, "0x{x}:{s}", .{ p.entry, v.name }) catch null;
-                if (key) |k| {
-                    defer ctx.allocator.free(k);
-                    if (tr.variable_types.get(k)) |sn| {
-                        typed_name = std.fmt.allocPrint(ctx.allocator, "struct {s}*", .{sn}) catch "uint64_t";
-                    }
-                }
-            }
-            bw.print("{s} {s}", .{ typed_name, v.name }) catch {};
-        }
-        if (first_param) bw.writeAll("void") catch {};
-        bw.writeAll(") {\n") catch {};
-
-        // Body: try structured tree first, fall back to flat pseudocode.
-        const cfg_result = buildOrGetCfg(ctx, eff, p);
-        var emitted_structured = false;
-        const types_ptr: ?*const analysis_types.TypeRecoveryResult = if (maybe_types) |*tr| tr else null;
-        if (cfg_result) |cfgr| blk: {
-            var sf = structure_mod.recover(
-                ctx.allocator,
-                cfgr.basic_blocks,
-                cfgr.edges,
-                p.entry,
-            ) catch break :blk;
-            defer sf.deinit(ctx.allocator);
-            const plt_ctx = PseudocodeCtx{
-                .allocator = ctx.allocator,
-                .db = eff.db,
-                .doc = &eff.entry.doc,
-                .types_result = types_ptr,
-            };
-            // B3 (v7.8.1): pass the CFG so renderStructuredNode can resolve
-            // condition_block addresses to actual compare expressions.
-            renderStructuredNodeCtx(bw, sf.root, ir_func, plt_ctx, cfgr, 1) catch break :blk;
-            emitted_structured = true;
-        } else {
-            warnings.append("CFG unavailable for one or more functions; falling back to flat pseudocode") catch {};
-        }
-
-        if (!emitted_structured) {
-            const plt_ctx = PseudocodeCtx{
-                .allocator = ctx.allocator,
-                .db = eff.db,
-                .doc = &eff.entry.doc,
-                .types_result = types_ptr,
-            };
-            writePseudocodeTextWithCtx(bw, ir_func, plt_ctx) catch {};
-        }
-
-        bw.writeAll("}\n\n") catch {};
-
-        // Truncation guard
-        if (body_buf.written().len > max_chars) break :pl_loop;
-    }
-
-    const truncated = body_buf.written().len > max_chars;
-    const body_text: []const u8 = if (truncated) body_buf.written()[0..max_chars] else body_buf.written();
-
-    // ---- Final JSON --------------------------------------------------------
-    var resp_buf = std.Io.Writer.Allocating.init(ctx.allocator);
-    errdefer resp_buf.deinit();
-    const rw = &resp_buf.writer;
-
-    rw.writeAll("{\"decompilation\":") catch {};
-    json.writeJsonString(rw, body_text) catch {};
-
-    rw.writeAll(",\"inferred_types\":[") catch {};
-    if (maybe_types) |tr| {
-        for (tr.structs, 0..) |s, i| {
-            if (i > 0) rw.writeByte(',') catch {};
-            rw.writeAll("{\"name\":") catch {};
-            json.writeJsonString(rw, s.name) catch {};
-            rw.print(",\"size\":{d},\"fields\":[", .{s.size_hint}) catch {};
-            for (s.fields, 0..) |f, j| {
-                if (j > 0) rw.writeByte(',') catch {};
-                rw.print("{{\"offset\":{d},\"width\":{d},\"name\":", .{ f.offset, f.width }) catch {};
-                json.writeJsonString(rw, f.name) catch {};
-                rw.writeByte('}') catch {};
-            }
-            rw.writeAll("]}") catch {};
-        }
-    }
-    rw.writeAll("]") catch {};
-
-    rw.writeAll(",\"resolved_calls\":[") catch {};
-    for (resolved_calls.items, 0..) |rc, i| {
-        if (i > 0) rw.writeByte(',') catch {};
-        rw.writeAll("{\"addr\":") catch {};
-        json.writeAddress(rw, applyRebaseDelta(rc.addr, eff.delta)) catch {};
-        rw.writeAll(",\"name\":") catch {};
-        json.writeJsonString(rw, rc.name) catch {};
-        rw.writeAll(",\"source\":\"") catch {};
-        rw.writeAll(rc.source) catch {};
-        rw.writeAll("\"}") catch {};
-    }
-    rw.writeAll("]") catch {};
-
-    rw.writeAll(",\"warnings\":[") catch {};
-    for (warnings.items, 0..) |wmsg, i| {
-        if (i > 0) rw.writeByte(',') catch {};
-        json.writeJsonString(rw, wmsg) catch {};
-    }
-    rw.writeAll("]") catch {};
-
-    rw.print(",\"truncated\":{s},\"char_count\":{d}}}", .{
-        if (truncated) "true" else "false",
-        body_text.len,
-    }) catch {};
-
-    const final_resp_inner = resp_buf.toOwnedSlice() catch return ToolError.OutOfMemory;
-    const elapsed = timestampMs(ctx.io) - start_ts;
-    const final_resp = json.successResponse(ctx.allocator, "decompile", final_resp_inner, elapsed) catch return ToolError.OutOfMemory;
-    return .{ .json_response = final_resp, .is_error = false, .meta_max_chars = 200_000 };
-}
-
-/// Write pseudocode as plain text (not JSON-wrapped). Used by pack formatter.
-fn writePseudocodeText(pw: anytype, ir_func: types.IRFunction) !void {
-    return writePseudocodeTextWithCtx(pw, ir_func, null);
-}
-
-fn writePseudocodeTextWithCtx(
-    pw: anytype,
-    ir_func: types.IRFunction,
-    plt_ctx: ?PseudocodeCtx,
-) !void {
-    for (ir_func.statements) |stmt| {
-        if (stmt.type == .nop) continue;
-        try pw.writeAll("  ");
-        switch (stmt.type) {
-            .assign => {
-                if (stmt.dest) |dest| {
-                    try pw.print("{s} = ", .{sanitizeOperand(dest)});
-                    if (stmt.src) |src| try pw.print("{s}", .{sanitizeOperand(src)});
-                    try pw.writeAll(";\n");
-                }
-            },
-            .call => {
-                if (stmt.dest) |dest| try pw.print("{s} = ", .{sanitizeOperand(dest)});
-                if (stmt.target) |target| {
-                    // W5: PLT / stub resolution
-                    const resolved: ?[]const u8 = if (plt_ctx) |c|
-                        resolvePltImportName(c.allocator, c.db, c.doc, target)
-                    else
-                        null;
-                    if (resolved) |r| {
-                        try pw.print("{s}()", .{sanitizeOperand(r)});
-                    } else {
-                        try pw.print("{s}()", .{sanitizeOperand(target)});
-                    }
-                } else try pw.writeAll("?()");
-                try pw.writeAll(";\n");
-            },
-            .compare => {
-                try pw.writeAll("flags = cmp(");
-                if (stmt.src) |src| try pw.print("{s}", .{sanitizeOperand(src)});
-                if (stmt.target) |t| try pw.print(", {s}", .{sanitizeOperand(t)});
-                try pw.writeAll(");\n");
-            },
-            .branch => {
-                // G3: normalize relative offsets to absolute addresses.
-                if (stmt.condition) |cond| {
-                    try pw.print("if ({s}) goto", .{sanitizeOperand(cond)});
-                    if (stmt.true_block) |tb| {
-                        const abs = if (tb < ir_func.address) ir_func.address + tb else tb;
-                        try pw.print(" 0x{x}", .{abs});
-                    }
-                    try pw.writeAll(";\n");
-                } else {
-                    if (stmt.true_block) |tb| {
-                        const abs = if (tb < ir_func.address) ir_func.address + tb else tb;
-                        try pw.print("goto 0x{x};\n", .{abs});
-                    } else try pw.writeAll("goto next;\n");
-                }
-            },
-            .@"return" => {
-                try pw.writeAll("return");
-                if (stmt.src) |src| try pw.print(" {s}", .{sanitizeOperand(src)});
-                try pw.writeAll(";\n");
-            },
-            .load => {
-                if (stmt.dest) |dest| try pw.print("{s} = *({s});\n", .{ sanitizeOperand(dest), sanitizeOperand(stmt.src orelse "?") });
-            },
-            .store => {
-                try pw.print("*({s}) = {s};\n", .{ sanitizeOperand(stmt.dest orelse "?"), sanitizeOperand(stmt.src orelse "?") });
-            },
-            .nop => {},
-        }
-    }
 }
 
 fn passesFilter(mask: u8, bit: u3) bool {
@@ -16043,205 +16176,85 @@ test "demangle C++ template with substitution refs (no empty slots)" {
     // not contain orphaned commas.
 }
 
-// ============================================================================
-// v7.8.1 — H1 hotfix unit tests for the decompile renderer (B1–B7)
-// ============================================================================
-
-test "B7: writeEscapedOperand escapes newlines, quotes, tabs, backslashes" {
-    var buf = std.Io.Writer.Allocating.init(std.testing.allocator);
-    defer buf.deinit();
-    try writeEscapedOperand(&buf.writer, "hello\nworld");
-    try std.testing.expectEqualStrings("hello\\nworld", buf.written());
-
-    buf.clearRetainingCapacity();
-    try writeEscapedOperand(&buf.writer, "tab\there\rret\\bs\"q");
-    try std.testing.expectEqualStrings("tab\\there\\rret\\\\bs\\\"q", buf.written());
-
-    buf.clearRetainingCapacity();
-    // Plain register name should pass through unchanged.
-    try writeEscapedOperand(&buf.writer, "x0");
-    try std.testing.expectEqualStrings("x0", buf.written());
-
-    // Bytes <0x20 (other than \n\r\t) and >0x7e get \xNN.
-    buf.clearRetainingCapacity();
-    try writeEscapedOperand(&buf.writer, &[_]u8{ 'a', 0x01, 'b', 0x7f });
-    try std.testing.expectEqualStrings("a\\x01b\\x7f", buf.written());
+test {
+    _ = @import("test_loops.zig");
+    _ = @import("test_register_flow.zig");
+    _ = @import("test_context_flow.zig");
+    _ = @import("test_execution_view.zig");
+    _ = @import("test_branch_predicate.zig");
 }
 
-test "B2: parseMemRefForSubst parses ARM/x86-style memory operands" {
-    {
-        const r = parseMemRefForSubst("[arg0, #0x18]") orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqualStrings("arg0", r.name);
-        try std.testing.expectEqual(@as(i64, 0x18), r.offset);
-    }
-    {
-        const r = parseMemRefForSubst("[x0+0x460]") orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqualStrings("x0", r.name);
-        try std.testing.expectEqual(@as(i64, 0x460), r.offset);
-    }
-    {
-        const r = parseMemRefForSubst("[arg1]") orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqualStrings("arg1", r.name);
-        try std.testing.expectEqual(@as(i64, 0), r.offset);
-    }
-    {
-        const r = parseMemRefForSubst("[arg2, #16]") orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqualStrings("arg2", r.name);
-        try std.testing.expectEqual(@as(i64, 16), r.offset);
-    }
-    // v7.9.0: negative offsets (frame-relative accesses).
-    {
-        const r = parseMemRefForSubst("[fp - 0x20]") orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqualStrings("fp", r.name);
-        try std.testing.expectEqual(@as(i64, -0x20), r.offset);
-    }
-    {
-        const r = parseMemRefForSubst("[frame_ptr, #-0x80]") orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqualStrings("frame_ptr", r.name);
-        try std.testing.expectEqual(@as(i64, -0x80), r.offset);
-    }
-    // Non-memory operand returns null.
-    try std.testing.expect(parseMemRefForSubst("x0") == null);
-    try std.testing.expect(parseMemRefForSubst("0x1234") == null);
+test "opaque ARM64 pack allocation failure does not count an uncommitted slot" {
+    const t = std.testing;
+    var failing = t.FailingAllocator.init(t.allocator, .{});
+    var text = try std.Io.Writer.Allocating.initCapacity(failing.allocator(), 32);
+    defer text.deinit();
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    var gaps: usize = 0;
+    // The instruction prefix fits, but its opaque warning requires growth.
+    try t.expectError(error.WriteFailed, writeArm64PackInstruction(&text.writer, &.{ 0xcc, 0xcc, 0xcc, 0xcc }, 0x1000, 0x1000, &gaps, null));
+    try t.expect(failing.has_induced_failure);
+    try t.expect(text.written().len > 0);
+    try t.expectEqual(@as(usize, 0), gaps);
+    const covered_bytes: u64 = 0;
+    try t.expectEqual(@as(u64, 0), covered_bytes - @as(u64, @intCast(gaps)) * 4);
 }
 
-test "B3: condCodeToInfix handles ARM cc set including unsigned variants" {
-    try std.testing.expectEqualStrings("==", condCodeToInfix("eq", false).?);
-    try std.testing.expectEqualStrings("!=", condCodeToInfix("ne", false).?);
-    try std.testing.expectEqualStrings("<", condCodeToInfix("lt", false).?);
-    try std.testing.expectEqualStrings("<=", condCodeToInfix("le", false).?);
-    try std.testing.expectEqualStrings(">", condCodeToInfix("gt", false).?);
-    try std.testing.expectEqualStrings(">=", condCodeToInfix("ge", false).?);
-    try std.testing.expectEqualStrings(">", condCodeToInfix("hi", false).?);
-    try std.testing.expectEqualStrings(">=", condCodeToInfix("hs", false).?);
-    try std.testing.expectEqualStrings(">=", condCodeToInfix("cs", false).?);
-    try std.testing.expectEqualStrings("<", condCodeToInfix("lo", false).?);
-    try std.testing.expectEqualStrings("<", condCodeToInfix("cc", false).?);
-    try std.testing.expectEqualStrings("<=", condCodeToInfix("ls", false).?);
-    try std.testing.expect(condCodeToInfix("zz", false) == null);
+test "load finalization OOM discards unpublished owned and borrowed documents" {
+    const t = std.testing;
+    for ([_]bool{ true, false }) |merge_failure| {
+        for ([_]bool{ true, false }) |owns_data| {
+            // Fail precisely in xref merge or final store publication; the
+            // analysis/database allocator remains available in both cases.
+            var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+            var store = DocumentStore.init(if (merge_failure) t.allocator else failing.allocator(), t.io);
+            defer store.deinit();
+            var arena = std.heap.ArenaAllocator.init(t.allocator);
+            defer arena.deinit();
+            const borrowed = [_]u8{ 0x20, 0x00, 0x00, 0x94, 0xc0, 0x03, 0x5f, 0xd6 }; // BL external; RET
+            const backing = if (owns_data) try t.allocator.dupe(u8, &.{ 0, 0, 0, 0, 0x20, 0x00, 0x00, 0x94, 0xc0, 0x03, 0x5f, 0xd6 }) else &borrowed;
+            const viewed = if (owns_data) backing[4..] else backing;
+            const path = try t.allocator.dupe(u8, "finalize-oom");
+            const entry = try t.allocator.create(DocumentEntry);
+            entry.* = .{ .doc = types.Document.init(t.allocator, 1, path, viewed), .db = Database.init(t.allocator, t.io), .owns_data = owns_data };
+            finalizeRawDocument(t.allocator, &entry.doc, viewed, .arm64, 0x1000, 0x1000);
+            if (merge_failure) {
+                entry.db.xrefs = xref_mod.XrefTracker.init(failing.allocator(), t.io);
+            } else {
+                // Include a pre-existing allocation in both indices for teardown.
+                try entry.db.xrefs.addXref(0x1000, 0x2000, .call);
+            }
+            const ctx = ToolContext{ .io = t.io, .store = &store, .session_id = "finalize-oom", .allocator = arena.allocator() };
+            try t.expectError(error.OutOfMemory, finalizeLoad(ctx, entry, backing, null));
+            try t.expect(failing.has_induced_failure);
+            try t.expectEqual(@as(usize, 0), store.documents.count());
+            // std.testing.allocator verifies all owned state was freed, including
+            // the original backing allocation rather than its embedded subview.
+            // Borrowed stack bytes must remain intact and must not be freed.
+            try t.expectEqual(@as(u8, 0x20), borrowed[0]);
+        }
+    }
 }
 
-test "B3: writeConditionExpr inlines real compare expression instead of cond_0xADDR" {
-    // Build a tiny IR with: compare(w0, 5) at 0x100, then b.hi at 0x104.
-    const stmts = [_]types.IRStatement{
-        .{ .type = .compare, .address = 0x100, .op = "cmp", .dest = "w0", .src = "0x5" },
-        .{ .type = .branch, .address = 0x104, .condition = "hi", .true_block = 0x200 },
+test "load options reject misplaced and unsupported overrides before loading" {
+    const samples = [_][]const u8{
+        "{\"arch\":\"x86_64\"}",             "{\"base\":4096}",     "{\"entry\":4096}",                     "{\"fat_arch\":\"arm64\"}",
+        "{\"analysis\":\"full\"}",           "{\"budget_ms\":100}", "{\"options\":{\"arch\":\"unknown\"}}", "{\"options\":{\"entry\":-1}}",
+        "{\"options\":{\"base\":\"4096\"}}",
     };
-    const irf = types.IRFunction{
-        .address = 0x100,
-        .name = null,
-        .statements = @constCast(&stmts),
-        .variables = &.{},
-    };
-
-    var buf = std.Io.Writer.Allocating.init(std.testing.allocator);
-    defer buf.deinit();
-    try writeConditionExpr(&buf.writer, irf, 0x100, false);
-    try std.testing.expectEqualStrings("w0 > 0x5", buf.written());
-
-    // Negated.
-    buf.clearRetainingCapacity();
-    try writeConditionExpr(&buf.writer, irf, 0x100, true);
-    try std.testing.expectEqualStrings("w0 <= 0x5", buf.written());
-
-    // G1 (v7.8.3): falls back to a parseable diagnostic expression when no
-    // compare statement exists for the condition_block. Was `cond_0x100`
-    // (which readers could mis-interpret as a real variable name).
-    // v7.13.0 B6a: when no cmp can be located anywhere in the function we now
-    // emit `(cmp_at_0x... != 0)` with the cc as a comment instead of just `1`,
-    // so the LLM sees an honest reference to the disassembly address.
-    buf.clearRetainingCapacity();
-    const empty_stmts = [_]types.IRStatement{};
-    const empty_irf = types.IRFunction{
-        .address = 0x0,
-        .name = null,
-        .statements = @constCast(&empty_stmts),
-        .variables = &.{},
-    };
-    try writeConditionExpr(&buf.writer, empty_irf, 0x100, false);
-    try std.testing.expectEqualStrings("/* cmp_at_0x100 cc=? */ (cmp_at_0x100 != 0)", buf.written());
-}
-
-test "B3: writeConditionExpr handles cbz/cbnz" {
-    const stmts = [_]types.IRStatement{
-        .{ .type = .compare, .address = 0x200, .op = "cmp", .dest = "x1", .src = "0" },
-        .{ .type = .branch, .address = 0x204, .condition = "eq_zero", .true_block = 0x300 },
-    };
-    const irf = types.IRFunction{
-        .address = 0x200,
-        .name = null,
-        .statements = @constCast(&stmts),
-        .variables = &.{},
-    };
-    var buf = std.Io.Writer.Allocating.init(std.testing.allocator);
-    defer buf.deinit();
-    try writeConditionExpr(&buf.writer, irf, 0x200, false);
-    try std.testing.expectEqualStrings("x1 == 0", buf.written());
-}
-
-test "B4: dedupStructs merges subset/superset structs and remaps variable_types" {
-    const allocator = std.testing.allocator;
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    // Larger struct s_24 with fields at 0, 8, 0x10.
-    var f_large = try a.alloc(analysis_types.InferredField, 3);
-    f_large[0] = .{ .offset = 0, .width = 8, .name = "f_00", .read_count = 1, .write_count = 0 };
-    f_large[1] = .{ .offset = 8, .width = 8, .name = "f_08", .read_count = 1, .write_count = 0 };
-    f_large[2] = .{ .offset = 0x10, .width = 8, .name = "f_10", .read_count = 1, .write_count = 0 };
-
-    // Smaller struct s_16 with fields at 0, 8 — proper subset of large.
-    var f_small = try a.alloc(analysis_types.InferredField, 2);
-    f_small[0] = .{ .offset = 0, .width = 8, .name = "f_00", .read_count = 1, .write_count = 0 };
-    f_small[1] = .{ .offset = 8, .width = 8, .name = "f_08", .read_count = 1, .write_count = 0 };
-
-    var structs = try a.alloc(analysis_types.InferredStruct, 2);
-    structs[0] = .{ .name = "s_24", .size_hint = 0x18, .fields = f_large, .pointer_origins = &.{} };
-    structs[1] = .{ .name = "s_16", .size_hint = 0x10, .fields = f_small, .pointer_origins = &.{} };
-
-    var var_types = std.StringHashMap([]const u8).init(a);
-    try var_types.put("0x1000:arg0", "s_24");
-    try var_types.put("0x2000:arg0", "s_16");
-    try var_types.put("0x3000:arg0", "s_24");
-
-    var tr = analysis_types.TypeRecoveryResult{
-        .structs = structs,
-        .variable_types = var_types,
-    };
-
-    try dedupStructs(a, &tr);
-
-    // Only the larger struct should remain.
-    try std.testing.expectEqual(@as(usize, 1), tr.structs.len);
-    try std.testing.expectEqualStrings("s_24", tr.structs[0].name);
-    // Variable that pointed at s_16 is now remapped to s_24.
-    try std.testing.expectEqualStrings("s_24", tr.variable_types.get("0x2000:arg0").?);
-    try std.testing.expectEqualStrings("s_24", tr.variable_types.get("0x1000:arg0").?);
-}
-
-test "B4: structsAreCompatible 70% overlap rule" {
-    const f1 = [_]analysis_types.InferredField{
-        .{ .offset = 0, .width = 8, .name = "f_00", .read_count = 0, .write_count = 0 },
-        .{ .offset = 8, .width = 8, .name = "f_08", .read_count = 0, .write_count = 0 },
-        .{ .offset = 0x10, .width = 8, .name = "f_10", .read_count = 0, .write_count = 0 },
-        .{ .offset = 0x18, .width = 8, .name = "f_18", .read_count = 0, .write_count = 0 },
-    };
-    const f2 = [_]analysis_types.InferredField{
-        .{ .offset = 0, .width = 8, .name = "f_00", .read_count = 0, .write_count = 0 },
-        .{ .offset = 8, .width = 8, .name = "f_08", .read_count = 0, .write_count = 0 },
-        .{ .offset = 0x10, .width = 8, .name = "f_10", .read_count = 0, .write_count = 0 },
-        // 3 of the smaller side (3) match → 100%
-    };
-    const a = analysis_types.InferredStruct{ .name = "a", .size_hint = 0x20, .fields = @constCast(&f1), .pointer_origins = &.{} };
-    const b = analysis_types.InferredStruct{ .name = "b", .size_hint = 0x18, .fields = @constCast(&f2), .pointer_origins = &.{} };
-    try std.testing.expect(structsAreCompatible(a, b));
-
-    // Disjoint structs do NOT merge.
-    const f3 = [_]analysis_types.InferredField{
-        .{ .offset = 0x100, .width = 8, .name = "f_100", .read_count = 0, .write_count = 0 },
-        .{ .offset = 0x108, .width = 8, .name = "f_108", .read_count = 0, .write_count = 0 },
-    };
-    const c = analysis_types.InferredStruct{ .name = "c", .size_hint = 0x110, .fields = @constCast(&f3), .pointer_origins = &.{} };
-    try std.testing.expect(!structsAreCompatible(a, c));
+    for (samples) |sample| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, sample, .{});
+        defer parsed.deinit();
+        try std.testing.expect(invalidLoadOptions(parsed.value) != null);
+    }
+    const valid = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"options\":{\"arch\":\"arm64\",\"base\":4096,\"entry\":4100}}", .{});
+    defer valid.deinit();
+    try std.testing.expect(invalidLoadOptions(valid.value) == null);
+    var doc: types.Document = undefined;
+    var opts: types.LoadOptions = .{};
+    parseLoadOptions(valid.value, &doc, &opts);
+    try std.testing.expectEqual(types.Arch.arm64, opts.arch.?);
+    try std.testing.expectEqual(@as(u64, 4096), opts.base.?);
+    try std.testing.expectEqual(@as(u64, 4100), opts.entry.?);
 }

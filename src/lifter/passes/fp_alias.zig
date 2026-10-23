@@ -58,10 +58,11 @@ pub fn run(allocator: std.mem.Allocator, func: *types.IRFunction) !void {
     defer alias_map.deinit();
 
     for (func.statements) |*stmt| {
+        if (stmt.block_start) alias_map.clearRetainingCapacity();
         // Reset the alias map at any control transfer — we don't do
         // cross-block dataflow.
         switch (stmt.type) {
-            .branch, .call, .@"return" => {
+            .branch, .call, .@"return", .@"opaque" => {
                 alias_map.clearRetainingCapacity();
                 continue;
             },
@@ -80,6 +81,16 @@ pub fn run(allocator: std.mem.Allocator, func: *types.IRFunction) !void {
             }
         }
 
+        if (stmt.type == .load) {
+            if (stmt.dest) |dest| _ = alias_map.remove(dest);
+        }
+        if (stmt.type == .assign or stmt.type == .load) {
+            if (stmt.dest) |dest| {
+                for (ALIAS_BASES) |base| {
+                    if (std.mem.eql(u8, dest, base)) alias_map.clearRetainingCapacity();
+                }
+            }
+        }
         if (stmt.type == .assign) {
             const dest = stmt.dest orelse continue;
             const src = stmt.src orelse {
@@ -151,9 +162,9 @@ fn maybeRewriteOperand(
     const tail = std.mem.trim(u8, body[name_end..], " \t,");
     var extra_offset: i64 = 0;
     if (tail.len > 0) {
-        extra_offset = parseSignedHex(tail) orelse 0;
+        extra_offset = parseSignedHex(tail) orelse return null;
     }
-    const total_offset: i64 = alias.offset + extra_offset;
+    const total_offset = std.math.add(i64, alias.offset, extra_offset) catch return null;
 
     // Build the rewritten operand. Always direct `[base ± hex]` form so
     // structure-recovery / parseMemRefForSubst pick it up.
@@ -425,4 +436,21 @@ test "fp_alias: leaves direct frame_ptr operands alone" {
     try run(arena.allocator(), &func);
 
     try std.testing.expectEqualStrings("[frame_ptr - 0x10]", func.statements[0].dest.?);
+}
+
+test "evidence: frame alias load and base update invalidate stale address" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var stmts = [_]types.IRStatement{
+        .{ .type = .assign, .address = 0, .dest = "tmp", .src = "frame_ptr - #0x20" },
+        .{ .type = .load, .address = 4, .dest = "tmp", .src = "[x0]" },
+        .{ .type = .store, .address = 8, .dest = "[tmp]", .src = "arg0" },
+        .{ .type = .assign, .address = 12, .dest = "tmp", .src = "frame_ptr - #0x20" },
+        .{ .type = .assign, .address = 16, .dest = "frame_ptr", .src = "arg0" },
+        .{ .type = .store, .address = 20, .dest = "[tmp]", .src = "arg1" },
+    };
+    var func = types.IRFunction{ .address = 0, .statements = &stmts, .variables = &.{} };
+    try run(arena.allocator(), &func);
+    try std.testing.expectEqualStrings("[tmp]", stmts[2].dest.?);
+    try std.testing.expectEqualStrings("[tmp]", stmts[5].dest.?);
 }

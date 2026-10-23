@@ -1,6 +1,6 @@
 // Phora — Lifter
 // Walks a procedure's basic blocks, transforms each instruction to IR statements.
-// Produces structured IR that LLMs can interpret into pseudocode.
+// Produces heuristic structured IR for LLM analysis; not validated instruction semantics.
 
 const std = @import("std");
 const types = @import("../types.zig");
@@ -12,17 +12,15 @@ const pass_const_fold = @import("passes/const_fold.zig");
 const pass_dead_store = @import("passes/dead_store.zig");
 const pass_reg_to_var = @import("passes/reg_to_var.zig");
 const pass_stack_slot = @import("passes/stack_slot.zig");
-const pass_call_arg_fixup = @import("passes/call_arg_fixup.zig");
 // v7.9.1 maturity pass
 const pass_fp_alias = @import("passes/fp_alias.zig");
 
 /// Run the v7.8.0 maturity passes on `func` in the order specified by the
 /// W1/W4 design notes:
-///   1. call_arg_fixup — needs raw `argN` assigns, so first.
-///   2. const_fold     — folds literals (uses string ops on raw operands).
-///   3. dead_store     — kills assigns whose dest is overwritten.
-///   4. stack_slot     — renames `[sp+N]` → `stack_K` so reg_to_var skips them.
-///   5. reg_to_var     — last; renames temporaries that don't escape.
+/// Display aliases such as arg0 do not establish an ABI or a call arity.
+/// call_arg_fixup is therefore excluded from this architecture-agnostic path.
+/// const_fold, dead_store, stack_slot, fp_alias and reg_to_var preserve the
+/// modeled dataflow while explicit call arguments are retained if supplied.
 ///
 /// `allocator` should be a long-lived allocator (typically an arena tied to
 /// the IR's lifetime) — const_fold and stack_slot allocate strings that the
@@ -31,7 +29,6 @@ pub fn runMaturityPasses(
     allocator: std.mem.Allocator,
     func: *types.IRFunction,
 ) !void {
-    try pass_call_arg_fixup.run(allocator, func);
     try pass_const_fold.run(allocator, func);
     try pass_dead_store.run(allocator, func);
     try pass_stack_slot.run(allocator, func);
@@ -51,7 +48,18 @@ pub fn liftProcedureMature(
     proc: *const types.Procedure,
     db: *const db_mod.Database,
 ) !types.IRFunction {
-    var func = try liftProcedure(allocator, proc, db);
+    return liftProcedureMatureForArch(allocator, proc, db, null);
+}
+
+/// Architecture identifies the architectural integer-return candidate only;
+/// it does not certify a return type, ABI, or source-language prototype.
+pub fn liftProcedureMatureForArch(
+    allocator: std.mem.Allocator,
+    proc: *const types.Procedure,
+    db: *const db_mod.Database,
+    arch: ?types.Arch,
+) !types.IRFunction {
+    var func = try liftProcedureForArch(allocator, proc, db, arch);
     errdefer {
         allocator.free(func.statements);
         allocator.free(func.variables);
@@ -65,6 +73,15 @@ pub fn liftProcedure(
     allocator: std.mem.Allocator,
     proc: *const types.Procedure,
     db: *const db_mod.Database,
+) !types.IRFunction {
+    return liftProcedureForArch(allocator, proc, db, null);
+}
+
+pub fn liftProcedureForArch(
+    allocator: std.mem.Allocator,
+    proc: *const types.Procedure,
+    db: *const db_mod.Database,
+    arch: ?types.Arch,
 ) !types.IRFunction {
     var statements = std.array_list.Managed(types.IRStatement).init(allocator);
     errdefer statements.deinit();
@@ -82,19 +99,64 @@ pub fn liftProcedure(
 
         while (addr < block_end) {
             if (db.getInstruction(addr)) |inst| {
-                const stmt = liftInstruction(allocator, inst, proc.entry, db, &seen_regs, &variables) catch {
-                    // If we can't lift an instruction, emit a nop
-                    try statements.append(ir.nop(addr));
-                    addr += inst.size;
-                    continue;
-                };
+                // Allocation failures must not turn a real instruction into NOP.
+                var stmt = try liftInstruction(allocator, inst, proc.entry, db, &seen_regs, &variables);
+                if (stmt.type == .@"return" and eqlIgnoreCase(inst.mnemonic, "ret")) {
+                    stmt.src = if (arch) |a| switch (a) {
+                        .x86_64 => "rax",
+                        .x86 => "eax",
+                        .arm64 => "x0",
+                        else => null,
+                    } else null;
+                    stmt.op = "integer_return_candidate";
+                }
+                // x86 arithmetic also writes flags. Keep those effects visible
+                // even when a later assignment overwrites its scalar result.
+                if (arch == .x86_64 or arch == .x86) {
+                    if (stmt.type == .assign and x86WritesFlags(inst.mnemonic))
+                        stmt.op = "writes_flags";
+                }
+                // Capture access widths before any presentation changes.
+                const evidence = ir.memoryEvidence(inst.mnemonic, inst.operands);
+                stmt.memory_width = evidence.width;
+                stmt.memory_signedness = evidence.signedness;
+                stmt.block_start = addr == block.start;
+                if (stmt.type == .branch) {
+                    // A condition label alone loses the tested register/bit.
+                    // Preserve these operands and even an external target that
+                    // cannot be encoded as an unsigned function-relative offset.
+                    stmt.op = try allocator.dupe(u8, inst.mnemonic);
+                    stmt.src = try allocator.dupe(u8, inst.operands);
+                    if (parseBranchTarget(inst.operands)) |target| {
+                        stmt.target = try std.fmt.allocPrint(allocator, "0x{x}", .{target});
+                    }
+                }
                 try statements.append(stmt);
+                if (inst.size == 0) break;
                 addr += inst.size;
             } else {
-                // No instruction at this address, skip 4 bytes (ARM64/MIPS32)
+                // A missing decode is unknown behavior, not a no-op.
+                var stmt = ir.opaqueInstruction(addr, "missing_decode", "instruction bytes unavailable");
+                stmt.block_start = addr == block.start;
+                try statements.append(stmt);
                 addr += 4;
             }
         }
+    }
+
+    // On-demand callers sometimes provide one linear fallback block. Mark
+    // incoming branch targets too, so fallthrough cannot donate a constant or
+    // inferred call argument to a join that also has another predecessor.
+    var leaders = std.AutoHashMap(u64, void).init(allocator);
+    defer leaders.deinit();
+    for (statements.items) |stmt| {
+        if (stmt.type == .branch) {
+            if (stmt.true_block) |off| try leaders.put(proc.entry + off, {});
+            if (stmt.false_block) |off| try leaders.put(proc.entry + off, {});
+        }
+    }
+    for (statements.items) |*stmt| {
+        if (leaders.contains(stmt.address)) stmt.block_start = true;
     }
 
     return .{
@@ -121,14 +183,51 @@ fn liftInstruction(
     // helpers that return the input on failure) would dangle once the
     // bucket moves; the renderer would SIGSEGV in std.mem.indexOfScalar.
     // splitOperands also dupes its tokens via the same allocator.
-    const inst_operands = allocator.dupe(u8, inst.operands) catch inst.operands;
+    const inst_operands = try allocator.dupe(u8, inst.operands);
     const mnemonic = inst.mnemonic;
+
+    // Vector lane operations and scalar FP operations require distinct semantics.
+    // Keep their original operands and barrier effects, including q-register
+    // transfers: a vector load must never turn into a scalar integer assignment.
+    if (ir.hasVectorOrFpOperand(inst_operands))
+        return ir.opaqueInstruction(inst.address, mnemonic, inst_operands);
+
+    // One statement cannot represent both destinations of a pair transfer,
+    // writeback of its base, or flag/extension effects omitted by the handlers.
+    // Keep these instructions intact until a complete model is available.
+    if (eqlIgnoreCase(mnemonic, "ldp") or eqlIgnoreCase(mnemonic, "stp") or
+        std.mem.indexOfScalar(u8, inst_operands, '!') != null or
+        (std.mem.indexOf(u8, inst_operands, "],") != null and
+            (std.mem.indexOfScalar(u8, inst_operands, ',') orelse inst_operands.len) < (std.mem.indexOfScalar(u8, inst_operands, '[') orelse 0)) or
+        std.mem.indexOf(u8, inst_operands, ", lsl ") != null or
+        std.mem.indexOf(u8, inst_operands, ", lsr ") != null or
+        std.mem.indexOf(u8, inst_operands, ", asr ") != null or
+        std.mem.indexOf(u8, inst_operands, ", uxt") != null or
+        std.mem.indexOf(u8, inst_operands, ", sxt") != null)
+    {
+        return ir.opaqueInstruction(inst.address, mnemonic, inst_operands);
+    }
+
+    // A write to the architectural zero register is discarded, but loads or
+    // flag-setting instructions can still have effects. Never define `zero`.
+    if ((std.mem.startsWith(u8, inst_operands, "xzr,") or std.mem.startsWith(u8, inst_operands, "wzr,")) and
+        !eqlIgnoreCase(mnemonic, "str") and !eqlIgnoreCase(mnemonic, "strb") and !eqlIgnoreCase(mnemonic, "strh") and
+        !eqlIgnoreCase(mnemonic, "cmp") and !eqlIgnoreCase(mnemonic, "cmn") and !eqlIgnoreCase(mnemonic, "tst"))
+    {
+        return ir.opaqueInstruction(inst.address, mnemonic, inst_operands);
+    }
 
     // MOV Xd, Xn — assignment
     if (eqlIgnoreCase(mnemonic, "mov")) {
         const parts = splitOperands(allocator, inst_operands);
         if (parts.dest != null and parts.src1 != null) {
+            if (std.mem.indexOfScalar(u8, parts.dest.?, '[') != null) {
+                return ir.store(inst.address, parts.dest.?, resolveOperand(parts.src1.?, db));
+            }
             try trackVariable(seen_regs, variables, parts.dest.?);
+            if (std.mem.indexOfScalar(u8, parts.src1.?, '[') != null) {
+                return ir.load(inst.address, regVar(parts.dest.?), parts.src1.?);
+            }
             return ir.assign(inst.address, regVar(parts.dest.?), resolveOperand(parts.src1.?, db));
         }
     }
@@ -140,11 +239,12 @@ fn liftInstruction(
         const parts = splitOperands(allocator, inst_operands);
         if (parts.dest != null and parts.src1 != null) {
             try trackVariable(seen_regs, variables, parts.dest.?);
+            if (std.mem.indexOfScalar(u8, parts.dest.?, '[') != null) return ir.opaqueInstruction(inst.address, mnemonic, inst_operands);
             const op = if (eqlIgnoreCase(mnemonic, "add") or eqlIgnoreCase(mnemonic, "addu")) "+" else "-";
             const src_expr = if (parts.src2) |s2|
                 formatBinaryOp(allocator, regVar(parts.src1.?), op, resolveOperand(s2, db))
             else
-                regVar(parts.src1.?);
+                formatBinaryOp(allocator, regVar(parts.dest.?), op, resolveOperand(parts.src1.?, db));
             return ir.assign(inst.address, regVar(parts.dest.?), src_expr);
         }
     }
@@ -202,10 +302,13 @@ fn liftInstruction(
                 "^"
             else
                 "~|"; // nor
+            if (std.mem.indexOfScalar(u8, parts.dest.?, '[') != null) return ir.opaqueInstruction(inst.address, mnemonic, inst_operands);
             const src_expr = if (parts.src2) |s2|
                 formatBinaryOp(allocator, regVar(parts.src1.?), op, resolveOperand(s2, db))
+            else if (eqlIgnoreCase(mnemonic, "xor") and eqlIgnoreCase(parts.dest.?, parts.src1.?))
+                "#0x0"
             else
-                regVar(parts.src1.?);
+                formatBinaryOp(allocator, regVar(parts.dest.?), op, resolveOperand(parts.src1.?, db));
             return ir.assign(inst.address, regVar(parts.dest.?), src_expr);
         }
     }
@@ -269,6 +372,16 @@ fn liftInstruction(
             const src_expr = formatBinaryOp(allocator, regVar(parts.dest.?), op, regVar(parts.src1.?));
             return ir.assign(inst.address, "hi:lo", src_expr);
         }
+    }
+
+    // AArch64 MADD/MSUB have four register operands and do not touch MIPS
+    // HI:LO. Preserve all four operands as unknown effects until represented
+    // completely, rather than dropping the multiplier/addend and its reads.
+    // The MIPS decoder spells every register with a '$' prefix.
+    if ((eqlIgnoreCase(mnemonic, "madd") or eqlIgnoreCase(mnemonic, "msub")) and
+        !std.mem.startsWith(u8, inst_operands, "$"))
+    {
+        return ir.opaqueInstruction(inst.address, mnemonic, inst_operands);
     }
 
     // MIPS madd/msub — multiply-add/sub into HI:LO accumulator
@@ -335,7 +448,7 @@ fn liftInstruction(
         // beq/bne rs, rt, target — two-register compare-and-branch
         const parts = splitOperands(allocator, inst_operands);
         const condition = if (eqlIgnoreCase(mnemonic, "beq") or eqlIgnoreCase(mnemonic, "beql")) "eq" else "ne";
-        const target = parseAddressFromOperands(inst_operands);
+        const target = parseBranchTarget(inst_operands);
         const target_offset: ?u32 = if (target) |t| branchOffset(t, proc_entry) else null;
         _ = parts;
         return ir.branch(inst.address, condition, target_offset, null);
@@ -355,7 +468,7 @@ fn liftInstruction(
             "lt_zero"
         else
             "ge_zero";
-        const target = parseAddressFromOperands(inst_operands);
+        const target = parseBranchTarget(inst_operands);
         const target_offset: ?u32 = if (target) |t| branchOffset(t, proc_entry) else null;
         return ir.branch(inst.address, condition, target_offset, null);
     }
@@ -363,7 +476,7 @@ fn liftInstruction(
     // MIPS FPU branch: bc1t/bc1f
     if (eqlIgnoreCase(mnemonic, "bc1t") or eqlIgnoreCase(mnemonic, "bc1f")) {
         const condition = if (eqlIgnoreCase(mnemonic, "bc1t")) "fpu_true" else "fpu_false";
-        const target = parseAddressFromOperands(inst_operands);
+        const target = parseBranchTarget(inst_operands);
         const target_offset: ?u32 = if (target) |t| branchOffset(t, proc_entry) else null;
         return ir.branch(inst.address, condition, target_offset, null);
     }
@@ -390,7 +503,7 @@ fn liftInstruction(
                 return ir.ret(inst.address, "$v0");
             }
             // Indirect jump (jump table, etc.)
-            const target = parseAddressFromOperands(inst_operands);
+            const target = parseBranchTarget(inst_operands);
             const target_offset: ?u32 = if (target) |t| branchOffset(t, proc_entry) else null;
             return ir.branch(inst.address, null, target_offset, null);
         }
@@ -457,14 +570,14 @@ fn liftInstruction(
     // BL target — ARM64 function call
     if (eqlIgnoreCase(mnemonic, "bl")) {
         const target_name = resolveCallTarget(inst_operands, db);
-        return ir.call(inst.address, target_name, null, "arg0");
+        return ir.call(inst.address, target_name, null, null);
     }
 
     // BLR Xn — ARM64 indirect function call
     if (eqlIgnoreCase(mnemonic, "blr")) {
         const parts = splitOperands(allocator, inst_operands);
         const target_name = if (parts.dest) |reg| regVar(reg) else "unknown";
-        return ir.call(inst.address, target_name, null, "arg0");
+        return ir.call(inst.address, target_name, null, null);
     }
 
     // CMP Xn, op2 — comparison
@@ -494,14 +607,14 @@ fn liftInstruction(
     // B.cond target — conditional branch
     if (mnemonic.len >= 2 and (mnemonic[0] == 'b' or mnemonic[0] == 'B') and mnemonic[1] == '.') {
         const condition = mnemonic[2..]; // eq, ne, lt, gt, etc.
-        const target = parseAddressFromOperands(inst_operands);
+        const target = parseBranchTarget(inst_operands);
         const target_offset: ?u32 = if (target) |t| branchOffset(t, proc_entry) else null;
         return ir.branch(inst.address, condition, target_offset, null);
     }
 
     // B target — unconditional branch
     if (eqlIgnoreCase(mnemonic, "b") and inst_operands.len > 0) {
-        const target = parseAddressFromOperands(inst_operands);
+        const target = parseBranchTarget(inst_operands);
         const target_offset: ?u32 = if (target) |t| branchOffset(t, proc_entry) else null;
         return ir.branch(inst.address, null, target_offset, null);
     }
@@ -509,7 +622,7 @@ fn liftInstruction(
     // CBZ/CBNZ — compare and branch on zero/nonzero
     if (eqlIgnoreCase(mnemonic, "cbz") or eqlIgnoreCase(mnemonic, "cbnz")) {
         const condition = if (eqlIgnoreCase(mnemonic, "cbz")) "eq_zero" else "ne_zero";
-        const target = parseAddressFromOperands(inst_operands);
+        const target = parseBranchTarget(inst_operands);
         const target_offset: ?u32 = if (target) |t| branchOffset(t, proc_entry) else null;
         return ir.branch(inst.address, condition, target_offset, null);
     }
@@ -517,14 +630,14 @@ fn liftInstruction(
     // TBZ/TBNZ — test bit and branch
     if (eqlIgnoreCase(mnemonic, "tbz") or eqlIgnoreCase(mnemonic, "tbnz")) {
         const condition = if (eqlIgnoreCase(mnemonic, "tbz")) "bit_clear" else "bit_set";
-        const target = parseAddressFromOperands(inst_operands);
+        const target = parseBranchTarget(inst_operands);
         const target_offset: ?u32 = if (target) |t| branchOffset(t, proc_entry) else null;
         return ir.branch(inst.address, condition, target_offset, null);
     }
 
     // RET — return (ARM64)
     if (eqlIgnoreCase(mnemonic, "ret")) {
-        return ir.ret(inst.address, "arg0");
+        return ir.ret(inst.address, null);
     }
 
     // LDR Xd, [Xn, #imm] — load (ARM64)
@@ -641,14 +754,14 @@ fn liftInstruction(
     // x86_64 CALL rel32 or CALL [reg] — function call
     if (eqlIgnoreCase(mnemonic, "call")) {
         const target_name = resolveCallTarget(inst_operands, db);
-        return ir.call(inst.address, target_name, null, "result");
+        return ir.call(inst.address, target_name, null, null);
     }
 
     // x86_64 RET — already handled above (shared with ARM64)
 
     // x86_64 JMP — unconditional branch
     if (eqlIgnoreCase(mnemonic, "jmp")) {
-        const target = parseAddressFromOperands(inst_operands);
+        const target = parseBranchTarget(inst_operands);
         const target_offset: ?u32 = if (target) |t| branchOffset(t, proc_entry) else null;
         return ir.branch(inst.address, null, target_offset, null);
     }
@@ -656,7 +769,7 @@ fn liftInstruction(
     // x86_64 Jcc — conditional branches (je, jne, jl, jle, jg, jge, jb, jbe, ja, jae, js, jns, jo, jno, jp, jnp)
     if (mnemonic.len >= 2 and (mnemonic[0] == 'j' or mnemonic[0] == 'J') and mnemonic[1] != 'm') {
         const condition = mnemonic[1..]; // e, ne, l, le, g, ge, etc.
-        const target = parseAddressFromOperands(inst_operands);
+        const target = parseBranchTarget(inst_operands);
         const target_offset: ?u32 = if (target) |t| branchOffset(t, proc_entry) else null;
         return ir.branch(inst.address, condition, target_offset, null);
     }
@@ -688,12 +801,12 @@ fn liftInstruction(
 
     // x86_64 LEAVE — equivalent to mov rsp,rbp + pop rbp
     if (eqlIgnoreCase(mnemonic, "leave")) {
-        return ir.assign(inst.address, "stack_ptr", "frame_ptr");
+        return ir.opaqueInstruction(inst.address, mnemonic, inst_operands);
     }
 
     // x86_64 SYSCALL
     if (eqlIgnoreCase(mnemonic, "syscall")) {
-        return ir.call(inst.address, "syscall", null, "result");
+        return ir.call(inst.address, "syscall", null, null);
     }
 
     // x86_64 INT3 — breakpoint
@@ -752,7 +865,7 @@ fn liftInstruction(
 
     // x86_64 CDQ/CQO — sign-extend rax to rdx:rax
     if (eqlIgnoreCase(mnemonic, "cdq") or eqlIgnoreCase(mnemonic, "cqo")) {
-        return ir.assign(inst.address, "arg2", "sign_extend(result)");
+        return ir.opaqueInstruction(inst.address, mnemonic, inst_operands);
     }
 
     // x86_64 UD2 — undefined instruction (unreachable marker)
@@ -760,18 +873,9 @@ fn liftInstruction(
         return ir.call(inst.address, "unreachable", null, null);
     }
 
-    // Default: emit as assign with mnemonic info so unknown instructions are visible
-    {
-        const parts = splitOperands(allocator, inst_operands);
-        if (parts.dest != null) {
-            try trackVariable(seen_regs, variables, parts.dest.?);
-            const src_expr = std.fmt.allocPrint(allocator, "{s} {s}", .{ mnemonic, inst_operands }) catch inst_operands;
-            return ir.assign(inst.address, ir.registerToVariable(parts.dest.?), src_expr);
-        }
-        // No destination register: emit assign with "?" dest showing the mnemonic
-        const src_expr = std.fmt.allocPrint(allocator, "{s} {s}", .{ mnemonic, inst_operands }) catch mnemonic;
-        return ir.assign(inst.address, "?", src_expr);
-    }
+    // Unsupported semantics may touch any state. Do not infer a write from
+    // operand position, especially for SIMD, stores, and system instructions.
+    return ir.opaqueInstruction(inst.address, mnemonic, inst_operands);
 }
 
 // ============================================================================
@@ -844,6 +948,9 @@ fn splitOperands(allocator: std.mem.Allocator, operands: []const u8) OperandPart
 
 /// Resolve an operand to a meaningful name (check for string refs, symbols, etc.).
 fn resolveOperand(operand: []const u8, db: *const db_mod.Database) []const u8 {
+    if (eqlIgnoreCase(operand, "xzr") or eqlIgnoreCase(operand, "wzr")) return "#0";
+    // A memory expression's displacement is not an absolute symbol address.
+    if (std.mem.indexOfScalar(u8, operand, '[') != null) return operand;
     // Try to parse as address and look up name
     if (parseAddressFromOperands(operand)) |addr| {
         // Check for string reference
@@ -857,7 +964,7 @@ fn resolveOperand(operand: []const u8, db: *const db_mod.Database) []const u8 {
     }
     // Check if it's a register
     if (isRegister(operand)) {
-        return ir.registerToVariable(operand);
+        return regVar(operand);
     }
     return operand;
 }
@@ -889,6 +996,11 @@ fn parseAddressFromOperands(operands: []const u8) ?u64 {
 
 /// Compute branch target offset from function entry. Returns null if target
 /// is before the entry (external branch).
+fn parseBranchTarget(operands: []const u8) ?u64 {
+    const idx = std.mem.lastIndexOf(u8, operands, "0x") orelse return null;
+    return parseAddressFromOperands(operands[idx..]);
+}
+
 fn branchOffset(target: u64, proc_entry: u64) ?u32 {
     if (target >= proc_entry) {
         const diff = target - proc_entry;
@@ -915,12 +1027,17 @@ fn isRegister(s: []const u8) bool {
     return false;
 }
 
-/// Shorthand for ir.registerToVariable — maps register names to readable variable names.
+/// Physical names preserve width views and do not assign ABI argument roles.
 fn regVar(reg: []const u8) []const u8 {
-    // Try ARM64 mapping first; if unchanged, try x86_64 mapping.
-    const arm_result = ir.registerToVariable(reg);
-    if (!std.mem.eql(u8, arm_result, reg)) return arm_result;
-    return ir.x86_64RegisterToVariable(reg);
+    if (eqlIgnoreCase(reg, "xzr") or eqlIgnoreCase(reg, "wzr")) return "#0";
+    return reg;
+}
+
+fn x86WritesFlags(mnemonic: []const u8) bool {
+    for ([_][]const u8{ "add", "sub", "and", "or", "xor", "shl", "shr", "sar", "inc", "dec", "neg", "imul" }) |name| {
+        if (eqlIgnoreCase(mnemonic, name)) return true;
+    }
+    return false;
 }
 
 /// Format a binary operation as "left op right", e.g. "sp + #0x20".
@@ -1022,4 +1139,246 @@ test "lift ret instruction" {
 
     const stmt = try liftInstruction(alloc, inst, 0x1000, &db, &seen, &vars);
     try std.testing.expectEqual(types.IRStatementType.@"return", stmt.type);
+}
+
+test "evidence: opaque SIMD pair and writeback preserve original instruction" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var db = db_mod.Database.init(std.testing.allocator, std.testing.io);
+    defer db.deinit();
+    var seen = std.StringHashMap(void).init(a);
+    var vars = std.array_list.Managed(types.Variable).init(a);
+    const examples = [_]struct { mnemonic: []const u8, operands: []const u8 }{
+        .{ .mnemonic = "simd/fp", .operands = "" },
+        .{ .mnemonic = "stp", .operands = "x0, x1, [sp, #-0x10]!" },
+        .{ .mnemonic = "ldp", .operands = "x0, x1, [x2]" },
+        .{ .mnemonic = "ldr", .operands = "x0, [x1], #0x8" },
+        .{ .mnemonic = "add", .operands = "x0, x1, x2, lsl #0x3" },
+        .{ .mnemonic = "ldr", .operands = "xzr, [x0]" },
+        .{ .mnemonic = "unknown", .operands = "x0, x1" },
+    };
+    for (examples) |ex| {
+        const stmt = try liftInstruction(a, .{ .address = 0x1000, .bytes = &.{}, .mnemonic = ex.mnemonic, .operands = ex.operands, .size = 4 }, 0x1000, &db, &seen, &vars);
+        try std.testing.expectEqual(types.IRStatementType.@"opaque", stmt.type);
+        try std.testing.expect(stmt.dest == null);
+        try std.testing.expectEqualStrings(ex.mnemonic, stmt.op.?);
+        try std.testing.expectEqualStrings(ex.operands, stmt.src.?);
+    }
+    const store = try liftInstruction(a, .{ .address = 0x1000, .bytes = &.{}, .mnemonic = "str", .operands = "xzr, [x0]", .size = 4 }, 0x1000, &db, &seen, &vars);
+    try std.testing.expectEqual(types.IRStatementType.store, store.type);
+    try std.testing.expectEqualStrings("[x0]", store.dest.?);
+    try std.testing.expectEqualStrings("#0", store.src.?);
+}
+
+test "evidence: maturity passes do not optimize through opaque effects" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var stmts = [_]types.IRStatement{
+        ir.assign(0, "arg0", "42"),
+        ir.opaqueInstruction(4, "simd/fp", ""),
+        ir.assign(8, "saved_x19", "arg0"),
+        ir.assign(12, "arg0", "7"),
+        ir.call(16, "helper", null, "arg0"),
+    };
+    var func = types.IRFunction{ .address = 0, .statements = &stmts, .variables = &.{} };
+    try runMaturityPasses(arena.allocator(), &func);
+    try std.testing.expectEqual(@as(usize, 5), func.statements.len);
+    try std.testing.expectEqualStrings("arg0", func.statements[2].src.?);
+    try std.testing.expectEqualStrings("saved_x19", func.statements[2].dest.?);
+    try std.testing.expectEqual(types.IRStatementType.@"opaque", func.statements[1].type);
+    // ABI and arity are unknown here, even with a visible arg0 alias write.
+    try std.testing.expect(func.statements[4].args == null);
+}
+
+test "evidence: inferred linear blocks split at incoming branches" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var db = db_mod.Database.init(std.testing.allocator, std.testing.io);
+    defer db.deinit();
+    const insns = [_]struct { mnemonic: []const u8, operands: []const u8 }{
+        .{ .mnemonic = "tbz", .operands = "x1, #0x2, 0x100c" },
+        .{ .mnemonic = "mov", .operands = "x0, #42" },
+        .{ .mnemonic = "nop", .operands = "" },
+        .{ .mnemonic = "bl", .operands = "0x2000" },
+        .{ .mnemonic = "ret", .operands = "" },
+    };
+    for (insns, 0..) |inst, i| {
+        var stored = types.Instruction{ .address = 0x1000 + i * 4, .bytes = &.{}, .mnemonic = inst.mnemonic, .operands = inst.operands, .size = 4 };
+        @memcpy(stored.operands_buf[0..inst.operands.len], inst.operands);
+        stored.operands_len = @intCast(inst.operands.len);
+        try db.addInstruction(stored);
+    }
+    var blocks = [_]types.BasicBlock{.{ .start = 0x1000, .size = 20, .instruction_count = 5, .successors = &.{}, .predecessors = &.{}, .terminator = .@"return" }};
+    const func = try liftProcedureMatureForArch(arena.allocator(), &.{ .entry = 0x1000, .size = 20, .basic_blocks = &blocks }, &db, .arm64);
+    try std.testing.expectEqual(@as(?u32, 12), func.statements[0].true_block);
+    try std.testing.expectEqualStrings("x1, #0x2, 0x100c", func.statements[0].src.?);
+    try std.testing.expectEqualStrings("0x100c", func.statements[0].target.?);
+    try std.testing.expect(func.statements[3].block_start);
+    try std.testing.expect(func.statements[3].args == null);
+    try std.testing.expectEqualStrings("x0", func.statements[4].src.?);
+}
+
+test "evidence: shared handlers preserve memory effects and two operand arithmetic" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var db = db_mod.Database.init(std.testing.allocator, std.testing.io);
+    defer db.deinit();
+    var seen = std.StringHashMap(void).init(a);
+    var vars = std.array_list.Managed(types.Variable).init(a);
+    const store = try liftInstruction(a, .{ .address = 0, .bytes = &.{}, .mnemonic = "mov", .operands = "[rax], rbx", .size = 3 }, 0, &db, &seen, &vars);
+    try std.testing.expectEqual(types.IRStatementType.store, store.type);
+    const load = try liftInstruction(a, .{ .address = 3, .bytes = &.{}, .mnemonic = "mov", .operands = "rax, [rbx]", .size = 3 }, 0, &db, &seen, &vars);
+    try std.testing.expectEqual(types.IRStatementType.load, load.type);
+    const add = try liftInstruction(a, .{ .address = 6, .bytes = &.{}, .mnemonic = "add", .operands = "rax, rbx", .size = 3 }, 0, &db, &seen, &vars);
+    try std.testing.expect(std.mem.indexOf(u8, add.src.?, " + ") != null);
+    try std.testing.expect(std.mem.startsWith(u8, add.src.?, "rax + "));
+    const xor = try liftInstruction(a, .{ .address = 9, .bytes = &.{}, .mnemonic = "xor", .operands = "eax, eax", .size = 2 }, 0, &db, &seen, &vars);
+    try std.testing.expectEqualStrings("#0x0", xor.src.?);
+}
+
+test "evidence: ARM64 four operand multiply accumulate cannot use MIPS HI LO model" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var db = db_mod.Database.init(std.testing.allocator, std.testing.io);
+    defer db.deinit();
+    var seen = std.StringHashMap(void).init(a);
+    var vars = std.array_list.Managed(types.Variable).init(a);
+    for ([_][]const u8{ "madd", "msub" }) |mnemonic| {
+        const arm_stmt = try liftInstruction(a, .{ .address = 4, .bytes = &.{}, .mnemonic = mnemonic, .operands = "x8, x19, x10, x8", .size = 4 }, 0, &db, &seen, &vars);
+        try std.testing.expectEqual(types.IRStatementType.@"opaque", arm_stmt.type);
+        try std.testing.expect(arm_stmt.dest == null);
+        try std.testing.expectEqualStrings("x8, x19, x10, x8", arm_stmt.src.?);
+        var stmts = [_]types.IRStatement{
+            ir.assign(0, "tmp1_32", "#0x30"),
+            arm_stmt,
+            ir.load(8, "tmp1_32", "[x23, #0x78]"),
+        };
+        var func = types.IRFunction{ .address = 0, .statements = &stmts, .variables = &.{} };
+        try runMaturityPasses(a, &func);
+        // W10 defines the X10 multiplier's low 32 bits. Its value must remain
+        // visible before the four-operand operation, despite the later load.
+        try std.testing.expectEqual(@as(usize, 3), func.statements.len);
+        try std.testing.expectEqualStrings("#0x30", func.statements[0].src.?);
+
+        const mips_stmt = try liftInstruction(a, .{ .address = 12, .bytes = &.{}, .mnemonic = mnemonic, .operands = "$t0, $t1", .size = 4 }, 0, &db, &seen, &vars);
+        try std.testing.expectEqual(types.IRStatementType.assign, mips_stmt.type);
+        try std.testing.expectEqualStrings("hi:lo", mips_stmt.dest.?);
+        try std.testing.expectEqualStrings(if (std.mem.eql(u8, mnemonic, "madd")) "hi:lo + $t0 * $t1" else "hi:lo - $t0 * $t1", mips_stmt.src.?);
+    }
+}
+
+test "evidence: mature lift retains original narrow and vector memory widths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var db = db_mod.Database.init(std.testing.allocator, std.testing.io);
+    defer db.deinit();
+    const instructions = [_]struct { mnemonic: []const u8, operands: []const u8 }{
+        .{ .mnemonic = "ldr", .operands = "w0, [x1, #0]" },
+        .{ .mnemonic = "ldrsb", .operands = "x2, [x1, #4]" },
+        .{ .mnemonic = "ldr", .operands = "q0, [x1, #16]" },
+        .{ .mnemonic = "add", .operands = "v0.4s, v1.4s, v2.4s" },
+        .{ .mnemonic = "str", .operands = "x0, [x1, #32]" },
+    };
+    for (instructions, 0..) |inst, i| {
+        var stored = types.Instruction{ .address = 0x1000 + i * 4, .bytes = &.{}, .mnemonic = inst.mnemonic, .operands = inst.operands, .size = 4 };
+        @memcpy(stored.operands_buf[0..inst.operands.len], inst.operands);
+        stored.operands_len = @intCast(inst.operands.len);
+        try db.addInstruction(stored);
+    }
+    var blocks = [_]types.BasicBlock{.{ .start = 0x1000, .size = 20, .instruction_count = 5, .successors = &.{}, .predecessors = &.{}, .terminator = .fallthrough }};
+    const func = try liftProcedureMature(arena.allocator(), &.{ .entry = 0x1000, .size = 20, .basic_blocks = &blocks }, &db);
+    try std.testing.expectEqual(@as(?u8, 4), func.statements[0].memory_width);
+    try std.testing.expectEqualStrings("w0", func.statements[0].dest.?);
+    try std.testing.expectEqual(@as(?u8, 1), func.statements[1].memory_width);
+    try std.testing.expect(func.statements[1].memory_signedness == .signed);
+    try std.testing.expectEqual(@as(?u8, 16), func.statements[2].memory_width);
+    try std.testing.expect(func.statements[2].type == .@"opaque");
+    try std.testing.expect(func.statements[3].type == .@"opaque");
+    try std.testing.expect(func.statements[3].dest == null);
+    try std.testing.expectEqualStrings("v0.4s, v1.4s, v2.4s", func.statements[3].src.?);
+    try std.testing.expectEqual(@as(?u8, 8), func.statements[4].memory_width);
+}
+
+test "evidence: LLVM R05 R06 R07 x86 arithmetic survives mature lifting" {
+    // Exact compiler bytes from the three platform fixtures, cross-checked
+    // against LLVM. The SysV specimens differ only in their load address.
+    const sysv = [_]u8{ 0x55, 0x48, 0x89, 0xe5, 0x4c, 0x01, 0xc7, 0x48, 0x8d, 0x3c, 0x7f, 0x48, 0x8d, 0x04, 0xb6, 0x48, 0x8d, 0x34, 0xd5, 0, 0, 0, 0, 0x48, 0x29, 0xd6, 0x48, 0x31, 0xc6, 0x48, 0x8d, 0x04, 0x89, 0x48, 0x8d, 0x04, 0x41, 0x48, 0x31, 0xf8, 0x48, 0x31, 0xf0, 0x5d, 0xc3 };
+    const windows = [_]u8{ 0x55, 0x48, 0x89, 0xe5, 0x48, 0x03, 0x4d, 0x30, 0x48, 0x8d, 0x0c, 0x49, 0x48, 0x8d, 0x04, 0x92, 0x4a, 0x8d, 0x14, 0xc5, 0, 0, 0, 0, 0x4c, 0x29, 0xc2, 0x48, 0x31, 0xc2, 0x4b, 0x8d, 0x04, 0x89, 0x49, 0x8d, 0x04, 0x41, 0x48, 0x31, 0xd0, 0x48, 0x31, 0xc8, 0x5d, 0xc3 };
+    const fixtures = [_]struct { entry: u64, bytes: []const u8, first: []const u8 }{
+        .{ .entry = 0x1490, .bytes = &sysv, .first = "rdi" },
+        .{ .entry = 0x10011b0, .bytes = &sysv, .first = "rdi" },
+        .{ .entry = 0x140001000, .bytes = &windows, .first = "rcx" },
+    };
+    const x86 = @import("../arch/x86_64.zig");
+    for (fixtures) |fixture| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        var db = db_mod.Database.init(std.testing.allocator, std.testing.io);
+        defer db.deinit();
+        var off: usize = 0;
+        var count: u32 = 0;
+        while (off < fixture.bytes.len) {
+            const decoded = x86.decode(fixture.bytes[off..], fixture.entry + off);
+            var inst = decoded.toInstruction(fixture.entry + off, fixture.bytes[off..]);
+            @memcpy(inst.operands_buf[0..inst.operands.len], inst.operands);
+            inst.operands_len = @intCast(inst.operands.len);
+            try db.addInstruction(inst);
+            off += decoded.length;
+            count += 1;
+        }
+        var blocks = [_]types.BasicBlock{.{ .start = fixture.entry, .size = @intCast(fixture.bytes.len), .instruction_count = count, .successors = &.{}, .predecessors = &.{}, .terminator = .@"return" }};
+        const proc = types.Procedure{ .entry = fixture.entry, .size = fixture.bytes.len, .basic_blocks = &blocks };
+        const func = try liftProcedureMatureForArch(arena.allocator(), &proc, &db, .x86_64);
+        // SysV never reads its temporary frame pointer before POP, so that
+        // MOV can be removed. Windows reads RBP to fetch its stack operand.
+        try std.testing.expectEqual(@as(usize, if (fixture.entry == 0x140001000) 14 else 13), func.statements.len);
+        var arithmetic_count: usize = 0;
+        var lea_count: usize = 0;
+        for (func.statements) |stmt| {
+            if (stmt.type == .assign and stmt.address >= fixture.entry + 4) arithmetic_count += 1;
+            if (stmt.address == fixture.entry + 4) {
+                try std.testing.expectEqualStrings(fixture.first, stmt.dest.?);
+                try std.testing.expect(std.mem.indexOf(u8, stmt.src.?, " + ") != null);
+            }
+            const original = db.getInstruction(stmt.address).?;
+            if (eqlIgnoreCase(original.mnemonic, "lea")) {
+                lea_count += 1;
+                try std.testing.expectEqualStrings(original.operands[0..std.mem.indexOfScalar(u8, original.operands, ',').?], stmt.dest.?);
+                try std.testing.expect(std.mem.indexOfScalar(u8, stmt.src.?, '[') != null);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), arithmetic_count);
+        try std.testing.expectEqual(@as(usize, 5), lea_count);
+        const ret = func.statements[func.statements.len - 1];
+        try std.testing.expectEqualStrings("rax", ret.src.?);
+        try std.testing.expectEqualStrings("integer_return_candidate", ret.op.?);
+        for (func.variables) |v| {
+            try std.testing.expectEqualStrings(v.register.?, v.name);
+            try std.testing.expect(v.type_name == null);
+        }
+        const unknown = try liftProcedureMature(arena.allocator(), &proc, &db);
+        try std.testing.expect(unknown.statements[unknown.statements.len - 1].src == null);
+    }
+}
+
+test "evidence: x86 flags survive a scalar overwrite before conditional branch" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var db = db_mod.Database.init(std.testing.allocator, std.testing.io);
+    defer db.deinit();
+    const operands = [_][]const u8{ "rax, 1", "rax, 0", "0x100c" };
+    const mnemonics = [_][]const u8{ "add", "mov", "je" };
+    for (operands, mnemonics, 0..) |operand, mnemonic, i| {
+        var inst = types.Instruction{ .address = 0x1000 + i * 4, .bytes = &.{}, .mnemonic = mnemonic, .operands = operand, .size = 4 };
+        @memcpy(inst.operands_buf[0..operand.len], operand);
+        inst.operands_len = @intCast(operand.len);
+        try db.addInstruction(inst);
+    }
+    var blocks = [_]types.BasicBlock{.{ .start = 0x1000, .size = 12, .instruction_count = 3, .successors = &.{}, .predecessors = &.{}, .terminator = .branch }};
+    const func = try liftProcedureMatureForArch(arena.allocator(), &.{ .entry = 0x1000, .size = 12, .basic_blocks = &blocks }, &db, .x86_64);
+    try std.testing.expectEqual(@as(usize, 3), func.statements.len);
+    try std.testing.expectEqualStrings("writes_flags", func.statements[0].op.?);
 }

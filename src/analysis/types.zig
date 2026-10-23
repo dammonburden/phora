@@ -1,20 +1,12 @@
-// Phora — Struct Layout / Type Recovery (W4 of v7.8.0)
-// Given a set of lifted IR functions, look for pointer variables that are
-// dereferenced at multiple offsets. Infer a struct with fields at those
-// offsets. Output typedefs that pseudocode/decompile renderers can emit.
-//
-// Algorithm:
-//   1. Scan load/store/compare statements for [VAR + OFFSET] memory operands.
-//   2. Build a per-(function,variable) access set of (offset, width, r/w).
-//   3. Cluster accesses into fields (overlapping offsets merge, wider wins).
-//   4. Emit a struct per pointer variable with >=2 distinct offsets; merge
-//      variables that share the exact same field layout so multiple
-//      functions can share a typedef.
-//   5. Single-hop cross-function propagation: if F calls G with var V as
-//      arg0 and G's arg0 has a recovered struct, V inherits that type.
+// Phora — Structural memory-access observations.
+// Constant-offset accesses and exact transfer widths can suggest a layout,
+// but do not prove a typedef, pointer identity, signed member type or ABI.
+// Unknown widths and indexed expressions are excluded. Display aliases do
+// not justify propagating these observations through calls.
 
 const std = @import("std");
 const types = @import("../types.zig");
+const ir = @import("../lifter/ir.zig");
 
 // ===========================================================================
 // Public types (per spec)
@@ -23,12 +15,16 @@ const types = @import("../types.zig");
 pub const InferredField = struct {
     /// Signed: negative offsets are valid for stack-frame structs (frame_<N>).
     offset: i32,
-    /// 1, 2, 4, or 8 bytes.
+    /// Maximum observed access width in bytes; never a proven member type.
     width: u8,
     /// e.g. "f_00", "f_08", "f_20"; or "f_n10" for negative-offset frames.
     name: []const u8,
     read_count: u32,
     write_count: u32,
+    /// Bit N means a width of 2^N bytes was observed.
+    observed_widths: u8 = 0,
+    signed_read_count: u32 = 0,
+    unsigned_read_count: u32 = 0,
 };
 
 pub const InferredStruct = struct {
@@ -37,14 +33,17 @@ pub const InferredStruct = struct {
     /// Max observed offset + width.
     size_hint: u32,
     fields: []InferredField,
-    /// Variables that Phora thinks are pointers to this struct type.
+    /// Observed memory bases; these are not certified source-language pointers.
     /// Keys are "function_entry:variable_name", e.g. "0x1000:arg0".
     pointer_origins: [][]const u8,
+    /// Structural access pattern only: arrays, unions and reused bases remain possible.
+    evidence: []const u8 = "structural_access_pattern",
+    has_overlapping_accesses: bool = false,
 };
 
 pub const TypeRecoveryResult = struct {
     structs: []InferredStruct,
-    /// Per-function per-variable type assignment:
+    /// Per-function base-name association with a structural pattern:
     /// map key = "funcaddr:varname" -> struct name.
     variable_types: std.StringHashMap([]const u8),
 };
@@ -58,6 +57,7 @@ const RawAccess = struct {
     width: u8,
     is_read: bool,
     is_write: bool,
+    signedness: types.MemorySignedness = .unknown,
 };
 
 const ClusteredField = struct {
@@ -65,6 +65,9 @@ const ClusteredField = struct {
     width: u8,
     read_count: u32,
     write_count: u32,
+    observed_widths: u8 = 0,
+    signed_read_count: u32 = 0,
+    unsigned_read_count: u32 = 0,
 };
 
 const VarKey = []const u8; // "funcaddr:varname"
@@ -97,67 +100,20 @@ fn isStackLike(name: []const u8) bool {
         std.mem.eql(u8, name, "x29");
 }
 
-/// Width hint from the full operand string. Returns 0 if no explicit hint.
+/// Legacy raw IR is accepted only when an architectural register or explicit
+/// operand-size prefix provides a width. Renamed variables carry no such proof.
 fn widthFromHint(operand: []const u8) u8 {
-    if (std.mem.indexOf(u8, operand, "byte ptr") != null) return 1;
-    if (std.mem.indexOf(u8, operand, "word ptr") != null and
-        std.mem.indexOf(u8, operand, "dword ptr") == null and
-        std.mem.indexOf(u8, operand, "qword ptr") == null) return 2;
-    if (std.mem.indexOf(u8, operand, "dword ptr") != null) return 4;
-    if (std.mem.indexOf(u8, operand, "qword ptr") != null) return 8;
-    return 0;
+    return ir.memoryOperandWidth(operand) orelse 0;
 }
 
-/// Width inferred from a register/variable name. Returns 0 if unknown.
-/// ARM64: w0..w30 = 32-bit, x0..x30 = 64-bit, b0=8, h0=16, s0=32, d0=64.
-/// x86_64: rax=8, eax=4, ax=2, al/ah=1.
 fn widthFromVarName(name: []const u8) u8 {
-    if (name.len < 2) return 0;
-    const c0 = name[0];
-    // ARM64 SIMD/scalar single-letter prefixes followed by digits.
-    if ((c0 == 'w' or c0 == 'x' or c0 == 'b' or c0 == 'h' or c0 == 's' or c0 == 'd' or c0 == 'q') and
-        std.ascii.isDigit(name[1]))
-    {
-        // Verify the rest is digits.
-        var i: usize = 1;
-        while (i < name.len) : (i += 1) {
-            if (!std.ascii.isDigit(name[i])) return 0;
-        }
-        return switch (c0) {
-            'b' => 1,
-            'h' => 2,
-            'w', 's' => 4,
-            'x', 'd' => 8,
-            'q' => 16, // capped to 8 by caller
-            else => 0,
-        };
-    }
-    // x86_64 GPRs: rax/rbx/.../rdi/rsi/r8..r15
-    if (c0 == 'r' and name.len >= 2) {
-        // r8..r15 with d/w/b suffix
-        if (name.len >= 2 and std.ascii.isDigit(name[1])) {
-            // r8..r15
-            const last = name[name.len - 1];
-            return switch (last) {
-                'b' => 1,
-                'w' => 2,
-                'd' => 4,
-                else => 8,
-            };
-        }
-        // rax/rcx/rdx/rbx/rsi/rdi/rsp/rbp etc.
-        if (name.len == 3) return 8;
-    }
-    if (c0 == 'e' and name.len == 3) return 4; // eax, ecx ...
-    return 0;
+    return ir.registerWidth(name) orelse 0;
 }
 
-/// Width hint from the load mnemonic (parsed from a leading hint like "ldrb",
-/// "ldrh"). Not always available — we mostly rely on dest name.
 fn widthFromLoadMnemonic(op: []const u8) u8 {
-    if (std.mem.eql(u8, op, "ldrb") or std.mem.eql(u8, op, "strb")) return 1;
-    if (std.mem.eql(u8, op, "ldrh") or std.mem.eql(u8, op, "strh")) return 2;
-    if (std.mem.eql(u8, op, "ldrw") or std.mem.eql(u8, op, "strw")) return 4;
+    if (std.mem.eql(u8, op, "ldrb") or std.mem.eql(u8, op, "ldrsb") or std.mem.eql(u8, op, "strb")) return 1;
+    if (std.mem.eql(u8, op, "ldrh") or std.mem.eql(u8, op, "ldrsh") or std.mem.eql(u8, op, "strh")) return 2;
+    if (std.mem.eql(u8, op, "ldrsw")) return 4;
     return 0;
 }
 
@@ -184,10 +140,18 @@ fn parseMemRef(operand: []const u8) ?ParsedRef {
     }
     if (name_end == 0) return null;
     const var_name = inner[0..name_end];
+    for (var_name) |c| if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '$') return null;
+    if (std.ascii.isDigit(var_name[0])) return null;
+    if (std.mem.trim(u8, operand[rb_rel + 1 ..], " \t").len != 0) return null;
 
     // Anything after the name is the offset section. Find a sign.
-    var rest = std.mem.trim(u8, inner[name_end..], " \t,");
+    var rest = std.mem.trim(u8, inner[name_end..], " \t");
     if (rest.len == 0) return .{ .var_name = var_name, .offset = 0 };
+
+    if (rest[0] == ',') {
+        rest = std.mem.trim(u8, rest[1..], " \t");
+        if (rest.len == 0) return null;
+    } else if (rest[0] != '+' and rest[0] != '-') return null;
 
     var sign: i64 = 1;
     if (rest[0] == '+') {
@@ -205,26 +169,15 @@ fn parseMemRef(operand: []const u8) ?ParsedRef {
     } else if (rest.len > 0 and rest[0] == '+') {
         rest = rest[1..];
     }
-    if (rest.len == 0) return .{ .var_name = var_name, .offset = 0 };
+    if (rest.len == 0) return null;
 
-    // Trim any trailing junk after the number (e.g. ", lsl #2").
-    var num_end: usize = 0;
-    if (rest.len >= 2 and rest[0] == '0' and (rest[1] == 'x' or rest[1] == 'X')) {
-        num_end = 2;
-        while (num_end < rest.len and std.ascii.isHex(rest[num_end])) : (num_end += 1) {}
-    } else {
-        while (num_end < rest.len and std.ascii.isDigit(rest[num_end])) : (num_end += 1) {}
-    }
-    if (num_end == 0) return .{ .var_name = var_name, .offset = 0 };
-    const num_str = rest[0..num_end];
-
-    const parsed: u64 = blk: {
-        if (num_str.len >= 2 and num_str[0] == '0' and (num_str[1] == 'x' or num_str[1] == 'X')) {
-            break :blk std.fmt.parseInt(u64, num_str[2..], 16) catch return .{ .var_name = var_name, .offset = 0 };
-        } else {
-            break :blk std.fmt.parseInt(u64, num_str, 10) catch return .{ .var_name = var_name, .offset = 0 };
-        }
-    };
+    // Consume the entire displacement. Indexed/scaled expressions are not
+    // constant field offsets, and a malformed number is not offset zero.
+    const parsed = if (std.mem.startsWith(u8, rest, "0x") or std.mem.startsWith(u8, rest, "0X"))
+        std.fmt.parseInt(u64, rest[2..], 16) catch return null
+    else
+        std.fmt.parseInt(u64, rest, 10) catch return null;
+    if (parsed > std.math.maxInt(i64)) return null;
     // G2 (v7.8.3): when the disassembler renders a negative i32 immediate as
     // unsigned hex (e.g. `[arg2 + 0xffffffa2]` for what's really -94), sign-
     // extend it back to a real negative i64 so the negative-offset filter in
@@ -349,11 +302,7 @@ pub fn recover(
         for (g.members.items) |m| m.struct_name = g.struct_name;
     }
 
-    // 4. Cross-function propagation (single hop):
-    // If function F has a call statement with arg0 = some variable V (or
-    // a temp that aliases V), and the callee G has a recovered struct on
-    // its arg0, V inherits that struct.
-    try propagateAcrossCalls(allocator, functions, var_store.items, var_map);
+    // Display aliases do not establish a calling convention or pointer identity.
 
     // 5. Build the output.
     var structs = try allocator.alloc(InferredStruct, group_store.items.len);
@@ -372,6 +321,9 @@ pub fn recover(
                 .name = name,
                 .read_count = f.read_count,
                 .write_count = f.write_count,
+                .observed_widths = f.observed_widths,
+                .signed_read_count = f.signed_read_count,
+                .unsigned_read_count = f.unsigned_read_count,
             };
         }
         var origins = std.array_list.Managed([]const u8).init(allocator);
@@ -384,6 +336,7 @@ pub fn recover(
             .size_hint = sizeHint(g.fields),
             .fields = named_fields,
             .pointer_origins = try origins.toOwnedSlice(),
+            .has_overlapping_accesses = hasOverlaps(g.fields),
         };
     }
 
@@ -425,20 +378,20 @@ fn extractFromStatement(
             const mem = stmt.src orelse return;
             const ref = parseMemRef(mem) orelse return;
             if (!isOffsetAcceptable(ref)) return;
-            var width = widthFromHint(mem);
+            var width = stmt.memory_width orelse widthFromHint(mem);
             if (width == 0) {
                 if (stmt.op) |o| width = widthFromLoadMnemonic(o);
             }
             if (width == 0) {
                 if (stmt.dest) |d| width = widthFromVarName(d);
             }
-            if (width == 0) width = 8;
-            if (width > 8) width = 8;
+            if (width == 0) return;
             try addAccess(allocator, var_map, var_store, func_addr, ref.var_name, .{
                 .offset = @as(i32, @intCast(ref.offset)),
                 .width = width,
                 .is_read = true,
                 .is_write = false,
+                .signedness = stmt.memory_signedness,
             });
         },
         .store => {
@@ -446,15 +399,14 @@ fn extractFromStatement(
             const mem = stmt.dest orelse return;
             const ref = parseMemRef(mem) orelse return;
             if (!isOffsetAcceptable(ref)) return;
-            var width = widthFromHint(mem);
+            var width = stmt.memory_width orelse widthFromHint(mem);
             if (width == 0) {
                 if (stmt.op) |o| width = widthFromLoadMnemonic(o);
             }
             if (width == 0) {
                 if (stmt.src) |s| width = widthFromVarName(s);
             }
-            if (width == 0) width = 8;
-            if (width > 8) width = 8;
+            if (width == 0) return;
             try addAccess(allocator, var_map, var_store, func_addr, ref.var_name, .{
                 .offset = @intCast(ref.offset),
                 .width = width,
@@ -462,14 +414,31 @@ fn extractFromStatement(
                 .is_write = true,
             });
         },
+        .@"opaque" => {
+            const op = stmt.op orelse return;
+            const operands = stmt.src orelse return;
+            const width = stmt.memory_width orelse return;
+            const read = std.mem.startsWith(u8, op, "ldr") or std.mem.startsWith(u8, op, "ldur");
+            const write = std.mem.startsWith(u8, op, "str") or std.mem.startsWith(u8, op, "stur");
+            if (!read and !write) return;
+            const ref = parseMemRef(operands) orelse return;
+            if (!isOffsetAcceptable(ref)) return;
+            try addAccess(allocator, var_map, var_store, func_addr, ref.var_name, .{
+                .offset = @intCast(ref.offset),
+                .width = width,
+                .is_read = read,
+                .is_write = write,
+                .signedness = stmt.memory_signedness,
+            });
+        },
         .compare => {
             // Compares can include `[var+off]` on either side.
-            inline for (.{ stmt.dest, stmt.src }) |maybe_op| {
+            for ([_]?[]const u8{ stmt.dest, stmt.src }) |maybe_op| {
                 if (maybe_op) |mem| {
                     if (parseMemRef(mem)) |ref| {
                         if (isOffsetAcceptable(ref)) {
-                            var width = widthFromHint(mem);
-                            if (width == 0) width = 8;
+                            const width = stmt.memory_width orelse widthFromHint(mem);
+                            if (width == 0) continue;
                             try addAccess(allocator, var_map, var_store, func_addr, ref.var_name, .{
                                 .offset = @intCast(ref.offset),
                                 .width = width,
@@ -569,6 +538,9 @@ fn clusterAccesses(
         .width = copy[0].width,
         .read_count = if (copy[0].is_read) 1 else 0,
         .write_count = if (copy[0].is_write) 1 else 0,
+        .observed_widths = widthMask(copy[0].width),
+        .signed_read_count = if (copy[0].is_read and copy[0].signedness == .signed) 1 else 0,
+        .unsigned_read_count = if (copy[0].is_read and copy[0].signedness == .unsigned) 1 else 0,
     };
 
     var i: usize = 1;
@@ -579,6 +551,9 @@ fn clusterAccesses(
             if (a.width > current.width) current.width = a.width;
             if (a.is_read) current.read_count += 1;
             if (a.is_write) current.write_count += 1;
+            current.observed_widths |= widthMask(a.width);
+            if (a.is_read and a.signedness == .signed) current.signed_read_count += 1;
+            if (a.is_read and a.signedness == .unsigned) current.unsigned_read_count += 1;
         } else {
             try out.append(current);
             current = .{
@@ -586,6 +561,9 @@ fn clusterAccesses(
                 .width = a.width,
                 .read_count = if (a.is_read) 1 else 0,
                 .write_count = if (a.is_write) 1 else 0,
+                .observed_widths = widthMask(a.width),
+                .signed_read_count = if (a.is_read and a.signedness == .signed) 1 else 0,
+                .unsigned_read_count = if (a.is_read and a.signedness == .unsigned) 1 else 0,
             };
         }
     }
@@ -598,12 +576,35 @@ fn clusterAccesses(
 // Struct emission helpers
 // ===========================================================================
 
+fn widthMask(width: u8) u8 {
+    return switch (width) {
+        1 => 1,
+        2 => 2,
+        4 => 4,
+        8 => 8,
+        16 => 16,
+        32 => 32,
+        64 => 64,
+        else => 0,
+    };
+}
+
+fn hasOverlaps(fields: []const ClusteredField) bool {
+    for (fields, 0..) |f, i| {
+        if (@popCount(f.observed_widths) > 1) return true;
+        for (fields[i + 1 ..]) |other| {
+            if (other.offset < f.offset + @as(i32, f.width)) return true;
+        }
+    }
+    return false;
+}
+
 fn fieldsSignature(allocator: std.mem.Allocator, fields: []const ClusteredField) ![]u8 {
     var buf = std.Io.Writer.Allocating.init(allocator);
     errdefer buf.deinit();
     var w = &buf.writer;
     for (fields) |f| {
-        try w.print("{d}:{d};", .{ f.offset, f.width });
+        try w.print("{d}:{d}:{d}:{d}:{d};", .{ f.offset, f.width, f.observed_widths, f.signed_read_count, f.unsigned_read_count });
     }
     return buf.toOwnedSlice();
 }
@@ -671,66 +672,6 @@ fn sizeHint(fields: []const ClusteredField) u32 {
     // Mixed sign: use full span.
     const span = max_end - min;
     return @as(u32, @intCast(@max(0, span)));
-}
-
-// ===========================================================================
-// Cross-function propagation (single hop)
-// ===========================================================================
-
-/// For each call statement in F passing var V as arg0, look up the callee G's
-/// arg0 in the var_map. If G's arg0 has a recovered struct, transfer it to V
-/// (provided V doesn't already have one).
-fn propagateAcrossCalls(
-    allocator: std.mem.Allocator,
-    functions: []const types.IRFunction,
-    var_infos: []const *VarInfo,
-    var_map: std.StringHashMap(*VarInfo),
-) !void {
-    _ = allocator;
-    _ = var_infos;
-
-    // Build name -> function entry address map.
-    var name_to_addr = std.StringHashMap(u64).init(var_map.allocator);
-    defer name_to_addr.deinit();
-    for (functions) |func| {
-        if (func.name) |n| {
-            try name_to_addr.put(n, func.address);
-        }
-    }
-
-    for (functions) |func| {
-        for (func.statements) |stmt| {
-            if (stmt.type != .call) continue;
-            const target = stmt.target orelse continue;
-            const args = stmt.args orelse continue;
-            if (args.len == 0) continue;
-
-            // Resolve callee address: target is either a function name or "0x..."
-            const callee_addr: u64 = blk: {
-                if (name_to_addr.get(target)) |a| break :blk a;
-                if (std.mem.startsWith(u8, target, "0x")) {
-                    break :blk std.fmt.parseInt(u64, target[2..], 16) catch continue;
-                }
-                continue;
-            };
-
-            // Look up callee's arg0.
-            const callee_key = try std.fmt.allocPrint(var_map.allocator, "0x{x}:arg0", .{callee_addr});
-            defer var_map.allocator.free(callee_key);
-            const callee_info = var_map.get(callee_key) orelse continue;
-            const callee_struct = callee_info.struct_name orelse continue;
-
-            // Look up caller's arg-0 variable in this call.
-            const caller_arg = args[0];
-            const caller_key = try std.fmt.allocPrint(var_map.allocator, "0x{x}:{s}", .{ func.address, caller_arg });
-            defer var_map.allocator.free(caller_key);
-            if (var_map.get(caller_key)) |caller_info| {
-                if (caller_info.struct_name == null) {
-                    caller_info.struct_name = callee_struct;
-                }
-            }
-        }
-    }
 }
 
 // ===========================================================================
@@ -932,7 +873,7 @@ test "recover: skips offsets >= 4096 (global, not struct)" {
     try std.testing.expectEqual(@as(usize, 0), result.structs.len);
 }
 
-test "recover: cross-function propagation transfers struct from callee arg0" {
+test "recover: arg display names do not propagate types across unknown ABIs" {
     const allocator = std.testing.allocator;
 
     // Callee g: derefs arg0 at 0 and 8.
@@ -971,12 +912,7 @@ test "recover: cross-function propagation transfers struct from callee arg0" {
     try std.testing.expectEqual(@as(usize, 1), result.structs.len);
     const sname = result.structs[0].name;
 
-    // f's arg0 inherits the struct via single-hop propagation.
-    const f_type = result.variable_types.get("0x1000:arg0") orelse {
-        try std.testing.expect(false);
-        return;
-    };
-    try std.testing.expectEqualStrings(sname, f_type);
+    try std.testing.expect(result.variable_types.get("0x1000:arg0") == null);
 
     // g's arg0 is also typed.
     const g_type = result.variable_types.get("0x2000:arg0").?;
@@ -1003,4 +939,35 @@ test "recover: width promotion when same offset accessed at multiple widths" {
     try std.testing.expectEqual(@as(usize, 1), result.structs.len);
     try std.testing.expectEqual(@as(u8, 8), result.structs[0].fields[0].width);
     try std.testing.expectEqual(@as(u32, 2), result.structs[0].fields[0].read_count);
+}
+
+test "field recovery rejects indexed invalid and overflowing displacements" {
+    const invalid = [_][]const u8{
+        "[x0, x1]",                    "[x0 + rax*4]",              "[x0, #8, lsl #2]", "[x0+]",
+        "[x0,]",                       "[x0 + 0xgarbage]",          "[x0 + 0x100junk]", "[x0 8]",
+        "[x0 + 18446744073709551616]", "[x0 + 0xffffffffffffffff]", "[x0,#8]!",
+    };
+    for (invalid) |operand| try std.testing.expect(parseMemRef(operand) == null);
+}
+
+test "field recovery preserves original widths sign extension and overlap evidence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var stmts = [_]types.IRStatement{
+        .{ .type = .load, .address = 0, .dest = "local_0", .src = "[arg0]", .memory_width = 4 },
+        .{ .type = .load, .address = 4, .dest = "arg1", .src = "[arg0]", .memory_width = 1, .memory_signedness = .signed },
+        .{ .type = .@"opaque", .address = 8, .op = "ldr", .src = "q0, [arg0, #16]", .memory_width = 16 },
+        .{ .type = .load, .address = 12, .dest = "local_1", .src = "[arg0, x2]", .memory_width = 8 },
+        .{ .type = .load, .address = 16, .dest = "local_2", .src = "[arg0, #32]" },
+    };
+    const result = try recover(arena.allocator(), &.{.{ .address = 0, .statements = &stmts, .variables = &.{} }});
+    try std.testing.expectEqual(@as(usize, 1), result.structs.len);
+    const s = result.structs[0];
+    try std.testing.expectEqual(@as(usize, 2), s.fields.len);
+    try std.testing.expectEqual(@as(u8, 4), s.fields[0].width);
+    try std.testing.expectEqual(@as(u8, 5), s.fields[0].observed_widths);
+    try std.testing.expectEqual(@as(u32, 1), s.fields[0].signed_read_count);
+    try std.testing.expectEqual(@as(u8, 16), s.fields[1].width);
+    try std.testing.expect(s.has_overlapping_accesses);
+    try std.testing.expectEqualStrings("structural_access_pattern", s.evidence);
 }

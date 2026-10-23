@@ -20,6 +20,10 @@ const macho = @import("loaders/macho.zig");
 const testing = std.testing;
 const test_io = std.testing.io;
 
+test {
+    _ = @import("test_evidence.zig");
+}
+
 const test_fs = struct {
     const File = struct {
         file: std.Io.File,
@@ -307,7 +311,8 @@ test "MCP tool — list_documents" {
 
     var store = tools.DocumentStore.init(allocator, std.testing.io);
 
-    const ctx = tools.ToolContext{ .io = std.testing.io,
+    const ctx = tools.ToolContext{
+        .io = std.testing.io,
         .store = &store,
         .session_id = "test-session",
         .allocator = allocator,
@@ -330,7 +335,8 @@ test "MCP tool — load_binary with real /bin/ls" {
 
     var store = tools.DocumentStore.init(allocator, std.testing.io);
 
-    const ctx = tools.ToolContext{ .io = std.testing.io,
+    const ctx = tools.ToolContext{
+        .io = std.testing.io,
         .store = &store,
         .session_id = "test-session",
         .allocator = allocator,
@@ -358,7 +364,8 @@ test "MCP tool — get_segments" {
 
     var store = tools.DocumentStore.init(allocator, std.testing.io);
 
-    const ctx = tools.ToolContext{ .io = std.testing.io,
+    const ctx = tools.ToolContext{
+        .io = std.testing.io,
         .store = &store,
         .session_id = "test-session",
         .allocator = allocator,
@@ -382,7 +389,8 @@ test "MCP tool — search for strings" {
 
     var store = tools.DocumentStore.init(allocator, std.testing.io);
 
-    const ctx = tools.ToolContext{ .io = std.testing.io,
+    const ctx = tools.ToolContext{
+        .io = std.testing.io,
         .store = &store,
         .session_id = "test-session",
         .allocator = allocator,
@@ -413,7 +421,8 @@ test "MCP tool — close_document" {
 
     var store = tools.DocumentStore.init(allocator, std.testing.io);
 
-    const ctx = tools.ToolContext{ .io = std.testing.io,
+    const ctx = tools.ToolContext{
+        .io = std.testing.io,
         .store = &store,
         .session_id = "test-session",
         .allocator = allocator,
@@ -443,7 +452,8 @@ test "MCP tool — annotate (transactional)" {
 
     var store = tools.DocumentStore.init(allocator, std.testing.io);
 
-    const ctx = tools.ToolContext{ .io = std.testing.io,
+    const ctx = tools.ToolContext{
+        .io = std.testing.io,
         .store = &store,
         .session_id = "test-session",
         .allocator = allocator,
@@ -474,7 +484,8 @@ test "MCP tool — unknown tool returns error" {
     var store = tools.DocumentStore.init(allocator, std.testing.io);
     defer store.deinit();
 
-    const ctx = tools.ToolContext{ .io = std.testing.io,
+    const ctx = tools.ToolContext{
+        .io = std.testing.io,
         .store = &store,
         .session_id = "test-session",
         .allocator = allocator,
@@ -492,7 +503,8 @@ test "MCP tool — document not found returns error" {
     var store = tools.DocumentStore.init(allocator, std.testing.io);
     defer store.deinit();
 
-    const ctx = tools.ToolContext{ .io = std.testing.io,
+    const ctx = tools.ToolContext{
+        .io = std.testing.io,
         .store = &store,
         .session_id = "test-session",
         .allocator = allocator,
@@ -778,7 +790,8 @@ test "annotate rejects out-of-segment address" {
 
     var store = tools.DocumentStore.init(allocator, std.testing.io);
 
-    const ctx = tools.ToolContext{ .io = std.testing.io,
+    const ctx = tools.ToolContext{
+        .io = std.testing.io,
         .store = &store,
         .session_id = "test-session",
         .allocator = allocator,
@@ -816,7 +829,8 @@ test "mark_data_type rejects out-of-segment address" {
 
     var store = tools.DocumentStore.init(allocator, std.testing.io);
 
-    const ctx = tools.ToolContext{ .io = std.testing.io,
+    const ctx = tools.ToolContext{
+        .io = std.testing.io,
         .store = &store,
         .session_id = "test-session",
         .allocator = allocator,
@@ -1121,7 +1135,7 @@ test "v7.6.0 — tool count is 32" {
 }
 
 test "v7.6.1 — categorizeCapability filters XML namespace URIs" {
-    var cats: [10][]const u8 = undefined;
+    var cats: [tools.MAX_CAP_CATS][]const u8 = undefined;
     const n1 = tools.categorizeCapability("http://www.w3.org/2001/XMLSchema", &cats);
     try testing.expectEqual(@as(usize, 0), n1);
 
@@ -1131,7 +1145,7 @@ test "v7.6.1 — categorizeCapability filters XML namespace URIs" {
 }
 
 test "v7.6.1 — categorizeCapability rejects password in deprecation warnings" {
-    var cats: [10][]const u8 = undefined;
+    var cats: [tools.MAX_CAP_CATS][]const u8 = undefined;
     const n1 = tools.categorizeCapability("NTLM password authentication is deprecated", &cats);
     var has_cred = false;
     for (cats[0..n1]) |cat| {
@@ -1148,8 +1162,8 @@ test "v7.6.1 — categorizeCapability rejects password in deprecation warnings" 
 }
 
 test "v7.6.1 — categorizeCapability confidence tiers" {
-    var cats: [10][]const u8 = undefined;
-    var confs: [10]tools.CapConfidence = undefined;
+    var cats: [tools.MAX_CAP_CATS][]const u8 = undefined;
+    var confs: [tools.MAX_CAP_CATS]tools.CapConfidence = undefined;
 
     const n1 = tools.categorizeCapabilityWithConfidence("-----BEGIN PRIVATE KEY-----", &cats, &confs);
     try testing.expect(n1 >= 1);
@@ -1166,6 +1180,141 @@ test "v7.6.1 — categorizeCapability confidence tiers" {
             try testing.expect(conf == .high);
         }
     }
+}
+
+fn capHasCategory(s: []const u8, want: []const u8) bool {
+    var cats: [tools.MAX_CAP_CATS][]const u8 = undefined;
+    const n = tools.categorizeCapability(s, &cats);
+    for (cats[0..n]) |c| {
+        if (std.mem.eql(u8, c, want)) return true;
+    }
+    return false;
+}
+
+test "v7.16 — modern app-surface categories fire on real markers" {
+    // telemetry_event
+    try testing.expect(capHasCategory("tengu_startup_complete", "telemetry_event"));
+    try testing.expect(capHasCategory("posthog_capture", "telemetry_event"));
+    // env_toggle
+    try testing.expect(capHasCategory("CLAUDE_CODE_SAFE_MODE", "env_toggle"));
+    try testing.expect(capHasCategory("DISABLE_AUTOUPDATER", "env_toggle"));
+    try testing.expect(capHasCategory("ELECTRON_RUN_AS_NODE", "env_toggle"));
+    // model_id
+    try testing.expect(capHasCategory("claude-fable-5", "model_id"));
+    try testing.expect(capHasCategory("claude-opus-4-8", "model_id"));
+    try testing.expect(capHasCategory("gpt-4o", "model_id"));
+    // mcp_tool
+    try testing.expect(capHasCategory("mcp__phora__load_binary", "mcp_tool"));
+    // oauth_scope
+    try testing.expect(capHasCategory("user:inference", "oauth_scope"));
+    try testing.expect(capHasCategory("org:read", "oauth_scope"));
+    // api_path
+    try testing.expect(capHasCategory("/api/organizations/%s/completion", "api_path"));
+    try testing.expect(capHasCategory("/v1/messages", "api_path"));
+}
+
+test "v7.16 — modern app-surface categories reject false positives" {
+    // env_toggle must not match prose or non-env-shaped tokens
+    try testing.expect(!capHasCategory("Please ENABLE the feature in settings", "env_toggle"));
+    try testing.expect(!capHasCategory("claude-code", "env_toggle"));
+    // model_id needs a digit — a product/surface name without one is not a model
+    try testing.expect(!capHasCategory("claude-coworker", "model_id"));
+    try testing.expect(!capHasCategory("claude-community", "model_id"));
+    // oauth_scope must reject C++ scope resolution, drive letters, timestamps, URLs
+    try testing.expect(!capHasCategory("std::vector", "oauth_scope"));
+    try testing.expect(!capHasCategory("C:/Windows", "oauth_scope"));
+    try testing.expect(!capHasCategory("12:34:56", "oauth_scope"));
+    try testing.expect(!capHasCategory("https://example.com", "oauth_scope"));
+    // api_path must reject filesystem/library paths
+    try testing.expect(!capHasCategory("/usr/lib/libSystem.dylib", "api_path"));
+    try testing.expect(!capHasCategory("/System/Library/Frameworks/Foundation.framework", "api_path"));
+}
+
+test "v7.16 — release_diff produces new-only headlines + changelog tagging" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var store = tools.DocumentStore.init(allocator, std.testing.io);
+    const ctx = tools.ToolContext{ .io = std.testing.io, .store = &store, .session_id = "t", .allocator = allocator };
+
+    var lp1 = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try lp1.object.put(std.heap.page_allocator, "path", std.json.Value{ .string = "/bin/ls" });
+    const l1 = tools.dispatch(ctx, "load_binary", lp1) catch return;
+    if (l1.is_error) return;
+    var lp2 = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try lp2.object.put(std.heap.page_allocator, "path", std.json.Value{ .string = "/usr/bin/ssh" });
+    const l2 = tools.dispatch(ctx, "load_binary", lp2) catch return;
+    if (l2.is_error) return;
+
+    var rp = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try rp.object.put(std.heap.page_allocator, "doc_id_old", std.json.Value{ .integer = 1 });
+    try rp.object.put(std.heap.page_allocator, "doc_id_new", std.json.Value{ .integer = 2 });
+    try rp.object.put(std.heap.page_allocator, "changelog", std.json.Value{ .string = "supports password authentication" });
+    const rd = try tools.dispatch(ctx, "release_diff", rp);
+    try testing.expect(!rd.is_error);
+    // Valid JSON + the expected shape; ssh has credential/crypto markers ls lacks.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, rd.json_response, .{});
+    defer parsed.deinit();
+    try testing.expect(std.mem.indexOf(u8, rd.json_response, "\"headlines\":[") != null);
+    try testing.expect(std.mem.indexOf(u8, rd.json_response, "\"lens\":\"new_only\"") != null);
+    try testing.expect(std.mem.indexOf(u8, rd.json_response, "\"category\":\"credential\"") != null);
+}
+
+test "v7.16 — read_bytes accepts a raw file_offset" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var store = tools.DocumentStore.init(allocator, std.testing.io);
+    const ctx = tools.ToolContext{ .io = std.testing.io, .store = &store, .session_id = "test-session", .allocator = allocator };
+
+    var load_params = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try load_params.object.put(std.heap.page_allocator, "path", std.json.Value{ .string = "/bin/ls" });
+    const loaded = tools.dispatch(ctx, "load_binary", load_params) catch return; // skip if /bin/ls unavailable
+    if (loaded.is_error) return;
+
+    var rb_params = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try rb_params.object.put(std.heap.page_allocator, "file_offset", std.json.Value{ .integer = 0 });
+    try rb_params.object.put(std.heap.page_allocator, "length", std.json.Value{ .integer = 8 });
+    const rb = try tools.dispatch(ctx, "read_bytes", rb_params);
+    try testing.expect(!rb.is_error);
+    // Response is valid JSON and echoes the file_offset + an 8-byte read.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, rb.json_response, .{});
+    defer parsed.deinit();
+    try testing.expect(std.mem.indexOf(u8, rb.json_response, "\"file_offset\":0") != null);
+    try testing.expect(std.mem.indexOf(u8, rb.json_response, "\"length\":8") != null);
+}
+
+test "v7.16 — detectBundleStrings is bounded and streams packed segments" {
+    const allocator = testing.allocator;
+
+    // A synthetic __BUN section with several printable runs separated by NULs.
+    const data = "tengu_alpha\x00CLAUDE_CODE_X\x00claude-fable-5\x00zz\x00/api/v1/x\x00";
+    var sections = [_]types.Section{.{ .name = "__bundle", .start = 0x1000, .length = data.len, .file_offset = 0 }};
+    var segments = [_]types.Segment{.{
+        .name = "__BUN",
+        .start = 0x1000,
+        .length = data.len,
+        .sections = sections[0..],
+        .permissions = .{ .read = true, .write = false, .execute = false },
+        .file_offset = 0,
+        .file_size = data.len,
+    }};
+    var doc = types.Document.init(allocator, 1, "synthetic", data);
+    defer doc.deinit();
+    doc.segments = segments[0..];
+
+    // min_length=3 drops the "zz" run; cap of 2 proves the bound is honored.
+    var capped = try strings_mod.detectBundleStrings(allocator, &doc, 3, 2);
+    defer capped.deinit();
+    try testing.expectEqual(@as(usize, 2), capped.items.len);
+
+    var full = try strings_mod.detectBundleStrings(allocator, &doc, 3, 1000);
+    defer full.deinit();
+    // tengu_alpha, CLAUDE_CODE_X, claude-fable-5, /api/v1/x  (zz is < 3 chars)
+    try testing.expectEqual(@as(usize, 4), full.items.len);
+    try testing.expectEqualStrings("tengu_alpha", full.items[0].value);
 }
 
 // ============================================================================
@@ -1223,7 +1372,7 @@ test "PLT fix — callers_of import resolves through stub" {
     // Don't hard-fail — this depends on the specific binary's stub layout
 }
 
-test "x86_64 pack — no ARM64 garble in pseudocode" {
+test "x86_64 pack — no ARM64 garble in instruction evidence" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -1332,7 +1481,7 @@ test "raw file — synthetic segment appears in get_segments" {
 }
 
 // ============================================================================
-// v7.8.0 — W5 (PLT-in-pseudocode) + W7 (decompile tool)
+// Shared integration fixture helpers
 // ============================================================================
 
 /// Helper: load /bin/ls via the MCP handler and return the store + ctx for the test.
@@ -1349,142 +1498,6 @@ fn setupLsArena(allocator: std.mem.Allocator) !?struct {
     const r = tools.dispatch(ctx, "load_binary", load_params) catch return null;
     if (r.is_error) return null;
     return .{ .store = store, .ctx = ctx };
-}
-
-test "decompile — PLT call renders as import name" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const setup = (try setupLsArena(allocator)) orelse return;
-
-    // Use the Mach-O entry point — it's guaranteed to be a real procedure.
-    const entry_addr = setup.store.get(1).?.doc.entry_point;
-    if (entry_addr == 0) return;
-
-    var params = std.json.Value{ .object = std.json.ObjectMap.empty };
-    try params.object.put(std.heap.page_allocator, "doc_id", std.json.Value{ .integer = 1 });
-    const hex_addr = try std.fmt.allocPrint(allocator, "0x{x}", .{entry_addr});
-    try params.object.put(std.heap.page_allocator, "address", std.json.Value{ .string = hex_addr });
-    try params.object.put(std.heap.page_allocator, "scope", std.json.Value{ .string = "single" });
-    try params.object.put(std.heap.page_allocator, "include_types", std.json.Value{ .bool = true });
-
-    const result = try tools.dispatch(setup.ctx, "decompile", params);
-    try testing.expect(!result.is_error);
-
-    // Must contain the decompilation header
-    try testing.expect(std.mem.indexOf(u8, result.json_response, "decompiled by phora") != null);
-    // Must have "resolved_calls" array (may be empty in tiny entry points, but key present)
-    try testing.expect(std.mem.indexOf(u8, result.json_response, "\"resolved_calls\"") != null);
-    // Must report char_count
-    try testing.expect(std.mem.indexOf(u8, result.json_response, "\"char_count\"") != null);
-
-    // Regression: a raw "0x" call target should NOT appear inside the decompilation
-    // for an entry-function that actually calls any resolved PLT stub. Skip the
-    // assertion entirely if the function happens to call nothing (tiny binaries).
-    if (std.mem.indexOf(u8, result.json_response, "\"source\":\"plt\"") != null or
-        std.mem.indexOf(u8, result.json_response, "\"source\":\"import\"") != null)
-    {
-        // At least one call was resolved — confirm the decompilation body
-        // doesn't still show raw `0x...(` call syntax for THAT specific call.
-        // (We don't strictly fail here — some calls may be indirect — but we
-        // want some symbolic call syntax visible.)
-        const has_any_name_call =
-            std.mem.indexOf(u8, result.json_response, "strcmp(") != null or
-            std.mem.indexOf(u8, result.json_response, "strlen(") != null or
-            std.mem.indexOf(u8, result.json_response, "malloc(") != null or
-            std.mem.indexOf(u8, result.json_response, "free(") != null or
-            std.mem.indexOf(u8, result.json_response, "printf(") != null or
-            std.mem.indexOf(u8, result.json_response, "exit(") != null or
-            // any underscore-prefixed libc name followed by '('
-            std.mem.indexOf(u8, result.json_response, "_stack_chk") != null or
-            std.mem.indexOf(u8, result.json_response, "__") != null;
-        // Soft check — if this ever fails, we can tighten it.
-        _ = has_any_name_call;
-    }
-}
-
-test "decompile — with scope=cluster returns multiple functions" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const setup = (try setupLsArena(allocator)) orelse return;
-
-    // Pick a procedure likely to call others — iterate the DB for one with >=2
-    // outgoing call xrefs.
-    const entry_doc = setup.store.get(1).?;
-    const eff_db = &entry_doc.db;
-
-    var chosen_addr: ?u64 = 0;
-    chosen_addr = entry_doc.doc.entry_point;
-    // Fallback: iterate procs and pick one with >32-byte body.
-    var proc_it = eff_db.procedures.iterator();
-    while (proc_it.next()) |pe| {
-        if (pe.value_ptr.size > 64) {
-            chosen_addr = pe.value_ptr.entry;
-            break;
-        }
-    }
-    if (chosen_addr == null or chosen_addr.? == 0) return;
-
-    var params = std.json.Value{ .object = std.json.ObjectMap.empty };
-    try params.object.put(std.heap.page_allocator, "doc_id", std.json.Value{ .integer = 1 });
-    const hex_addr = try std.fmt.allocPrint(allocator, "0x{x}", .{chosen_addr.?});
-    try params.object.put(std.heap.page_allocator, "address", std.json.Value{ .string = hex_addr });
-    try params.object.put(std.heap.page_allocator, "scope", std.json.Value{ .string = "cluster" });
-    try params.object.put(std.heap.page_allocator, "max_cluster", std.json.Value{ .integer = 5 });
-
-    const result = try tools.dispatch(setup.ctx, "decompile", params);
-    try testing.expect(!result.is_error);
-
-    // The summary line reports "<N> functions". We accept any N >= 1 for now —
-    // on binaries with no recovered callees it can legitimately be 1.
-    try testing.expect(std.mem.indexOf(u8, result.json_response, "functions") != null);
-    try testing.expect(std.mem.indexOf(u8, result.json_response, "\"decompilation\"") != null);
-}
-
-test "decompile — max_chars truncation sets truncated:true" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const setup = (try setupLsArena(allocator)) orelse return;
-    const entry_addr = setup.store.get(1).?.doc.entry_point;
-    if (entry_addr == 0) return;
-
-    // Request a tiny cap (1000 is the schema minimum). If the decompilation
-    // body exceeds 1000 chars, truncated must be true. On very short entry
-    // functions this test degrades to a soft no-op.
-    var params = std.json.Value{ .object = std.json.ObjectMap.empty };
-    try params.object.put(std.heap.page_allocator, "doc_id", std.json.Value{ .integer = 1 });
-    const hex_addr = try std.fmt.allocPrint(allocator, "0x{x}", .{entry_addr});
-    try params.object.put(std.heap.page_allocator, "address", std.json.Value{ .string = hex_addr });
-    try params.object.put(std.heap.page_allocator, "scope", std.json.Value{ .string = "cluster" });
-    try params.object.put(std.heap.page_allocator, "max_cluster", std.json.Value{ .integer = 10 });
-    try params.object.put(std.heap.page_allocator, "max_chars", std.json.Value{ .integer = 1000 });
-
-    const result = try tools.dispatch(setup.ctx, "decompile", params);
-    try testing.expect(!result.is_error);
-
-    // char_count must be reported.
-    try testing.expect(std.mem.indexOf(u8, result.json_response, "\"char_count\"") != null);
-    // If char_count > 1000 we must see truncated:true; otherwise either is fine.
-    if (std.mem.indexOf(u8, result.json_response, "\"truncated\":true") == null) {
-        // Soft pass: the entry function + cluster fit in 1000 chars.
-    }
-}
-
-test "decompile — tool is routed via dispatch" {
-    // Compile-time smoke: decompile must be in the tool list.
-    var found = false;
-    for (tools.tool_definitions) |def| {
-        if (std.mem.eql(u8, def.name, "decompile")) {
-            found = true;
-            break;
-        }
-    }
-    try testing.expect(found);
 }
 
 // ============================================================================
@@ -1547,157 +1560,8 @@ test "x86_64 decoded instruction survives Database.addInstruction round-trip (H3
 }
 
 // ============================================================================
-// v7.8.1 H1 hotfix — decompile renderer regression tests (B1, B5, B6, B7)
+// Integration fixture helpers
 // ============================================================================
-
-test "decompile B1+B5: resolved_calls populated; saved/frame regs excluded from params" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const setup = (try setupLsArena(allocator)) orelse return;
-
-    // Pick a procedure with at least 64-byte body — likely to call out.
-    const eff_db = &setup.store.get(1).?.db;
-    var chosen_addr: u64 = setup.store.get(1).?.doc.entry_point;
-    var proc_it = eff_db.procedures.iterator();
-    while (proc_it.next()) |pe| {
-        if (pe.value_ptr.size >= 64) {
-            chosen_addr = pe.value_ptr.entry;
-            break;
-        }
-    }
-    if (chosen_addr == 0) return;
-
-    var params = std.json.Value{ .object = std.json.ObjectMap.empty };
-    try params.object.put(std.heap.page_allocator, "doc_id", std.json.Value{ .integer = 1 });
-    const hex_addr = try std.fmt.allocPrint(allocator, "0x{x}", .{chosen_addr});
-    try params.object.put(std.heap.page_allocator, "address", std.json.Value{ .string = hex_addr });
-    try params.object.put(std.heap.page_allocator, "scope", std.json.Value{ .string = "cluster" });
-    try params.object.put(std.heap.page_allocator, "max_cluster", std.json.Value{ .integer = 5 });
-
-    const result = try tools.dispatch(setup.ctx, "decompile", params);
-    try testing.expect(!result.is_error);
-
-    // B5: function signatures must NOT list frame_ptr / link_reg / saved_xN
-    // as parameters. The signature is rendered as
-    //   `uint64_t fname_0xADDR(uint64_t arg0, ...)` — so the bad pattern is
-    // `uint64_t <name>` preceded by either `(` or `, `. Soft-check: the
-    // simplest is just "uint64_t frame_ptr" which only appears in a sig.
-    try testing.expect(std.mem.indexOf(u8, result.json_response, "uint64_t frame_ptr") == null);
-    try testing.expect(std.mem.indexOf(u8, result.json_response, "uint64_t link_reg") == null);
-    try testing.expect(std.mem.indexOf(u8, result.json_response, "uint64_t saved_x") == null);
-    try testing.expect(std.mem.indexOf(u8, result.json_response, "uint64_t stack_ptr") == null);
-
-    // B1: when resolved_calls is non-empty, every entry's source must be one
-    // of the canonical kinds (plt/import/local/user_annotation/unresolved).
-    if (std.mem.indexOf(u8, result.json_response, "\"resolved_calls\":[{") != null) {
-        const has_known_source =
-            std.mem.indexOf(u8, result.json_response, "\"source\":\"plt\"") != null or
-            std.mem.indexOf(u8, result.json_response, "\"source\":\"import\"") != null or
-            std.mem.indexOf(u8, result.json_response, "\"source\":\"local\"") != null or
-            std.mem.indexOf(u8, result.json_response, "\"source\":\"user_annotation\"") != null or
-            std.mem.indexOf(u8, result.json_response, "\"source\":\"unresolved\"") != null;
-        try testing.expect(has_known_source);
-    }
-}
-
-test "decompile B6: at least one /bin/ls function emits a return statement" {
-    // B6 fix: when a block's IR terminator is `return`, the renderer must
-    // emit a visible `return ...;` line so the function epilogue is part
-    // of the C-like output. Pre-fix, structured CF rendering swallowed `ret`
-    // instructions silently. Most real C functions have a `ret` epilogue;
-    // we walk a sample of /bin/ls's procedures and assert at least one
-    // produces a `return` line.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const setup = (try setupLsArena(allocator)) orelse return;
-    const eff_db = &setup.store.get(1).?.db;
-
-    var procs_to_try = std.array_list.Managed(u64).init(allocator);
-    defer procs_to_try.deinit();
-    var proc_it = eff_db.procedures.iterator();
-    while (proc_it.next()) |pe| {
-        if (pe.value_ptr.size >= 32 and pe.value_ptr.size < 4096)
-            try procs_to_try.append(pe.value_ptr.entry);
-        if (procs_to_try.items.len >= 20) break;
-    }
-    if (procs_to_try.items.len == 0) return;
-
-    var found_return = false;
-    for (procs_to_try.items) |addr| {
-        var params = std.json.Value{ .object = std.json.ObjectMap.empty };
-        try params.object.put(std.heap.page_allocator, "doc_id", std.json.Value{ .integer = 1 });
-        const hex_addr = try std.fmt.allocPrint(allocator, "0x{x}", .{addr});
-        try params.object.put(std.heap.page_allocator, "address", std.json.Value{ .string = hex_addr });
-        try params.object.put(std.heap.page_allocator, "scope", std.json.Value{ .string = "single" });
-        // Skip type recovery to dodge a pre-existing latent crash in
-        // analysis/types.zig:393 on some procedures — unrelated to B6.
-        try params.object.put(std.heap.page_allocator, "include_types", std.json.Value{ .bool = false });
-        const result = tools.dispatch(setup.ctx, "decompile", params) catch continue;
-        if (result.is_error) continue;
-        if (std.mem.indexOf(u8, result.json_response, "return") != null) {
-            found_return = true;
-            break;
-        }
-    }
-    try testing.expect(found_return);
-}
-
-test "decompile B7: control chars escape to \\xNN inside the body" {
-    // B7 specifically targets newlines/tabs/quotes/backslashes inside string
-    // literals that flow into operand text. The strongest portable check is:
-    // scan the JSON response and verify it never contains a raw newline or
-    // tab byte INSIDE a JSON string. (Outside strings JSON has only spaces.)
-    // We also confirm the response is non-empty and the decompilation key is
-    // present.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const setup = (try setupLsArena(allocator)) orelse return;
-    const entry_addr = setup.store.get(1).?.doc.entry_point;
-    if (entry_addr == 0) return;
-
-    var params = std.json.Value{ .object = std.json.ObjectMap.empty };
-    try params.object.put(std.heap.page_allocator, "doc_id", std.json.Value{ .integer = 1 });
-    const hex_addr = try std.fmt.allocPrint(allocator, "0x{x}", .{entry_addr});
-    try params.object.put(std.heap.page_allocator, "address", std.json.Value{ .string = hex_addr });
-    try params.object.put(std.heap.page_allocator, "scope", std.json.Value{ .string = "cluster" });
-    try params.object.put(std.heap.page_allocator, "max_cluster", std.json.Value{ .integer = 10 });
-
-    const result = try tools.dispatch(setup.ctx, "decompile", params);
-    try testing.expect(!result.is_error);
-
-    // Walk the response and assert no raw newline byte appears inside a
-    // double-quoted JSON string. This is the property B7 is meant to
-    // guarantee — any \n in a string literal must be escaped to \\n.
-    var in_str = false;
-    var escape_next = false;
-    for (result.json_response) |c| {
-        if (escape_next) {
-            escape_next = false;
-            continue;
-        }
-        if (in_str) {
-            if (c == '\\') {
-                escape_next = true;
-            } else if (c == '"') {
-                in_str = false;
-            } else if (c == '\n' or c == '\r' or c == '\t') {
-                // RAW control char inside a JSON string — B7 violation.
-                try testing.expect(false);
-            }
-        } else {
-            if (c == '"') in_str = true;
-        }
-    }
-
-    // Sanity: response must have a decompilation key.
-    try testing.expect(std.mem.indexOf(u8, result.json_response, "\"decompilation\"") != null);
-}
 
 // ============================================================================
 // v7.9.3 W3 — regression tests deferred from v7.9.2
@@ -1726,114 +1590,105 @@ fn setupPathArena(
     return .{ .store = store, .ctx = ctx };
 }
 
-test "B8 (v7.9.3 W3.1): matured IR surfaces stack_<N> in /bin/ls main decompile" {
-    // v7.9.2 Wave V swapped ensureLiftedIR → liftProcedureMature so maturity
-    // passes (stack_slot / reg_to_var / call_arg_fixup) run on the IR before
-    // it hits the renderer. Guard against accidental revert that would re-
-    // hide all stack_<N> symbols from decompile output.
-    //
-    // We scan a handful of mid-sized procedures in /bin/ls — at least one
-    // should produce a `stack_<digit>` token post-v7.9.2. Before v7.9.2 this
-    // token never appeared in any decompile output.
+test "B8: matured IR names proven stable stack slots through the tool API" {
+    // Host functions usually change SP or contain unknown effects. Those must
+    // retain raw addressing; they cannot establish globally stable stack slots.
+    // A fixed STR/LDR/RET fixture verifies that the maturity pipeline is wired
+    // into lift while giving the stack-slot pass its required stable SP.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-
-    const setup = (try setupLsArena(allocator)) orelse return;
-    const eff_db = &setup.store.get(1).?.db;
-
-    // Pick up to 30 procedures in a reasonable size range and try each.
-    var candidates = std.array_list.Managed(u64).init(allocator);
-    defer candidates.deinit();
-    var proc_it = eff_db.procedures.iterator();
-    while (proc_it.next()) |pe| {
-        if (pe.value_ptr.size >= 64 and pe.value_ptr.size < 4096) {
-            try candidates.append(pe.value_ptr.entry);
-        }
-        if (candidates.items.len >= 30) break;
-    }
-    if (candidates.items.len == 0) return;
-
-    var found_stack_slot = false;
-    for (candidates.items) |addr| {
-        var params = std.json.Value{ .object = std.json.ObjectMap.empty };
-        try params.object.put(std.heap.page_allocator, "doc_id", std.json.Value{ .integer = 1 });
-        const hex_addr = try std.fmt.allocPrint(allocator, "0x{x}", .{addr});
-        try params.object.put(std.heap.page_allocator, "address", std.json.Value{ .string = hex_addr });
-        try params.object.put(std.heap.page_allocator, "scope", std.json.Value{ .string = "single" });
-        // Skip type recovery: it has a pre-existing latent issue on some
-        // procs and is unrelated to the stack_slot check.
-        try params.object.put(std.heap.page_allocator, "include_types", std.json.Value{ .bool = false });
-        const result = tools.dispatch(setup.ctx, "decompile", params) catch continue;
-        if (result.is_error) continue;
-
-        // Look for /\bstack_\d+\b/. Scan once: find "stack_" then verify the
-        // following char is an ASCII digit and the preceding char isn't an
-        // identifier char.
-        var idx: usize = 0;
-        while (std.mem.indexOfPos(u8, result.json_response, idx, "stack_")) |pos| {
-            const after = pos + "stack_".len;
-            if (after < result.json_response.len and std.ascii.isDigit(result.json_response[after])) {
-                const prev_ok = pos == 0 or !(std.ascii.isAlphanumeric(result.json_response[pos - 1]) or result.json_response[pos - 1] == '_');
-                if (prev_ok) {
-                    found_stack_slot = true;
-                    break;
-                }
-            }
-            idx = pos + 1;
-        }
-        if (found_stack_slot) break;
-    }
-
-    try testing.expect(found_stack_slot);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const words = [_]u32{ 0xf9000be0, 0xf9400be0, 0xd65f03c0 };
+    var data: [12]u8 = undefined;
+    for (words, 0..) |word, i| std.mem.writeInt(u32, data[i * 4 ..][0..4], word, .little);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "stable-stack", .data = &data });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "stable-stack", allocator);
+    const params_text = try std.fmt.allocPrint(allocator, "{{\"path\":\"{s}\",\"options\":{{\"arch\":\"arm64\",\"base\":4096,\"entry\":4096}}}}", .{path});
+    var store = tools.DocumentStore.init(allocator, std.testing.io);
+    const ctx = tools.ToolContext{ .io = std.testing.io, .store = &store, .session_id = "stable-stack", .allocator = allocator };
+    const load_params = try std.json.parseFromSlice(std.json.Value, allocator, params_text, .{});
+    const loaded = try tools.dispatch(ctx, "load_binary", load_params.value);
+    try testing.expect(!loaded.is_error);
+    const params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"doc_id\":1,\"addresses\":4096}", .{});
+    const lifted = try tools.dispatch(ctx, "lift", params.value);
+    try testing.expect(!lifted.is_error);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, lifted.json_response, .{});
+    const result = parsed.value.object.get("results").?.array.items[0].object.get("result").?;
+    const statements = result.object.get("statements").?.array.items;
+    try testing.expectEqual(@as(usize, 3), statements.len);
+    try testing.expectEqualStrings("store", statements[0].object.get("type").?.string);
+    try testing.expectEqualStrings("stack_0", statements[0].object.get("dest").?.string);
+    try testing.expectEqualStrings("load", statements[1].object.get("type").?.string);
+    try testing.expectEqualStrings("stack_0", statements[1].object.get("src").?.string);
 }
 
-test "B9 (v7.9.3 W3.2): call_arg_fixup produces non-empty arg lists on /bin/bash" {
-    // v7.9.2 maturity passes include call_arg_fixup, which should populate
-    // call-site argument lists so we see rendering like `_fname(arg0, arg1)`
-    // rather than bare `_fname()`. Scan a sample of /bin/bash procedures.
-    // If /bin/bash isn't present on the host system, the
-    // test is a no-op — same soft-skip convention as other integration tests.
+test "B9: raw ARM64 calls retain unknown argument evidence through the tool API" {
+    // Display aliases and sparse writes cannot establish ABI, arity or a
+    // prototype. An opaque instruction also blocks historical argument values.
+    // Verify both cached IR and serialized statements using fixed machine code.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const words = [_]u32{
+        0xd2800020, // mov x0,#1
+        0xd28000a3, // mov x3,#5 (sparse positional alias write)
+        0x9400000e, // bl0x1040
+        0xd2800123, // mov x3,#9
+        0x1e202800, // unmodeled scalar FP effects: opaque dataflow barrier
+        0x9400000b, // bl0x1040 after opaque effects
+        0xd65f03c0, // ret
+    };
+    var data: [68]u8 = @splat(0);
+    for (words, 0..) |word, i| std.mem.writeInt(u32, data[i * 4 ..][0..4], word, .little);
+    std.mem.writeInt(u32, data[64..][0..4], 0xd65f03c0, .little); // callee ret
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "unknown-call-args", .data = &data });
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "unknown-call-args", allocator);
+    const params_text = try std.fmt.allocPrint(allocator, "{{\"path\":\"{s}\",\"options\":{{\"arch\":\"arm64\",\"base\":4096,\"entry\":4096}}}}", .{path});
+    var store = tools.DocumentStore.init(allocator, std.testing.io);
+    defer store.deinit();
+    const ctx = tools.ToolContext{ .io = std.testing.io, .store = &store, .session_id = "unknown-call-args", .allocator = allocator };
+    const load_params = try std.json.parseFromSlice(std.json.Value, allocator, params_text, .{});
+    const loaded = try tools.dispatch(ctx, "load_binary", load_params.value);
+    try testing.expect(!loaded.is_error);
+    const params = try std.json.parseFromSlice(std.json.Value, allocator, "{\"doc_id\":1,\"addresses\":4096}", .{});
+    const lifted = try tools.dispatch(ctx, "lift", params.value);
+    try testing.expect(!lifted.is_error);
 
-    const setup = (try setupPathArena(allocator, "/bin/bash", null)) orelse return;
-    const eff_db = &setup.store.get(1).?.db;
-
-    var candidates = std.array_list.Managed(u64).init(allocator);
-    defer candidates.deinit();
-    var proc_it = eff_db.procedures.iterator();
-    while (proc_it.next()) |pe| {
-        if (pe.value_ptr.size >= 64 and pe.value_ptr.size < 8192)
-            try candidates.append(pe.value_ptr.entry);
-        if (candidates.items.len >= 50) break;
-    }
-    if (candidates.items.len == 0) return;
-
-    // Look for a call with a non-empty argument list: `(` followed by
-    // a non-`)` non-space, non-newline char. Crude but effective: scan for
-    // "(arg" or "(0x" or "(&" etc.
-    var found_nonempty_call = false;
-    for (candidates.items) |addr| {
-        var params = std.json.Value{ .object = std.json.ObjectMap.empty };
-        try params.object.put(std.heap.page_allocator, "doc_id", std.json.Value{ .integer = 1 });
-        const hex_addr = try std.fmt.allocPrint(allocator, "0x{x}", .{addr});
-        try params.object.put(std.heap.page_allocator, "address", std.json.Value{ .string = hex_addr });
-        try params.object.put(std.heap.page_allocator, "scope", std.json.Value{ .string = "single" });
-        try params.object.put(std.heap.page_allocator, "include_types", std.json.Value{ .bool = false });
-        const result = tools.dispatch(setup.ctx, "decompile", params) catch continue;
-        if (result.is_error) continue;
-
-        // Look for any `(arg` signal — call_arg_fixup renames positional call
-        // args to `arg0`, `arg1`, etc. when it can't find a better name.
-        if (std.mem.indexOf(u8, result.json_response, "(arg") != null) {
-            found_nonempty_call = true;
-            break;
+    const function = store.get(1).?.db.getCachedIR(4096) orelse return error.TestExpectedCachedIR;
+    var ir_calls: usize = 0;
+    var retained_opaque = false;
+    for (function.statements) |stmt| {
+        if (stmt.type == .call) {
+            const expected_address: u64 = if (ir_calls == 0) 0x1008 else 0x1014;
+            try testing.expectEqual(expected_address, stmt.address);
+            try testing.expect(stmt.target != null);
+            try testing.expect(stmt.args == null);
+            ir_calls += 1;
         }
+        if (stmt.address == 0x1010) retained_opaque = stmt.type == .@"opaque";
     }
+    try testing.expectEqual(@as(usize, 2), ir_calls);
+    try testing.expect(retained_opaque);
 
-    try testing.expect(found_nonempty_call);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, lifted.json_response, .{});
+    const item = parsed.value.object.get("results").?.array.items[0];
+    try testing.expect(item.object.get("success").?.bool);
+    const statements = item.object.get("result").?.object.get("statements").?.array.items;
+    var json_calls: usize = 0;
+    for (statements) |statement| {
+        if (!std.mem.eql(u8, statement.object.get("type").?.string, "call")) continue;
+        try testing.expectEqualStrings(if (json_calls == 0) "0x1008" else "0x1014", statement.object.get("address").?.string);
+        try testing.expect(statement.object.get("target") != null);
+        try testing.expectEqualStrings("unknown", statement.object.get("arguments_status").?.string);
+        // Missing evidence must not become an empty, zero-parameter argument list.
+        try testing.expect(statement.object.get("args") == null);
+        json_calls += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), json_calls);
 }
 
 test "B10 (v7.9.3 W3.3): stack_slot + reg_to_var coexist on /usr/sbin/sshd — no raw [sp+/- in body" {
@@ -1841,8 +1696,8 @@ test "B10 (v7.9.3 W3.3): stack_slot + reg_to_var coexist on /usr/sbin/sshd — n
     // accesses. After v7.9.2 every `[sp+N]` / `[sp-N]` form should be rewritten
     // to `stack_<N>` by the stack_slot pass, and reg_to_var should produce
     // named locals (`v0`, `v1`, ...). We assert:
-    //   (a) at least one procedure's decompile produces a `stack_<N>` token;
-    //   (b) within a procedure's decompilation.body, no raw `[sp+` or `[sp-`
+    //   (a) at least one procedure's IR produces a `stack_<N>` token;
+    //   (b) within a procedure's IR, no raw `[sp+` or `[sp-`
     //       appears (indicating the pass ran to completion).
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1867,10 +1722,8 @@ test "B10 (v7.9.3 W3.3): stack_slot + reg_to_var coexist on /usr/sbin/sshd — n
         var params = std.json.Value{ .object = std.json.ObjectMap.empty };
         try params.object.put(std.heap.page_allocator, "doc_id", std.json.Value{ .integer = 1 });
         const hex_addr = try std.fmt.allocPrint(allocator, "0x{x}", .{addr});
-        try params.object.put(std.heap.page_allocator, "address", std.json.Value{ .string = hex_addr });
-        try params.object.put(std.heap.page_allocator, "scope", std.json.Value{ .string = "single" });
-        try params.object.put(std.heap.page_allocator, "include_types", std.json.Value{ .bool = false });
-        const result = tools.dispatch(setup.ctx, "decompile", params) catch continue;
+        try params.object.put(std.heap.page_allocator, "addresses", std.json.Value{ .string = hex_addr });
+        const result = tools.dispatch(setup.ctx, "lift", params) catch continue;
         if (result.is_error) continue;
 
         const body = result.json_response;
@@ -1886,7 +1739,7 @@ test "B10 (v7.9.3 W3.3): stack_slot + reg_to_var coexist on /usr/sbin/sshd — n
             }
         }
         // Raw `[sp+` / `[sp-` must not appear anywhere in the response. The
-        // JSON envelope itself never contains `[sp` — only renderer output
+        // JSON envelope itself never contains `[sp` — only IR output
         // could emit it — so a direct substring search is a valid end-to-end
         // signal that the stack_slot pass consumed every sp-relative addr.
         const has_raw_sp_plus = std.mem.indexOf(u8, body, "[sp+") != null;
@@ -2485,28 +2338,27 @@ test "B19 (v7.12 W4): tool order — load_binary first, get_binary_context secon
     try testing.expectEqualStrings("load_binary", tools.tool_definitions[0].name);
     try testing.expectEqualStrings("get_binary_context", tools.tool_definitions[1].name);
     try testing.expectEqualStrings("get_remake_frontier", tools.tool_definitions[2].name);
-    try testing.expectEqualStrings("decompile", tools.tool_definitions[3].name);
-    try testing.expectEqualStrings("get_semantic_slice", tools.tool_definitions[4].name);
-    try testing.expectEqualStrings("search", tools.tool_definitions[5].name);
+    try testing.expectEqualStrings("get_semantic_slice", tools.tool_definitions[3].name);
+    try testing.expectEqualStrings("search", tools.tool_definitions[4].name);
 }
 
-test "B20 (v7.11 W7): tool count is still 32 (reorder did not drop entries)" {
+test "B20 (v7.11 W7): tool count is 32 after renderer removal" {
     try testing.expectEqual(@as(usize, 32), tools.tool_definitions.len);
 
     // Re-verify every name from the W7 ordering is present (plus v7.12 W4
     // adds `get_binary_context`).
     const expected_names = [_][]const u8{
-        "load_binary",            "get_binary_context", "get_remake_frontier",
-        "decompile",              "get_semantic_slice", "search",
-        "suggest_names",          "annotate",           "save_project",
-        "load_project",           "list_documents",     "get_strings",
-        "get_imports",            "get_exports",        "get_xrefs",
-        "get_call_graph",         "get_cfg",            "lift",
-        "analyze_functions",      "analyze_addresses",  "disassemble_range",
-        "read_bytes",             "get_segments",       "get_hardening_report",
-        "get_embedded_resources", "compare",            "get_dependency_graph",
-        "close_document",         "get_demangled_name", "mark_data_type",
-        "rebase_document",        "export",
+        "load_binary",        "get_binary_context",   "get_remake_frontier",
+        "get_semantic_slice", "search",               "suggest_names",
+        "annotate",           "save_project",         "load_project",
+        "list_documents",     "get_strings",          "get_imports",
+        "get_exports",        "get_xrefs",            "get_call_graph",
+        "get_cfg",            "lift",                 "analyze_functions",
+        "analyze_addresses",  "disassemble_range",    "read_bytes",
+        "get_segments",       "get_hardening_report", "get_embedded_resources",
+        "compare",            "get_dependency_graph", "close_document",
+        "get_demangled_name", "mark_data_type",       "rebase_document",
+        "export",             "release_diff",
     };
     try testing.expectEqual(expected_names.len, tools.tool_definitions.len);
     for (expected_names) |name| {
@@ -2667,26 +2519,25 @@ test "B28 (v7.12 W5): read_bytes hex_compact output is sub-3x raw size" {
 
 test "B29 (v7.12 W5): read_bytes accepts length=65536" {
     // Cap raised from 16384 → 65536. A request at the new cap must succeed
-    // and return up to 65536 bytes (clipped only by segment availability).
+    // and return up to 65536 file bytes. A VA read at the entry point may
+    // legitimately stop at an earlier section boundary.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
     const setup = (try setupLsArena(allocator)) orelse return;
-    const entry_addr = setup.store.get(1).?.doc.entry_point;
-    if (entry_addr == 0) return;
+    const data_length = setup.store.get(1).?.doc.data.len;
 
     var params = std.json.Value{ .object = std.json.ObjectMap.empty };
     try params.object.put(std.heap.page_allocator, "doc_id", std.json.Value{ .integer = 1 });
-    const hex_addr = try std.fmt.allocPrint(allocator, "0x{x}", .{entry_addr});
-    try params.object.put(std.heap.page_allocator, "address", std.json.Value{ .string = hex_addr });
+    try params.object.put(std.heap.page_allocator, "file_offset", std.json.Value{ .integer = 0 });
     try params.object.put(std.heap.page_allocator, "length", std.json.Value{ .integer = 65536 });
     try params.object.put(std.heap.page_allocator, "encoding", std.json.Value{ .string = "hex_compact" });
 
     const result = try tools.dispatch(setup.ctx, "read_bytes", params);
     try testing.expect(!result.is_error);
 
-    // Verify the returned length is greater than the old 16384 cap.
+    // Verify the exact available file length, including the raised cap.
     const len_marker = "\"length\":";
     const len_idx = std.mem.indexOf(u8, result.json_response, len_marker) orelse return error.TestUnexpectedResult;
     const after = result.json_response[len_idx + len_marker.len ..];
@@ -2694,8 +2545,7 @@ test "B29 (v7.12 W5): read_bytes accepts length=65536" {
     while (num_end < after.len and after[num_end] >= '0' and after[num_end] <= '9') num_end += 1;
     try testing.expect(num_end > 0);
     const length_val = try std.fmt.parseInt(u64, after[0..num_end], 10);
-    try testing.expect(length_val > 16384);
-    try testing.expect(length_val <= 65536);
+    try testing.expectEqual(@as(u64, @min(data_length, 65536)), length_val);
 }
 
 // ============================================================================
@@ -2885,44 +2735,6 @@ test "B36 (v7.12 W6): get_strings group_contiguous=true produces block_address/b
     try testing.expect(std.mem.indexOf(u8, result.json_response, "\"text\":") != null);
 }
 
-test "B37 (v7.12 W8a): negative-offset structs use frame_ name (not s_)" {
-    // Indirect check via the analysis/types.zig test suite — synthesize a
-    // function with a negative-offset access on a non-stack-like name and
-    // confirm no struct is fabricated. Pure unit-level exercise of the rule
-    // change is in types.zig tests; here we just exercise the decompile path
-    // on /bin/ls and confirm we don't see `s_NNNN.f_n` patterns in the body.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const setup = (try setupLsArena(allocator)) orelse return;
-    const entry_addr = setup.store.get(1).?.doc.entry_point;
-    if (entry_addr == 0) return;
-
-    var dp = std.json.Value{ .object = std.json.ObjectMap.empty };
-    try dp.object.put(std.heap.page_allocator, "doc_id", std.json.Value{ .integer = 1 });
-    const hex_addr = try std.fmt.allocPrint(allocator, "0x{x}", .{entry_addr});
-    try dp.object.put(std.heap.page_allocator, "address", std.json.Value{ .string = hex_addr });
-    try dp.object.put(std.heap.page_allocator, "scope", std.json.Value{ .string = "single" });
-    const result = try tools.dispatch(setup.ctx, "decompile", dp);
-    try testing.expect(!result.is_error);
-
-    // No `s_NNNN.f_nXX` (s_ struct with negative-offset field) should appear.
-    // Use a quick byte-grep — `.f_n` after a digit is the giveaway.
-    if (std.mem.indexOf(u8, result.json_response, ".f_n")) |idx| {
-        // Walk back to find the parent struct name.
-        if (idx >= 8) {
-            const window = result.json_response[idx - 8 .. idx];
-            // Reject only `s_<digits>.f_n` (positive struct with negative
-            // field). `frame_<N>.f_n` is explicitly allowed.
-            if (std.mem.indexOf(u8, window, "s_") != null and std.mem.indexOf(u8, window, "frame_") == null) {
-                if (!builtin.is_test) std.debug.print("B37 regression: {s}.f_n in decompile body\n", .{window});
-                return error.TestUnexpectedResult;
-            }
-        }
-    }
-}
-
 test "B38 (v7.12 W8b): UDF disasm has no LDR memory operands" {
     // Synthesize a single 4-byte UDF encoding (0x00000000) and decode it.
     // The decoder must produce mnemonic="udf" and EMPTY operands.
@@ -2931,47 +2743,6 @@ test "B38 (v7.12 W8b): UDF disasm has no LDR memory operands" {
     const dec = arm64_arch.decode(&raw, 0x100000000);
     try testing.expectEqualStrings("udf", dec.mnemonic);
     try testing.expectEqual(@as(u8, 0), dec.operands_len);
-}
-
-test "B39 (v7.12 W8c): unresolved internal call shows sub_<addr> not raw hex" {
-    // Decompile /bin/ls main and confirm any local call we couldn't resolve
-    // (mid-function jump into an unnamed proc) shows up as `sub_<hex>` rather
-    // than `0x<hex>(`. The exact format may vary; we just check the prefix.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const setup = (try setupLsArena(allocator)) orelse return;
-    const entry_addr = setup.store.get(1).?.doc.entry_point;
-    if (entry_addr == 0) return;
-
-    var dp = std.json.Value{ .object = std.json.ObjectMap.empty };
-    try dp.object.put(std.heap.page_allocator, "doc_id", std.json.Value{ .integer = 1 });
-    const hex_addr = try std.fmt.allocPrint(allocator, "0x{x}", .{entry_addr});
-    try dp.object.put(std.heap.page_allocator, "address", std.json.Value{ .string = hex_addr });
-    try dp.object.put(std.heap.page_allocator, "scope", std.json.Value{ .string = "single" });
-    const result = try tools.dispatch(setup.ctx, "decompile", dp);
-    try testing.expect(!result.is_error);
-
-    // Look for unresolved-call source markers; if present, the matched name
-    // should NOT begin with "0x" (which would indicate raw hex was used as
-    // the function name).
-    var pos: usize = 0;
-    while (std.mem.indexOfPos(u8, result.json_response, pos, "\"source\":\"unresolved\"")) |found| {
-        // Walk back to find this entry's "name" field.
-        const window_start = if (found >= 200) found - 200 else 0;
-        const window = result.json_response[window_start..found];
-        const name_marker = "\"name\":\"";
-        if (std.mem.lastIndexOf(u8, window, name_marker)) |nm_idx| {
-            const after = window[nm_idx + name_marker.len ..];
-            // First two chars must NOT be "0x" — that would be the bug.
-            if (after.len >= 2 and std.mem.startsWith(u8, after, "0x")) {
-                if (!builtin.is_test) std.debug.print("B39 regression: unresolved call name begins 0x: {s}\n", .{after[0..@min(after.len, 20)]});
-                return error.TestUnexpectedResult;
-            }
-        }
-        pos = found + 1;
-    }
 }
 
 test "B40 (v7.12 W9): backward branch target stays in proc range, not 0xffff..." {
@@ -3531,66 +3302,6 @@ test "B53 (v7.13.0 B8): load_binary path=dyld_shared_cache:Foundation returns va
         return;
     }
     try testing.expect(std.mem.indexOf(u8, load_res.json_response, "\"format\":\"macho\"") != null);
-}
-
-test "B54 (v7.13.1 A1): decompile /bin/mv 0x100000ad4 does NOT emit struct s_3616 spill cluster" {
-    // v7.13.0 emitted `struct s_3616` with 60+ single-byte fields (f_dd..f_184)
-    // because the spill-cluster density gate required 50% density and that
-    // wide frame pattern was only ~1.7% dense. v7.13.1 lowers the gate to
-    // ~10% density and adds a sparse-large fallback (≥40 fields, span <8192)
-    // so the cluster is suppressed.
-    const MV_PATH = "/bin/mv";
-    {
-        const f = test_fs.openFileAbsolute(MV_PATH, .{}) catch {
-            if (!builtin.is_test) std.log.warn("[B54 SKIP] /bin/mv not available", .{});
-            return;
-        };
-        f.close();
-    }
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    const store = try allocator.create(tools.DocumentStore);
-    store.* = tools.DocumentStore.init(allocator, std.testing.io);
-    const ctx = tools.ToolContext{ .io = std.testing.io, .store = store, .session_id = "test", .allocator = allocator };
-
-    var load_p = std.json.Value{ .object = std.json.ObjectMap.empty };
-    try load_p.object.put(std.heap.page_allocator, "path", std.json.Value{ .string = MV_PATH });
-    const load_res = try tools.dispatch(ctx, "load_binary", load_p);
-    if (load_res.is_error) {
-        if (!builtin.is_test) std.log.warn("[B54 SKIP] load_binary /bin/mv failed: {s}", .{load_res.json_response[0..@min(200, load_res.json_response.len)]});
-        return;
-    }
-
-    var dec_p = std.json.Value{ .object = std.json.ObjectMap.empty };
-    try dec_p.object.put(std.heap.page_allocator, "address", std.json.Value{ .integer = 0x100000ad4 });
-    try dec_p.object.put(std.heap.page_allocator, "max_chars", std.json.Value{ .integer = 3000 });
-    const dec_res = try tools.dispatch(ctx, "decompile", dec_p);
-    if (dec_res.is_error) {
-        if (!builtin.is_test) std.log.warn("[B54 SKIP] decompile /bin/mv 0x100000ad4 errored: {s}", .{dec_res.json_response[0..@min(200, dec_res.json_response.len)]});
-        return;
-    }
-
-    // The fix should suppress the fabricated struct entirely. Either there's
-    // no struct s_3616 typedef at all, OR the suppression comment appears.
-    //
-    // v7.15.2 C1 KNOWN REGRESSION: the cluster decompile crash fix
-    // (Database.getInstruction now re-derives operands from the HashMap
-    // entry's own buffer rather than a stale rehashed bucket) means the
-    // type-recovery field detector now sees CORRECT operand offsets where
-    // it previously saw garbage. The spill-cluster suppression heuristic at
-    // src/analysis/types.zig:isLikelySpillCluster expects 60+ fields across
-    // a wide span; with corrected operands the detected layout differs and
-    // the suppression no longer fires for /bin/mv 0x100000ad4. Until the
-    // heuristic is retuned in v7.15.3, soft-skip the assertion with a warn
-    // rather than fail the build — the underlying C1 fix is the priority.
-    const has_struct_def = std.mem.indexOf(u8, dec_res.json_response, "struct s_3616 {") != null;
-    if (has_struct_def) {
-        if (!builtin.is_test) std.log.warn("[B54 SOFT-SKIP] struct s_3616 still emitted — v7.15.2 C1 unmasked latent spill-detector tuning issue; revisit isLikelySpillCluster heuristic in v7.15.3", .{});
-        return;
-    }
 }
 
 test "B55 (v7.14.0 B1): load_binary path=dyld_shared_cache:Foundation extracts a packed image" {
@@ -4247,9 +3958,13 @@ test "B65 (v7.15.0 B1): 100 sequential load+close cycles leave the store empty" 
     // closed document remained observable through store bookkeeping. This
     // keeps the regression check deterministic instead of relying on process
     // high-water RSS, which is order-dependent in the full test suite.
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var safe = std.heap.SafeAllocator.init(std.heap.page_allocator, .{
+        .canary = 0x70680065,
+        .check_write_after_free = true,
+    });
+    defer testing.expectEqual(@as(usize, 0), safe.deinit()) catch
+        @panic("document lifecycle leaked memory");
+    const allocator = safe.allocator();
 
     const store = try allocator.create(tools.DocumentStore);
     defer allocator.destroy(store);
@@ -4264,20 +3979,21 @@ test "B65 (v7.15.0 B1): 100 sequential load+close cycles leave the store empty" 
         const ctx = tools.ToolContext{ .io = std.testing.io, .store = store, .session_id = "b65", .allocator = a };
 
         var lp = std.json.Value{ .object = std.json.ObjectMap.empty };
-        try lp.object.put(std.heap.page_allocator, "path", std.json.Value{ .string = "/bin/ls" });
-        const lr = tools.dispatch(ctx, "load_binary", lp) catch return;
-        if (lr.is_error) return;
-        const parsed = std.json.parseFromSlice(std.json.Value, a, lr.json_response, .{}) catch return;
+        try lp.object.put(a, "path", std.json.Value{ .string = "/bin/ls" });
+        const lr = try tools.dispatch(ctx, "load_binary", lp);
+        try testing.expect(!lr.is_error);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, lr.json_response, .{});
         defer parsed.deinit();
-        const results = parsed.value.object.get("results") orelse return;
-        if (results != .array or results.array.items.len == 0) return;
-        const inner = results.array.items[0].object.get("result") orelse return;
-        const doc_id_v = inner.object.get("doc_id") orelse return;
-        if (doc_id_v != .integer) return;
+        const results = parsed.value.object.get("results") orelse return error.TestUnexpectedResult;
+        try testing.expect(results == .array and results.array.items.len > 0);
+        const inner = results.array.items[0].object.get("result") orelse return error.TestUnexpectedResult;
+        const doc_id_v = inner.object.get("doc_id") orelse return error.TestUnexpectedResult;
+        try testing.expect(doc_id_v == .integer);
 
         var cp = std.json.Value{ .object = std.json.ObjectMap.empty };
-        try cp.object.put(std.heap.page_allocator, "doc_id", std.json.Value{ .integer = doc_id_v.integer });
-        _ = tools.dispatch(ctx, "close_document", cp) catch return;
+        try cp.object.put(a, "doc_id", std.json.Value{ .integer = doc_id_v.integer });
+        const closed = try tools.dispatch(ctx, "close_document", cp);
+        try testing.expect(!closed.is_error);
     }
 
     try testing.expectEqual(@as(usize, 0), store.documents.count());
@@ -4376,12 +4092,16 @@ test "B68 (v7.15.0 B4): close_document holds store.mutex during rebased-children
 test "B69 (v7.15.0 B6): 50 concurrent load_binary calls don't deadlock" {
     // Spawn 50 threads, each loading /bin/ls. The dedup path must serialize
     // them safely. Pass criterion: all threads return without deadlock or
-    // crash. Because dedup short-circuits to the same doc_id after the first
-    // load wins the race, only ONE actual doc lives in the store; we close
+    // crash, and every load succeeds. Dedup returns the same doc_id after
+    // the first load wins the race, so only ONE doc lives in the store; we close
     // it at the end so leak-checking allocators stay clean.
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var safe = std.heap.SafeAllocator.init(std.heap.page_allocator, .{
+        .canary = 0x70680069,
+        .check_write_after_free = true,
+    });
+    defer testing.expectEqual(@as(usize, 0), safe.deinit()) catch
+        @panic("document lifecycle leaked memory");
+    const allocator = safe.allocator();
 
     const store = try allocator.create(tools.DocumentStore);
     defer allocator.destroy(store);
@@ -4395,8 +4115,9 @@ test "B69 (v7.15.0 B6): 50 concurrent load_binary calls don't deadlock" {
             const a = sub.allocator();
             const ctx = tools.ToolContext{ .io = std.testing.io, .store = s, .session_id = "b69", .allocator = a };
             var lp = std.json.Value{ .object = std.json.ObjectMap.empty };
-            lp.object.put(std.heap.page_allocator, "path", std.json.Value{ .string = "/bin/ls" }) catch return;
-            _ = tools.dispatch(ctx, "load_binary", lp) catch {};
+            lp.object.put(a, "path", std.json.Value{ .string = "/bin/ls" }) catch return;
+            const loaded = tools.dispatch(ctx, "load_binary", lp) catch return;
+            if (loaded.is_error) return;
             _ = done_ptr.fetchAdd(1, .seq_cst);
         }
     };
@@ -4423,13 +4144,15 @@ test "B69 (v7.15.0 B6): 50 concurrent load_binary calls don't deadlock" {
         store.mutex.lockUncancelable(std.testing.io);
         defer store.mutex.unlock(std.testing.io);
         var it = store.documents.keyIterator();
-        while (it.next()) |k| ids.append(k.*) catch {};
+        while (it.next()) |k| try ids.append(k.*);
     }
     for (ids.items) |id| {
         var cp = std.json.Value{ .object = std.json.ObjectMap.empty };
-        cp.object.put(std.heap.page_allocator, "doc_id", std.json.Value{ .integer = @intCast(id) }) catch continue;
-        _ = tools.dispatch(ctx, "close_document", cp) catch {};
+        try cp.object.put(a, "doc_id", std.json.Value{ .integer = @intCast(id) });
+        const closed = try tools.dispatch(ctx, "close_document", cp);
+        try testing.expect(!closed.is_error);
     }
+    try testing.expectEqual(@as(usize, 0), store.documents.count());
 }
 
 test "B70 (v7.15.0 B6): get_binary_context cross-mode envelope shapes are byte-isomorphic at top level" {
@@ -4487,7 +4210,7 @@ test "B71 (v7.15.0 B6): every advertised prompt produces text mentioning at leas
         "find-crypto", "compare-binaries",    "find-strings",
     };
     const tool_names = [_][]const u8{
-        "get_binary_context", "get_remake_frontier", "decompile",
+        "get_binary_context", "get_remake_frontier", "disassemble_range",
         "get_semantic_slice", "suggest_names",       "annotate",
         "compare",            "search",              "get_strings",
         "get_imports",        "load_binary",         "analyze_functions",
@@ -4583,12 +4306,15 @@ test "B73 (v7.15.1 A1): close_document after get_binary_context mode=frontier do
     //   3. Closes the doc — must NOT crash.
     //   4. Loads /bin/ls again — must get a NEW doc_id (proves close freed
     //      and the store actually relinquished the slot).
-    // Uses a separate GPA so the allocator-mismatch surface that produced
-    // the SIGABRT is exercised — testing.allocator wraps a different
-    // allocator that may be more forgiving.
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // A separate SafeAllocator canary catches cross-allocator frees, and
+    // deinit must report zero leaks after both document lifecycles.
+    var safe = std.heap.SafeAllocator.init(std.heap.page_allocator, .{
+        .canary = 0x70680073,
+        .check_write_after_free = true,
+    });
+    defer testing.expectEqual(@as(usize, 0), safe.deinit()) catch
+        @panic("document lifecycle leaked memory");
+    const allocator = safe.allocator();
 
     const store = try allocator.create(tools.DocumentStore);
     defer allocator.destroy(store);
@@ -4603,23 +4329,23 @@ test "B73 (v7.15.1 A1): close_document after get_binary_context mode=frontier do
         const ctx = tools.ToolContext{ .io = std.testing.io, .store = store, .session_id = "b73", .allocator = a };
 
         var lp = std.json.Value{ .object = std.json.ObjectMap.empty };
-        try lp.object.put(std.heap.page_allocator, "path", std.json.Value{ .string = "/bin/ls" });
-        const lr = tools.dispatch(ctx, "load_binary", lp) catch return;
-        if (lr.is_error) return;
+        try lp.object.put(a, "path", std.json.Value{ .string = "/bin/ls" });
+        const lr = try tools.dispatch(ctx, "load_binary", lp);
+        try testing.expect(!lr.is_error);
 
-        const parsed = std.json.parseFromSlice(std.json.Value, a, lr.json_response, .{}) catch return;
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, lr.json_response, .{});
         defer parsed.deinit();
-        const results = parsed.value.object.get("results") orelse return;
-        if (results != .array or results.array.items.len == 0) return;
-        const inner = results.array.items[0].object.get("result") orelse return;
-        const doc_id_v = inner.object.get("doc_id") orelse return;
-        if (doc_id_v != .integer) return;
+        const results = parsed.value.object.get("results") orelse return error.TestUnexpectedResult;
+        try testing.expect(results == .array and results.array.items.len > 0);
+        const inner = results.array.items[0].object.get("result") orelse return error.TestUnexpectedResult;
+        const doc_id_v = inner.object.get("doc_id") orelse return error.TestUnexpectedResult;
+        try testing.expect(doc_id_v == .integer);
 
         // Frontier mode: forces ensureCalleesCached on at least one proc.
         var fp = std.json.Value{ .object = std.json.ObjectMap.empty };
-        try fp.object.put(std.heap.page_allocator, "doc_id", std.json.Value{ .integer = doc_id_v.integer });
-        try fp.object.put(std.heap.page_allocator, "mode", std.json.Value{ .string = "frontier" });
-        try fp.object.put(std.heap.page_allocator, "max_candidates", std.json.Value{ .integer = 2 });
+        try fp.object.put(a, "doc_id", std.json.Value{ .integer = doc_id_v.integer });
+        try fp.object.put(a, "mode", std.json.Value{ .string = "frontier" });
+        try fp.object.put(a, "max_candidates", std.json.Value{ .integer = 2 });
         const fr = tools.dispatch(ctx, "get_binary_context", fp) catch |err| {
             std.log.err("[B73 FAIL] get_binary_context mode=frontier errored: {s}", .{@errorName(err)});
             return error.TestUnexpectedResult;
@@ -4631,7 +4357,7 @@ test "B73 (v7.15.1 A1): close_document after get_binary_context mode=frontier do
 
         // Close — pre-fix this is the SIGABRT site.
         var cp = std.json.Value{ .object = std.json.ObjectMap.empty };
-        try cp.object.put(std.heap.page_allocator, "doc_id", std.json.Value{ .integer = doc_id_v.integer });
+        try cp.object.put(a, "doc_id", std.json.Value{ .integer = doc_id_v.integer });
         const cr = tools.dispatch(ctx, "close_document", cp) catch |err| {
             std.log.err("[B73 FAIL] close_document after frontier errored: {s}", .{@errorName(err)});
             return error.TestUnexpectedResult;
@@ -4652,17 +4378,17 @@ test "B73 (v7.15.1 A1): close_document after get_binary_context mode=frontier do
         const ctx = tools.ToolContext{ .io = std.testing.io, .store = store, .session_id = "b73", .allocator = a };
 
         var lp = std.json.Value{ .object = std.json.ObjectMap.empty };
-        try lp.object.put(std.heap.page_allocator, "path", std.json.Value{ .string = "/bin/ls" });
-        const lr = tools.dispatch(ctx, "load_binary", lp) catch return;
-        if (lr.is_error) return;
+        try lp.object.put(a, "path", std.json.Value{ .string = "/bin/ls" });
+        const lr = try tools.dispatch(ctx, "load_binary", lp);
+        try testing.expect(!lr.is_error);
 
-        const parsed = std.json.parseFromSlice(std.json.Value, a, lr.json_response, .{}) catch return;
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, lr.json_response, .{});
         defer parsed.deinit();
-        const results = parsed.value.object.get("results") orelse return;
-        if (results != .array or results.array.items.len == 0) return;
-        const inner = results.array.items[0].object.get("result") orelse return;
-        const doc_id_v = inner.object.get("doc_id") orelse return;
-        if (doc_id_v != .integer) return;
+        const results = parsed.value.object.get("results") orelse return error.TestUnexpectedResult;
+        try testing.expect(results == .array and results.array.items.len > 0);
+        const inner = results.array.items[0].object.get("result") orelse return error.TestUnexpectedResult;
+        const doc_id_v = inner.object.get("doc_id") orelse return error.TestUnexpectedResult;
+        try testing.expect(doc_id_v == .integer);
 
         if (doc_id_v.integer == first_doc_id) {
             std.log.err("[B73 FAIL] reload returned same doc_id {d} — close_document did not actually free", .{first_doc_id});
@@ -4670,8 +4396,9 @@ test "B73 (v7.15.1 A1): close_document after get_binary_context mode=frontier do
         }
 
         var cp = std.json.Value{ .object = std.json.ObjectMap.empty };
-        try cp.object.put(std.heap.page_allocator, "doc_id", std.json.Value{ .integer = doc_id_v.integer });
-        _ = tools.dispatch(ctx, "close_document", cp) catch return;
+        try cp.object.put(a, "doc_id", std.json.Value{ .integer = doc_id_v.integer });
+        const closed = try tools.dispatch(ctx, "close_document", cp);
+        try testing.expect(!closed.is_error);
     }
 }
 
@@ -4715,90 +4442,4 @@ test "B75 (v7.15.1 A3): matchesImageName distinguishes overlapping framework nam
         std.log.err("[B75 FAIL] v7.15.1 A3 marker comment missing from matchesImageName", .{});
         return error.TestUnexpectedResult;
     }
-}
-
-test "B77 (v7.15.2 C1): decompile scope=cluster on high-callee proc does NOT crash" {
-    // Live MCP repro 2026-04-26 against v7.15.1: load /bin/ls, then
-    // decompile address=0x1000016d8 scope=cluster max_cluster=5 SIGSEGVs
-    // the server (EXC_BAD_ACCESS at corrupted pointer 0x3467981d1 inside
-    // _platform_memmove on the main thread). The seed proc is the fts
-    // walker with 24 callees. Pre-existing cluster test (line ~1337)
-    // picked _main (few callees) and passed. This test exercises the
-    // high-callee path with the same GPA + sub-arena pattern as B73 so
-    // the per-request arena semantics match the MCP runtime.
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const store = try allocator.create(tools.DocumentStore);
-    defer allocator.destroy(store);
-    store.* = tools.DocumentStore.init(allocator, std.testing.io);
-    defer store.deinit();
-
-    var sub = std.heap.ArenaAllocator.init(allocator);
-    defer sub.deinit();
-    const a = sub.allocator();
-    const ctx = tools.ToolContext{ .io = std.testing.io, .store = store, .session_id = "b77", .allocator = a };
-
-    var lp = std.json.Value{ .object = std.json.ObjectMap.empty };
-    try lp.object.put(std.heap.page_allocator, "path", std.json.Value{ .string = "/bin/ls" });
-    const lr = tools.dispatch(ctx, "load_binary", lp) catch return;
-    if (lr.is_error) return;
-
-    const parsed = std.json.parseFromSlice(std.json.Value, a, lr.json_response, .{}) catch return;
-    defer parsed.deinit();
-    const results = parsed.value.object.get("results") orelse return;
-    if (results != .array or results.array.items.len == 0) return;
-    const inner = results.array.items[0].object.get("result") orelse return;
-    const doc_id_v = inner.object.get("doc_id") orelse return;
-    if (doc_id_v != .integer) return;
-    const doc_id = doc_id_v.integer;
-
-    // Find a procedure with the most outgoing call xrefs — that's the high-callee
-    // pattern that triggered the live crash. /bin/ls fts walker (0x1000016d8) has
-    // 24 callees per the live frontier output.
-    const entry = store.get(@intCast(doc_id)) orelse return;
-    var best_addr: u64 = 0;
-    var best_calls: usize = 0;
-    var proc_it = entry.db.procedures.iterator();
-    while (proc_it.next()) |pe| {
-        const p = pe.value_ptr.*;
-        const proc_end = p.entry + @max(p.size, 1);
-        const xrefs = entry.db.xrefs.getRefsFromRange(p.entry, proc_end);
-        var calls: usize = 0;
-        for (xrefs) |x| {
-            if (x.xref_type == .call) calls += 1;
-        }
-        if (calls > best_calls) {
-            best_calls = calls;
-            best_addr = p.entry;
-        }
-    }
-    if (best_addr == 0 or best_calls < 5) return; // soft-skip on degenerate binaries
-
-    var dp = std.json.Value{ .object = std.json.ObjectMap.empty };
-    try dp.object.put(std.heap.page_allocator, "doc_id", std.json.Value{ .integer = doc_id });
-    const hex_addr = try std.fmt.allocPrint(a, "0x{x}", .{best_addr});
-    try dp.object.put(std.heap.page_allocator, "address", std.json.Value{ .string = hex_addr });
-    try dp.object.put(std.heap.page_allocator, "scope", std.json.Value{ .string = "cluster" });
-    try dp.object.put(std.heap.page_allocator, "max_cluster", std.json.Value{ .integer = 5 });
-    try dp.object.put(std.heap.page_allocator, "include_types", std.json.Value{ .bool = true });
-
-    const dr = tools.dispatch(ctx, "decompile", dp) catch |err| {
-        std.log.err("[B77 FAIL] decompile scope=cluster on 0x{x} ({d} callees) errored: {s}", .{ best_addr, best_calls, @errorName(err) });
-        return error.TestUnexpectedResult;
-    };
-    if (dr.is_error) {
-        std.log.err("[B77 FAIL] decompile scope=cluster on 0x{x} ({d} callees) returned is_error: {s}", .{ best_addr, best_calls, dr.json_response });
-        return error.TestUnexpectedResult;
-    }
-    // Sanity: response must contain the decompilation header.
-    if (std.mem.indexOf(u8, dr.json_response, "decompiled by phora") == null) {
-        std.log.err("[B77 FAIL] decompile output missing header — response: {s}", .{dr.json_response[0..@min(dr.json_response.len, 200)]});
-        return error.TestUnexpectedResult;
-    }
-
-    var cp = std.json.Value{ .object = std.json.ObjectMap.empty };
-    try cp.object.put(std.heap.page_allocator, "doc_id", std.json.Value{ .integer = doc_id });
-    _ = tools.dispatch(ctx, "close_document", cp) catch return;
 }

@@ -53,6 +53,7 @@ pub const Terminator = enum {
     call,
     @"return",
     fallthrough,
+    unknown,
 
     pub fn toString(self: Terminator) []const u8 {
         return switch (self) {
@@ -61,6 +62,7 @@ pub const Terminator = enum {
             .call => "call",
             .@"return" => "return",
             .fallthrough => "fallthrough",
+            .unknown => "unknown",
         };
     }
 };
@@ -74,6 +76,8 @@ pub const IRStatementType = enum {
     load,
     store,
     nop,
+    /// Unmodeled instruction: may read/write registers, flags, or memory.
+    @"opaque",
 
     pub fn toString(self: IRStatementType) []const u8 {
         return switch (self) {
@@ -85,6 +89,7 @@ pub const IRStatementType = enum {
             .load => "load",
             .store => "store",
             .nop => "nop",
+            .@"opaque" => "opaque",
         };
     }
 };
@@ -151,6 +156,18 @@ pub const Section = struct {
     /// These sections have no file backing — read_bytes should return zeros, entropy
     /// should not be computed over file bytes (which would point to wrong data).
     is_zerofill: bool = false,
+    /// Loader-provided instruction-section flag; null for synthetic/legacy maps.
+    is_code: ?bool = null,
+
+    pub fn isCode(self: Section) bool {
+        if (self.is_zerofill) return false;
+        return self.is_code orelse (std.mem.eql(u8, self.name, "__text") or
+            std.mem.eql(u8, self.name, ".text") or std.mem.startsWith(u8, self.name, ".text.") or
+            std.mem.eql(u8, self.name, "__stubs") or std.mem.eql(u8, self.name, "__auth_stubs") or
+            std.mem.eql(u8, self.name, "__stub_helper") or std.mem.eql(u8, self.name, ".plt") or
+            std.mem.eql(u8, self.name, ".plt.sec") or std.mem.eql(u8, self.name, ".init") or
+            std.mem.eql(u8, self.name, ".fini") or std.mem.eql(u8, self.name, ".raw"));
+    }
 };
 
 /// A contiguous memory region in a binary.
@@ -232,6 +249,9 @@ pub const Document = struct {
     entry_point: u64,
     segments: []Segment,
     procedures: std.array_list.Managed(Procedure),
+    /// Validated Mach-O linker starts, sorted and owned by procedures.allocator.
+    /// Coverage is per code section; sections without entries retain heuristic discovery.
+    linker_function_starts: []const u64 = &.{},
     strings: std.array_list.Managed(String),
     imports: std.array_list.Managed(Import),
     annotations: std.array_list.Managed(Annotation),
@@ -302,11 +322,63 @@ pub const Document = struct {
     }
 
     pub fn deinit(self: *Document) void {
+        self.procedures.allocator.free(self.linker_function_starts);
+        self.linker_function_starts = &.{};
         self.procedures.deinit();
         self.strings.deinit();
         self.imports.deinit();
         self.annotations.deinit();
         self.deinitAnalysis();
+    }
+
+    /// End of the instruction range containing address. Segment permissions alone
+    /// do not make embedded constants or headers executable code.
+    pub fn codeRangeEnd(self: *const Document, address: u64) ?u64 {
+        for (self.segments) |seg| {
+            if (!seg.permissions.execute) continue;
+            for (seg.sections) |sec| {
+                if (sec.isCode() and address >= sec.start and address - sec.start < sec.length)
+                    return sec.start +| sec.length;
+            }
+            if (seg.sections.len == 0 and address >= seg.start and address - seg.start < seg.length)
+                return seg.start +| seg.length;
+        }
+        return null;
+    }
+
+    pub fn isLinkerFunctionStart(self: *const Document, address: u64) bool {
+        const pos = self.linkerStartLowerBound(address);
+        return pos < self.linker_function_starts.len and self.linker_function_starts[pos] == address;
+    }
+
+    /// A linker entry list outranks prologue, post-return and call-target guesses.
+    /// This only constrains sections represented in that list, so a missing table
+    /// or an uncovered executable section can still use heuristic discovery.
+    pub fn permitsProcedureStart(self: *const Document, address: u64) bool {
+        return self.isLinkerFunctionStart(address) or !self.hasLinkerFunctionStartsFor(address);
+    }
+
+    pub fn hasLinkerFunctionStartsFor(self: *const Document, address: u64) bool {
+        if (self.linker_function_starts.len == 0) return false;
+        for (self.segments) |seg| {
+            if (!seg.permissions.execute) continue;
+            for (seg.sections) |sec| {
+                if (!sec.isCode() or address < sec.start or address - sec.start >= sec.length) continue;
+                const first = self.linkerStartLowerBound(sec.start);
+                return first < self.linker_function_starts.len and self.linker_function_starts[first] - sec.start < sec.length;
+            }
+        }
+        return false;
+    }
+
+    fn linkerStartLowerBound(self: *const Document, address: u64) usize {
+        var lo: usize = 0;
+        var hi = self.linker_function_starts.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.linker_function_starts[mid] < address) lo = mid + 1 else hi = mid;
+        }
+        return lo;
     }
 
     /// Release v7.8.0 analysis results if populated. Safe to call multiple
@@ -370,10 +442,19 @@ pub const Document = struct {
 // IR (Lifter Output)
 // ============================================================================
 
+pub const MemorySignedness = enum { unknown, unsigned, signed };
+
 /// A single IR statement produced by the lifter.
 pub const IRStatement = struct {
     type: IRStatementType,
     address: u64,
+    /// Starts a control-flow block, including targets inside linear fallback blocks.
+    block_start: bool = false,
+    /// Exact memory transfer width from the original instruction, in bytes.
+    /// Null means unknown; it must not be guessed from a renamed variable.
+    memory_width: ?u8 = null,
+    /// Extension of a loaded value, when the instruction establishes it.
+    memory_signedness: MemorySignedness = .unknown,
     dest: ?[]const u8 = null,
     src: ?[]const u8 = null,
     target: ?[]const u8 = null,
@@ -466,7 +547,7 @@ pub const Instruction = struct {
     // Owned copy of operands — decodeInstruction copies here so the
     // operands slice can point to owned memory instead of the decoder's
     // stack-local buffer (which becomes dangling after return).
-    operands_buf: [64]u8 = [_]u8{0} ** 64,
+    operands_buf: [64]u8 = @splat(0),
     operands_len: u8 = 0,
 };
 
@@ -669,3 +750,22 @@ pub const ExportFormat = enum {
     text,
     ir,
 };
+
+test "linker starts constrain only covered code sections" {
+    const t = std.testing;
+    var doc = Document.init(t.allocator, 1, "coverage", &.{});
+    defer doc.deinit();
+    var sections = [_]Section{
+        .{ .name = "__text", .start = 0x1000, .length = 0x100, .file_offset = 0, .is_code = true },
+        .{ .name = "custom", .start = 0x2000, .length = 0x100, .file_offset = 0, .is_code = true },
+    };
+    var segments = [_]Segment{.{ .name = "__TEXT", .start = 0x1000, .length = 0x2000, .sections = &sections, .permissions = .{ .read = true, .execute = true }, .file_offset = 0 }};
+    doc.segments = &segments;
+    doc.linker_function_starts = try t.allocator.dupe(u64, &.{ 0x1000, 0x1080 });
+    try t.expect(doc.permitsProcedureStart(0x1000));
+    try t.expect(doc.permitsProcedureStart(0x1080));
+    try t.expect(!doc.permitsProcedureStart(0x1004));
+    try t.expect(!doc.permitsProcedureStart(0x10fc));
+    try t.expect(doc.permitsProcedureStart(0x2000));
+    try t.expect(doc.permitsProcedureStart(0x2004));
+}

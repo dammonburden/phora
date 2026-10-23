@@ -9,9 +9,25 @@ const types = @import("../types.zig");
 // Decoded instruction — internal representation with rich metadata
 // ============================================================================
 
+pub const DecodeStatus = enum { decoded, unsupported };
+
+/// Family labels are opaque decoder fallbacks, not instruction identities.
+pub fn isOpaqueMnemonic(mnemonic: []const u8) bool {
+    for ([_][]const u8{ "simd/ldst", "simd/fp", "dp_reg", "dp1src", "dp2src", "ldr/str", "sve", "udf" }) |name|
+        if (std.mem.eql(u8, mnemonic, name)) return true;
+    return false;
+}
+
+pub fn decodeStatus(word: u32, mnemonic: []const u8) DecodeStatus {
+    // Architected UDF has fixed upper 16 bits zero; other UDF labels are fallback.
+    if (std.mem.eql(u8, mnemonic, "udf") and word & 0xffff0000 == 0) return .decoded;
+    return if (isOpaqueMnemonic(mnemonic)) .unsupported else .decoded;
+}
+
 pub const DecodedInstruction = struct {
+    decode_status: DecodeStatus = .unsupported,
     mnemonic: []const u8,
-    operands: [128]u8 = [_]u8{0} ** 128,
+    operands: [128]u8 = @splat(0),
     operands_len: u8 = 0,
     length: u8 = 4,
     is_branch: bool = false,
@@ -105,27 +121,6 @@ fn bits(insn: u32, hi: u5, lo: u5) u32 {
 
 fn bit(insn: u32, pos: u5) u1 {
     return @truncate(insn >> pos);
-}
-
-fn signExtend(value: u64, sign_bit: u6) i64 {
-    const mask = @as(u64, 1) << sign_bit;
-    if (value & mask != 0) {
-        // Sign bit is set, extend with 1s
-        const ext: u64 = @as(u64, 0xFFFFFFFFFFFFFFFF) << @as(u6, sign_bit + 1);
-        return @bitCast(ext | value);
-    }
-    return @intCast(value);
-}
-
-/// v7.12 W9: like signExtend but returns u64 (caller bitcasts to i64). Treats
-/// `value` as an N+1-bit value where bit `sign_bit` is the sign. Pre-shift
-/// sign-extension keeps imm26 / imm19 calculations identical regardless of
-/// whether the caller multiplies the result by 4 (for 4-byte branch offsets).
-fn signExtend64(value: u64, sign_bit: u6) u64 {
-    const mask = @as(u64, 1) << sign_bit;
-    if (value & mask == 0) return value;
-    const ext: u64 = @as(u64, 0xFFFFFFFFFFFFFFFF) << @as(u6, sign_bit + 1);
-    return ext | value;
 }
 
 // ============================================================================
@@ -228,9 +223,9 @@ pub fn decode(raw: []const u8, address: u64) DecodedInstruction {
             decodeDPRegister(insn, address, &result);
         },
 
-        // 0bx111: Data processing — SIMD/FP (stub)
+        // 0bx111: Data processing — SIMD/FP
         0b0111, 0b1111 => {
-            result.mnemonic = "simd/fp";
+            decodeSIMD(insn, &result);
         },
 
         // 0b001x: SME / SVE (stub)
@@ -248,6 +243,7 @@ pub fn decode(raw: []const u8, address: u64) DecodedInstruction {
         },
     }
 
+    result.decode_status = decodeStatus(insn, result.mnemonic);
     return result;
 }
 
@@ -273,7 +269,7 @@ fn decodeBranchesAndSystem(insn: u32, address: u64, result: *DecodedInstruction)
             // SignExtend(imm26:'00', 64) and avoids any ambiguity that arose
             // from sign-extending the post-shift 28-bit value.
             const imm26 = bits(insn, 25, 0);
-            const sext: i64 = @as(i64, @bitCast(signExtend64(imm26, 25)));
+            const sext: i64 = std.math.signExtend(i64, @as(u26, @intCast(imm26)));
             const offset: i64 = sext * 4;
             const target = @as(u64, @bitCast(@as(i64, @bitCast(address)) +% offset));
             result.mnemonic = "b";
@@ -286,7 +282,7 @@ fn decodeBranchesAndSystem(insn: u32, address: u64, result: *DecodedInstruction)
         // 0b100: BL (branch with link, immediate)
         0b100 => {
             const imm26 = bits(insn, 25, 0);
-            const sext: i64 = @as(i64, @bitCast(signExtend64(imm26, 25)));
+            const sext: i64 = std.math.signExtend(i64, @as(u26, @intCast(imm26)));
             const offset: i64 = sext * 4;
             const target = @as(u64, @bitCast(@as(i64, @bitCast(address)) +% offset));
             result.mnemonic = "bl";
@@ -301,7 +297,7 @@ fn decodeBranchesAndSystem(insn: u32, address: u64, result: *DecodedInstruction)
         0b010 => {
             const imm19 = bits(insn, 23, 5);
             const cond: u4 = @truncate(bits(insn, 3, 0));
-            const offset = signExtend(imm19 << 2, 20);
+            const offset = std.math.signExtend(i64, @as(u19, @intCast(imm19))) * 4;
             const target = @as(u64, @bitCast(@as(i64, @bitCast(address)) +% offset));
             result.mnemonic = condBranchMnemonic(cond);
             result.is_branch = true;
@@ -311,44 +307,33 @@ fn decodeBranchesAndSystem(insn: u32, address: u64, result: *DecodedInstruction)
             f.appendHex(target);
             result.operands_len = f.len();
         },
-        // 0b001, 0b101: CBZ/CBNZ
+        // 0b001, 0b101: compare-and-branch or test-and-branch.
+        // Bit 25 distinguishes TBZ/TBNZ from CBZ/CBNZ; bit 31 selects width.
         0b001, 0b101 => {
             const sf = bit(insn, 31) == 1;
             const op = bit(insn, 24);
-            const imm19 = bits(insn, 23, 5);
+            const is_test = bit(insn, 25) == 1;
             const rt: u5 = @truncate(bits(insn, 4, 0));
-            const offset = signExtend(imm19 << 2, 20);
+            const offset = if (is_test)
+                std.math.signExtend(i64, @as(u14, @intCast(bits(insn, 18, 5)))) * 4
+            else
+                std.math.signExtend(i64, @as(u19, @intCast(bits(insn, 23, 5)))) * 4;
             const target = @as(u64, @bitCast(@as(i64, @bitCast(address)) +% offset));
-            result.mnemonic = if (op == 0) "cbz" else "cbnz";
+            result.mnemonic = if (is_test)
+                (if (op == 0) "tbz" else "tbnz")
+            else
+                (if (op == 0) "cbz" else "cbnz");
             result.is_branch = true;
             result.is_conditional_branch = true;
             result.branch_target = target;
             var f = FmtBuf.init(&result.operands);
             f.append(regName(rt, sf));
             f.comma();
-            f.appendHex(target);
-            result.operands_len = f.len();
-        },
-        // 0b011, 0b111: TBZ/TBNZ
-        0b011, 0b111 => {
-            const b5 = bit(insn, 31);
-            const b40: u5 = @truncate(bits(insn, 23, 19));
-            const op = bit(insn, 24);
-            const imm14 = bits(insn, 18, 5);
-            const rt: u5 = @truncate(bits(insn, 4, 0));
-            const offset = signExtend(imm14 << 2, 15);
-            const target = @as(u64, @bitCast(@as(i64, @bitCast(address)) +% offset));
-            const bit_num = (@as(u6, b5) << 5) | @as(u6, b40);
-            const sf = b5 == 1;
-            result.mnemonic = if (op == 0) "tbz" else "tbnz";
-            result.is_branch = true;
-            result.is_conditional_branch = true;
-            result.branch_target = target;
-            var f = FmtBuf.init(&result.operands);
-            f.append(regName(rt, sf));
-            f.comma();
-            f.appendFmt("#{d}", .{bit_num});
-            f.comma();
+            if (is_test) {
+                const bit_num = (@as(u6, bit(insn, 31)) << 5) | @as(u6, @intCast(bits(insn, 23, 19)));
+                f.appendFmt("#{d}", .{bit_num});
+                f.comma();
+            }
             f.appendHex(target);
             result.operands_len = f.len();
         },
@@ -690,7 +675,7 @@ fn decodePCRelAddr(insn: u32, address: u64, result: *DecodedInstruction) void {
 
     if (op == 0) {
         // ADR Xd, label
-        const offset = signExtend(imm, 20);
+        const offset = std.math.signExtend(i64, @as(u21, @intCast(imm)));
         const target = @as(u64, @bitCast(@as(i64, @bitCast(address)) +% offset));
         result.mnemonic = "adr";
         var f = FmtBuf.init(&result.operands);
@@ -700,7 +685,7 @@ fn decodePCRelAddr(insn: u32, address: u64, result: *DecodedInstruction) void {
         result.operands_len = f.len();
     } else {
         // ADRP Xd, label (page-aligned)
-        const offset = signExtend(@as(u64, imm) << 12, 32);
+        const offset = std.math.signExtend(i64, @as(u21, @intCast(imm))) * 4096;
         const page = address & ~@as(u64, 0xFFF);
         const target = @as(u64, @bitCast(@as(i64, @bitCast(page)) +% offset));
         result.mnemonic = "adrp";
@@ -784,7 +769,11 @@ fn decodeLogicalImm(insn: u32, result: *DecodedInstruction) void {
     const rn: u5 = @truncate(bits(insn, 9, 5));
     const rd: u5 = @truncate(bits(insn, 4, 0));
 
-    const imm_val = decodeBitmaskImm(n, imms, immr, sf);
+    const imm_val = decodeBitmaskImm(n, imms, immr, sf) orelse {
+        result.mnemonic = "udf";
+        result.operands_len = 0;
+        return;
+    };
 
     // TST is ANDS with Rd = ZR
     if (opc == 0b11 and rd == 31) {
@@ -829,61 +818,34 @@ fn decodeLogicalImm(insn: u32, result: *DecodedInstruction) void {
     result.operands_len = f.len();
 }
 
-fn decodeBitmaskImm(n: u1, imms_raw: u6, immr_raw: u6, sf: bool) u64 {
-    const imms: u6 = imms_raw;
-    const immr: u6 = immr_raw;
-    const reg_size: u7 = if (sf) 64 else 32;
+/// ARM DecodeBitMasks with immediate=TRUE. Invalid encodings never invent
+/// a zero/all-ones mask. The element width is 2^HighestSetBit(N:NOT(imms)).
+fn decodeBitmaskImm(n: u1, imms: u6, immr: u6, sf: bool) ?u64 {
+    if (!sf and n != 0) return null;
+    const size_selector: u7 = (@as(u7, n) << 6) | @as(u7, ~imms);
+    if (size_selector < 2) return null; // len < 1 is reserved.
+    var probe = size_selector;
+    var len: u3 = 0;
+    while (probe > 1) : (probe >>= 1) len += 1;
+    const element_size: u7 = @as(u7, 1) << len;
+    const levels: u6 = @intCast(element_size - 1);
+    const s = imms & levels;
+    const r = immr & levels;
+    if (s == levels) return null; // All-ones logical immediates are reserved.
 
-    // Determine element size
-    var len: u6 = 0;
-    if (n == 1) {
-        len = 6;
-    } else {
-        // Find highest bit set in ~imms (within 6 bits)
-        const not_imms: u6 = ~imms;
-        if (not_imms & 0b100000 != 0) {
-            len = 6;
-        } else if (not_imms & 0b010000 != 0) {
-            len = 5;
-        } else if (not_imms & 0b001000 != 0) {
-            len = 4;
-        } else if (not_imms & 0b000100 != 0) {
-            len = 3;
-        } else if (not_imms & 0b000010 != 0) {
-            len = 2;
-        } else {
-            len = 1;
-        }
-    }
-
-    const esize: u7 = @as(u7, 1) << @as(u3, @truncate(len));
-    const mask: u6 = @truncate(esize - 1);
-    const s: u6 = imms & mask;
-    const r: u6 = immr & mask;
-
-    // Create the bitmask pattern for one element
-    var welem: u64 = (@as(u64, 1) << @as(u6, s + 1)) - 1;
-
-    // Rotate right by r
+    // s+1 is at most 63. Keep element_size in seven bits: truncating 64
+    // before rotating previously disabled every 64-bit-element rotation.
+    const element_mask = @as(u64, std.math.maxInt(u64)) >> @as(u6, @intCast(64 - element_size));
+    var element = (@as(u64, 1) << @as(u6, @intCast(@as(u7, s) + 1))) - 1;
     if (r != 0) {
-        const esize_trunc: u6 = @truncate(esize);
-        if (r < esize_trunc) {
-            welem = (welem >> @as(u6, r)) | (welem << @as(u6, esize_trunc - r));
-            welem &= (@as(u64, 1) << @as(u6, esize_trunc)) - 1;
-        }
+        element = ((element >> r) | (element << @as(u6, @intCast(element_size - r)))) & element_mask;
     }
-
-    // Replicate to fill register width
     var result: u64 = 0;
-    var pos: u7 = 0;
-    while (pos < reg_size) : (pos += esize) {
-        result |= welem << @as(u6, @truncate(pos));
+    const register_size: u7 = if (sf) 64 else 32;
+    var position: u7 = 0;
+    while (position < register_size) : (position += element_size) {
+        result |= element << @as(u6, @intCast(position));
     }
-
-    if (!sf) {
-        result &= 0xFFFFFFFF;
-    }
-
     return result;
 }
 
@@ -1109,7 +1071,233 @@ fn decodeExtract(insn: u32, result: *DecodedInstruction) void {
 // bits [28:25] = x1x0
 // ============================================================================
 
-fn decodeLoadStore(insn: u32, _: u64, result: *DecodedInstruction) void {
+// Finite SIMD/FP identities. Fixed-bit masks exclude unimplemented scalar FP,
+// scalar SIMD, widening/narrowing operations, and other three-same opcodes.
+// Their effects remain opaque: a familiar mnemonic must not invent scalar IR.
+fn decodeSIMD(insn: u32, result: *DecodedInstruction) void {
+    result.mnemonic = "simd/fp";
+    // FADD scalar S/D only. Register fields and the S/D type bit vary; half
+    // precision and neighboring FP operations remain unsupported. Identity and
+    // fallthrough are known, while the lifter still treats FP effects as opaque.
+    if (insn & 0xffa0fc00 == 0x1e202800) {
+        result.mnemonic = "fadd";
+        const kind: []const u8 = if (bit(insn, 22) == 0) "s" else "d";
+        var f = FmtBuf.init(&result.operands);
+        f.appendFmt("{s}{d}, {s}{d}, {s}{d}", .{ kind, bits(insn, 4, 0), kind, bits(insn, 9, 5), kind, bits(insn, 20, 16) });
+        result.operands_len = f.len();
+        return;
+    }
+    // MOVI .2D mask immediate: each imm8 bit selects an all-zero/all-one byte.
+    // Require Q=1/op=1/cmode=1110 and all fixed bits; other modified-immediate
+    // forms remain opaque until independently implemented.
+    if (insn & 0xfff8fc00 == 0x6f00e400) {
+        const imm8 = (bits(insn, 18, 16) << 5) | bits(insn, 9, 5);
+        var immediate: u64 = 0;
+        for (0..8) |i| {
+            if (imm8 & (@as(u32, 1) << @as(u5, @intCast(i))) != 0)
+                immediate |= @as(u64, 0xff) << @as(u6, @intCast(i * 8));
+        }
+        result.mnemonic = "movi";
+        var f = FmtBuf.init(&result.operands);
+        f.appendFmt("v{d}.2d, #0x{x}", .{ bits(insn, 4, 0), immediate });
+        result.operands_len = f.len();
+        return;
+    }
+    // SHA3 four-register Boolean operations have a fixed 128-bit arrangement.
+    // Keep every fixed bit (including bit15) in the mask so reserved neighbors
+    // and other crypto instructions cannot acquire these operand semantics.
+    const crypto = insn & 0xffe08000;
+    if (crypto == 0xce000000 or crypto == 0xce200000) {
+        result.mnemonic = if (crypto == 0xce000000) "eor3" else "bcax";
+        var f = FmtBuf.init(&result.operands);
+        f.appendFmt("v{d}.16b, v{d}.16b, v{d}.16b, v{d}.16b", .{
+            bits(insn, 4, 0), bits(insn, 9, 5), bits(insn, 20, 16), bits(insn, 14, 10),
+        });
+        result.operands_len = f.len();
+        return;
+    }
+    const q = bit(insn, 30);
+    var arrangement: []const u8 = undefined;
+    switch (insn & 0xbfe0fc00) {
+        0x0e201c00 => result.mnemonic = "and",
+        0x0e601c00 => result.mnemonic = "bic",
+        0x0ea01c00 => result.mnemonic = "orr",
+        0x2e201c00 => result.mnemonic = "eor",
+        else => {
+            if ((insn & 0x9f20fc00) != 0x0e208400) return;
+            const size: u2 = @truncate(bits(insn, 23, 22));
+            // ADD/SUB (vector) reserves size=11 when Q=0; there is no .1d form.
+            if (size == 3 and q == 0) {
+                result.mnemonic = "udf";
+                return;
+            }
+            result.mnemonic = if (bit(insn, 29) == 0) "add" else "sub";
+            arrangement = if (q == 1)
+                ([4][]const u8{ "16b", "8h", "4s", "2d" })[size]
+            else
+                ([4][]const u8{ "8b", "4h", "2s", "" })[size];
+        },
+    }
+    if ((insn & 0x9f20fc00) != 0x0e208400)
+        arrangement = if (q == 1) "16b" else "8b";
+
+    var f = FmtBuf.init(&result.operands);
+    f.appendFmt("v{d}.{s}, v{d}.{s}, v{d}.{s}", .{
+        bits(insn, 4, 0),   arrangement,
+        bits(insn, 9, 5),   arrangement,
+        bits(insn, 20, 16), arrangement,
+    });
+    result.operands_len = f.len();
+}
+
+fn appendSIMDRegister(f: *FmtBuf, reg: u32, scale: u3) void {
+    f.appendFmt("{s}{d}", .{ ([5][]const u8{ "b", "h", "s", "d", "q" })[scale], reg });
+}
+
+fn decodeSIMDMemory(insn: u32, address: u64, result: *DecodedInstruction) void {
+    // Unknown structure/lane accesses and extensions stay explicitly opaque.
+    result.mnemonic = "simd/ldst";
+    const rt = bits(insn, 4, 0);
+    const rn: u5 = @truncate(bits(insn, 9, 5));
+    const opc: u2 = @truncate(bits(insn, 23, 22));
+    const size: u2 = @truncate(bits(insn, 31, 30));
+    var f = FmtBuf.init(&result.operands);
+
+    // SIMD/FP literal loads: opc selects S/D/Q; opc=11 is unallocated.
+    if ((insn & 0x3f000000) == 0x1c000000) {
+        if (size == 3) {
+            result.mnemonic = "udf";
+            return;
+        }
+        const offset = std.math.signExtend(i64, @as(u19, @intCast(bits(insn, 23, 5)))) * 4;
+        result.mnemonic = "ldr";
+        appendSIMDRegister(&f, rt, @as(u3, size) + 2);
+        f.comma();
+        f.appendHex(address +% @as(u64, @bitCast(offset)));
+        result.operands_len = f.len();
+        return;
+    }
+
+    // Pair S/D/Q registers, scaled signed imm7. Non-temporal pairs have idx=00.
+    if ((insn & 0x3e000000) == 0x2c000000) {
+        // opc=11 includes newer LDTNP/STTNP extensions; preserve them opaque.
+        if (size == 3) return;
+        const scale: u3 = @as(u3, size) + 2;
+        const idx = bits(insn, 24, 23);
+        const load = bit(insn, 22) == 1;
+        result.mnemonic = if (idx == 0)
+            (if (load) "ldnp" else "stnp")
+        else
+            (if (load) "ldp" else "stp");
+        const offset = std.math.signExtend(i64, @as(u7, @intCast(bits(insn, 21, 15)))) * (@as(i64, 1) << scale);
+        appendSIMDRegister(&f, rt, scale);
+        f.comma();
+        appendSIMDRegister(&f, bits(insn, 14, 10), scale);
+        f.comma();
+        appendSIMDAddress(&f, rn, offset, if (idx == 0) 2 else @intCast(idx));
+        result.operands_len = f.len();
+        return;
+    }
+
+    const unsigned = (insn & 0x3f000000) == 0x3d000000;
+    const imm9 = (insn & 0x3f200000) == 0x3c000000;
+    const regoff = (insn & 0x3f200c00) == 0x3c200800;
+    if (!unsigned and !imm9 and !regoff) return;
+    // opc[1] selects a 128-bit transfer, which requires size=00.
+    if (opc >= 2 and size != 0) {
+        result.mnemonic = "udf";
+        return;
+    }
+    const scale: u3 = if (opc >= 2) 4 else @as(u3, size);
+    const load = (opc & 1) == 1;
+    const idx: u2 = @truncate(bits(insn, 11, 10));
+    const option: u3 = @truncate(bits(insn, 15, 13));
+    // SIMD has no unprivileged imm9 form. Register offsets require option<1>=1.
+    if ((imm9 and idx == 2) or (regoff and (option & 2) == 0)) {
+        result.mnemonic = "udf";
+        return;
+    }
+    result.mnemonic = if (imm9 and idx == 0)
+        (if (load) "ldur" else "stur")
+    else
+        (if (load) "ldr" else "str");
+    appendSIMDRegister(&f, rt, scale);
+    f.comma();
+    if (unsigned) {
+        appendSIMDAddress(&f, rn, @as(i64, bits(insn, 21, 10)) << scale, 2);
+    } else if (imm9) {
+        const offset = std.math.signExtend(i64, @as(u9, @intCast(bits(insn, 20, 12))));
+        appendSIMDAddress(&f, rn, offset, if (idx == 0) 2 else idx);
+    } else {
+        const rm: u5 = @truncate(bits(insn, 20, 16));
+        const shifted = bit(insn, 12) == 1;
+        f.appendFmt("[{s}, {s}", .{ xRegName(rn), if ((option & 1) == 1) xRegOrZr(rm) else wRegOrZr(rm) });
+        if (option != 3 or shifted) {
+            const ext = switch (option) {
+                2 => "uxtw",
+                3 => "lsl",
+                6 => "sxtw",
+                7 => "sxtx",
+                else => unreachable,
+            };
+            f.appendFmt(", {s} #{d}", .{ ext, if (shifted) scale else @as(u3, 0) });
+        }
+        f.append("]");
+    }
+    result.operands_len = f.len();
+}
+
+fn appendSIMDAddress(f: *FmtBuf, rn: u5, offset: i64, idx: u2) void {
+    f.appendFmt("[{s}", .{xRegName(rn)});
+    if (idx != 1 and (offset != 0 or idx == 3)) {
+        f.append(", #");
+        f.appendSignedHex(offset);
+    }
+    f.append("]");
+    if (idx == 1) {
+        f.append(", #");
+        f.appendSignedHex(offset);
+    } else if (idx == 3) {
+        f.append("!");
+    }
+}
+
+// FEAT_LSE scalar atomic RMW identities. No memory/ordering semantics are
+// inferred by the IR from this decoder. Reserved operations stay opaque.
+fn decodeLseAtomic(insn: u32, result: *DecodedInstruction) bool {
+    if (insn & 0x3f200c00 != 0x38200000) return false;
+    const op: u4 = @truncate(insn >> 12);
+    if (op > 8) return false;
+    const size: u2 = @truncate(insn >> 30);
+    const order: u2 = @truncate(insn >> 22);
+    const names = [9][4][3][]const u8{
+        .{ .{ "ldaddb", "ldaddh", "ldadd" }, .{ "ldaddlb", "ldaddlh", "ldaddl" }, .{ "ldaddab", "ldaddah", "ldadda" }, .{ "ldaddalb", "ldaddalh", "ldaddal" } },
+        .{ .{ "ldclrb", "ldclrh", "ldclr" }, .{ "ldclrlb", "ldclrlh", "ldclrl" }, .{ "ldclrab", "ldclrah", "ldclra" }, .{ "ldclralb", "ldclralh", "ldclral" } },
+        .{ .{ "ldeorb", "ldeorh", "ldeor" }, .{ "ldeorlb", "ldeorlh", "ldeorl" }, .{ "ldeorab", "ldeorah", "ldeora" }, .{ "ldeoralb", "ldeoralh", "ldeoral" } },
+        .{ .{ "ldsetb", "ldseth", "ldset" }, .{ "ldsetlb", "ldsetlh", "ldsetl" }, .{ "ldsetab", "ldsetah", "ldseta" }, .{ "ldsetalb", "ldsetalh", "ldsetal" } },
+        .{ .{ "ldsmaxb", "ldsmaxh", "ldsmax" }, .{ "ldsmaxlb", "ldsmaxlh", "ldsmaxl" }, .{ "ldsmaxab", "ldsmaxah", "ldsmaxa" }, .{ "ldsmaxalb", "ldsmaxalh", "ldsmaxal" } },
+        .{ .{ "ldsminb", "ldsminh", "ldsmin" }, .{ "ldsminlb", "ldsminlh", "ldsminl" }, .{ "ldsminab", "ldsminah", "ldsmina" }, .{ "ldsminalb", "ldsminalh", "ldsminal" } },
+        .{ .{ "ldumaxb", "ldumaxh", "ldumax" }, .{ "ldumaxlb", "ldumaxlh", "ldumaxl" }, .{ "ldumaxab", "ldumaxah", "ldumaxa" }, .{ "ldumaxalb", "ldumaxalh", "ldumaxal" } },
+        .{ .{ "lduminb", "lduminh", "ldumin" }, .{ "lduminlb", "lduminlh", "lduminl" }, .{ "lduminab", "lduminah", "ldumina" }, .{ "lduminalb", "lduminalh", "lduminal" } },
+        .{ .{ "swpb", "swph", "swp" }, .{ "swplb", "swplh", "swpl" }, .{ "swpab", "swpah", "swpa" }, .{ "swpalb", "swpalh", "swpal" } },
+    };
+    result.mnemonic = names[op][order][@min(size, 2)];
+    var f = FmtBuf.init(&result.operands);
+    f.append(regName(@truncate(insn >> 16), size == 3));
+    f.comma();
+    f.append(regName(@truncate(insn), size == 3));
+    f.comma();
+    f.appendFmt("[{s}]", .{xRegName(@truncate(insn >> 5))});
+    result.operands_len = f.len();
+    return true;
+}
+
+fn decodeLoadStore(insn: u32, address: u64, result: *DecodedInstruction) void {
+    if (decodeLseAtomic(insn, result)) return;
+    if (bit(insn, 26) == 1) {
+        decodeSIMDMemory(insn, address, result);
+        return;
+    }
     // ARM64 load/store dispatch.
     // The load/store encoding group (bits[28:25] = x1x0) is sub-classified by
     // bits [29:28] and [26] and [24:23].
@@ -1194,6 +1382,12 @@ fn loadStoreMnemonic(size: u2, v: u1, opc: u2) []const u8 {
     };
 }
 
+fn loadStoreTargetIs64(size: u2, opc: u2) bool {
+    // opc=10 selects signed extension to 64 bits for byte, halfword, and word.
+    // opc=11 selects signed extension to 32 bits only for byte and halfword.
+    return size == 0b11 or opc == 0b10;
+}
+
 fn decodeLoadStoreUnsignedImm(insn: u32, result: *DecodedInstruction) void {
     const size: u2 = @truncate(bits(insn, 31, 30));
     const v: u1 = @truncate(bits(insn, 26, 26));
@@ -1215,7 +1409,7 @@ fn decodeLoadStoreUnsignedImm(insn: u32, result: *DecodedInstruction) void {
     }
 
     // Determine register width for the data register
-    const sf = (size == 0b11) or (opc >= 0b10 and size == 0b10);
+    const sf = loadStoreTargetIs64(size, opc);
 
     var f = FmtBuf.init(&result.operands);
     if (v == 0) {
@@ -1250,7 +1444,7 @@ fn decodeLoadStoreRegImm9(insn: u32, result: *DecodedInstruction) void {
     const rn: u5 = @truncate(bits(insn, 9, 5));
     const rt: u5 = @truncate(bits(insn, 4, 0));
 
-    const offset = signExtend(imm9, 8);
+    const offset = std.math.signExtend(i64, @as(u9, @intCast(imm9)));
 
     result.mnemonic = loadStoreMnemonic(size, v, opc);
     if (std.mem.eql(u8, result.mnemonic, "udf")) {
@@ -1258,7 +1452,7 @@ fn decodeLoadStoreRegImm9(insn: u32, result: *DecodedInstruction) void {
         return;
     }
 
-    const sf = (size == 0b11) or (opc >= 0b10 and size == 0b10);
+    const sf = loadStoreTargetIs64(size, opc);
 
     var f = FmtBuf.init(&result.operands);
     f.append(regName(rt, sf));
@@ -1319,13 +1513,23 @@ fn decodeLoadStoreRegOff(insn: u32, result: *DecodedInstruction) void {
     const rn: u5 = @truncate(bits(insn, 9, 5));
     const rt: u5 = @truncate(bits(insn, 4, 0));
 
+    // Keep atomics and other bit21=1 classes outside this register-offset form.
+    if ((insn & 0x3f200c00) != 0x38200800) {
+        result.mnemonic = "ldr/str";
+        return;
+    }
+    if ((option & 0b010) == 0) {
+        result.mnemonic = "udf";
+        return;
+    }
+
     result.mnemonic = loadStoreMnemonic(size, v, opc);
     if (std.mem.eql(u8, result.mnemonic, "udf")) {
         result.operands_len = 0;
         return;
     }
 
-    const sf = (size == 0b11) or (opc >= 0b10 and size == 0b10);
+    const sf = loadStoreTargetIs64(size, opc);
     const rm_is_64 = (option & 0b001) == 1;
 
     var f = FmtBuf.init(&result.operands);
@@ -1373,7 +1577,7 @@ fn decodeLoadStorePair(insn: u32, result: *DecodedInstruction) void {
 
     const sf = opc == 0b10;
     const scale: u3 = if (sf) 3 else 2;
-    const offset = signExtend(imm7, 6) * (@as(i64, 1) << scale);
+    const offset = std.math.signExtend(i64, @as(u7, @intCast(imm7))) * (@as(i64, 1) << scale);
 
     if (v == 0) {
         if (l == 1) {
@@ -1572,6 +1776,11 @@ fn decodeDPAddSubShifted(insn: u32, result: *DecodedInstruction) void {
     const rn: u5 = @truncate(bits(insn, 9, 5));
     const rd: u5 = @truncate(bits(insn, 4, 0));
 
+    if (shift == 3 or (!sf and imm6 >= 32)) {
+        result.mnemonic = "udf";
+        return;
+    }
+
     // CMP alias: SUBS Rd=ZR, Rn, Rm{, shift}
     if (op == 1 and s == 1 and rd == 31) {
         result.mnemonic = "cmp";
@@ -1733,6 +1942,44 @@ fn decodeDPTwoSource(insn: u32, result: *DecodedInstruction) void {
 }
 
 fn decodeDPOneSource(insn: u32, result: *DecodedInstruction) void {
+    // Finite register pointer-authentication families, independently assembled.
+    // Exact opcode masks distinguish one-register zero-modifier forms from
+    // two-register modifiers. Decoding identity does not model PAC effects.
+    const one_name: ?[]const u8 = switch (insn & 0xffffffe0) {
+        0xdac123e0 => "paciza",
+        0xdac127e0 => "pacizb",
+        0xdac12be0 => "pacdza",
+        0xdac12fe0 => "pacdzb",
+        0xdac133e0 => "autiza",
+        0xdac137e0 => "autizb",
+        0xdac13be0 => "autdza",
+        0xdac13fe0 => "autdzb",
+        0xdac143e0 => "xpaci",
+        0xdac147e0 => "xpacd",
+        else => null,
+    };
+    const two_name: ?[]const u8 = switch (insn & 0xfffffc00) {
+        0xdac10000 => "pacia",
+        0xdac10400 => "pacib",
+        0xdac10800 => "pacda",
+        0xdac10c00 => "pacdb",
+        0xdac11000 => "autia",
+        0xdac11400 => "autib",
+        0xdac11800 => "autda",
+        0xdac11c00 => "autdb",
+        else => null,
+    };
+    if (one_name orelse two_name) |name| {
+        result.mnemonic = name;
+        var f = FmtBuf.init(&result.operands);
+        f.append(regName(@truncate(insn), true));
+        if (two_name != null) {
+            f.comma();
+            f.append(regNameSp(@truncate(insn >> 5), true));
+        }
+        result.operands_len = f.len();
+        return;
+    }
     const sf = bit(insn, 31) == 1;
     const opcode = bits(insn, 15, 10);
     const rn: u5 = @truncate(bits(insn, 9, 5));
@@ -1791,12 +2038,17 @@ fn decodeDPAddSubCarry(insn: u32, result: *DecodedInstruction) void {
 fn decodeDPCondCompare(insn: u32, result: *DecodedInstruction) void {
     const sf = bit(insn, 31) == 1;
     const op = bit(insn, 30);
-    const o3 = bit(insn, 4);
+    // Bit 11 selects immediate versus register; bits 10 and 4 are reserved.
+    if (insn & 0x20000410 != 0x20000000) {
+        result.mnemonic = "dp_reg";
+        return;
+    }
+    const immediate = bit(insn, 11);
     const rn: u5 = @truncate(bits(insn, 9, 5));
     const nzcv: u4 = @truncate(bits(insn, 3, 0));
     const cond: u4 = @truncate(bits(insn, 15, 12));
 
-    if (o3 == 0) {
+    if (immediate == 0) {
         // Conditional compare (register)
         const rm: u5 = @truncate(bits(insn, 20, 16));
         result.mnemonic = if (op == 0) "ccmn" else "ccmp";
@@ -2074,6 +2326,167 @@ pub fn decodeInstruction(raw: []const u8, address: u64) types.Instruction {
 // Tests
 // ============================================================================
 
+fn decodeTestWord(word: u32) DecodedInstruction {
+    const raw = [4]u8{ @truncate(word), @truncate(word >> 8), @truncate(word >> 16), @truncate(word >> 24) };
+    return decode(&raw, 0x1000);
+}
+
+test "signed GPR loads preserve W versus X destinations from LLVM encodings" {
+    const cases = .{
+        .{ @as(u32, 0x79800408), "ldrsh", "x8, [x0, #0x2]" }, // compiler R03
+        .{ @as(u32, 0x79c00408), "ldrsh", "w8, [x0, #0x2]" },
+        .{ @as(u32, 0x39800c29), "ldrsb", "x9, [x1, #0x3]" },
+        .{ @as(u32, 0x39c00c29), "ldrsb", "w9, [x1, #0x3]" },
+        .{ @as(u32, 0xb9800c4a), "ldrsw", "x10, [x2, #0xc]" },
+        .{ @as(u32, 0x389ff46b), "ldrsb", "x11, [x3], #-0x1" },
+        .{ @as(u32, 0x38dff46b), "ldrsb", "w11, [x3], #-0x1" },
+        .{ @as(u32, 0x789fec8c), "ldrsh", "x12, [x4, #-0x2]!" },
+        .{ @as(u32, 0x78dfec8c), "ldrsh", "w12, [x4, #-0x2]!" },
+        .{ @as(u32, 0xb88044ad), "ldrsw", "x13, [x5], #0x4" },
+        // Existing scalar unscaled names stay canonical LDRSB/SH/SW; the
+        // architectural LDUR forms have identical data register widths.
+        .{ @as(u32, 0x389f00ce), "ldrsb", "x14, [x6, #-0x10]" },
+        .{ @as(u32, 0x38df00ce), "ldrsb", "w14, [x6, #-0x10]" },
+        .{ @as(u32, 0x789f80ef), "ldrsh", "x15, [x7, #-0x8]" },
+        .{ @as(u32, 0x78df80ef), "ldrsh", "w15, [x7, #-0x8]" },
+        .{ @as(u32, 0xb89fc110), "ldrsw", "x16, [x8, #-0x4]" },
+        .{ @as(u32, 0x38aa6931), "ldrsb", "x17, [x9, x10]" },
+        .{ @as(u32, 0x38ea6931), "ldrsb", "w17, [x9, x10]" },
+        .{ @as(u32, 0x78acd972), "ldrsh", "x18, [x11, w12, sxtw #1]" },
+        .{ @as(u32, 0x78ecd972), "ldrsh", "w18, [x11, w12, sxtw #1]" },
+        .{ @as(u32, 0xb8ae79b3), "ldrsw", "x19, [x13, x14, lsl #2]" },
+    };
+    inline for (cases) |case| {
+        const decoded = decodeTestWord(case[0]);
+        try std.testing.expectEqualStrings(case[1], decoded.mnemonic);
+        try std.testing.expectEqualStrings(case[2], decoded.getOperands());
+    }
+    // Reserved word signed-to-W forms and reserved register-offset options.
+    const invalid = [_]u32{ 0xb9c00c4a, 0xb8c044ad, 0xb8ee79b3, 0x38aa0931, 0x38aa2931, 0x38aa8931, 0x38aaa931 };
+    for (invalid) |word| {
+        const decoded = decodeTestWord(word);
+        try std.testing.expectEqualStrings("udf", decoded.mnemonic);
+        try std.testing.expectEqualStrings("", decoded.getOperands());
+    }
+    // Scalar literal loads remain explicitly unsupported in this finite pass.
+    const literal = decodeTestWord(0x98000036);
+    try std.testing.expectEqualStrings("ldr/str", literal.mnemonic);
+}
+
+test "SIMD finite vector families match LLVM assembled arrangements" {
+    // clang -target arm64-apple-macos13; independently decoded by llvm-objdump.
+    const cases = .{
+        .{ @as(u32, 0x0e221c20), "and", "v0.8b, v1.8b, v2.8b" },
+        .{ @as(u32, 0x4e251c83), "and", "v3.16b, v4.16b, v5.16b" },
+        .{ @as(u32, 0x4ea81ce6), "orr", "v6.16b, v7.16b, v8.16b" },
+        .{ @as(u32, 0x0e6b1d49), "bic", "v9.8b, v10.8b, v11.8b" },
+        .{ @as(u32, 0x6e2e1dac), "eor", "v12.16b, v13.16b, v14.16b" },
+        .{ @as(u32, 0x0e228420), "add", "v0.8b, v1.8b, v2.8b" },
+        .{ @as(u32, 0x4e258483), "add", "v3.16b, v4.16b, v5.16b" },
+        .{ @as(u32, 0x0e6884e6), "add", "v6.4h, v7.4h, v8.4h" },
+        .{ @as(u32, 0x4e6b8549), "add", "v9.8h, v10.8h, v11.8h" },
+        .{ @as(u32, 0x0eae85ac), "add", "v12.2s, v13.2s, v14.2s" },
+        .{ @as(u32, 0x4eb1860f), "add", "v15.4s, v16.4s, v17.4s" },
+        .{ @as(u32, 0x4ef48672), "add", "v18.2d, v19.2d, v20.2d" },
+        .{ @as(u32, 0x6e3786d5), "sub", "v21.16b, v22.16b, v23.16b" },
+        .{ @as(u32, 0x6efa8738), "sub", "v24.2d, v25.2d, v26.2d" },
+    };
+    inline for (cases) |case| {
+        const decoded = decodeTestWord(case[0]);
+        try std.testing.expectEqualStrings(case[1], decoded.mnemonic);
+        try std.testing.expectEqualStrings(case[2], decoded.getOperands());
+    }
+}
+
+test "SIMD SHA3 BCAX and EOR3 preserve four vector operands" {
+    // clang -march=armv8.2-a+sha3; independent llvm-objdump references.
+    // First BCAX is also observed in compiler-produced R02 at offset 0x334.
+    const cases = .{
+        .{ @as(u32, 0xce210040), "bcax", "v0.16b, v2.16b, v1.16b, v0.16b" },
+        .{ @as(u32, 0xce3d73df), "bcax", "v31.16b, v30.16b, v29.16b, v28.16b" },
+        .{ @as(u32, 0xce2f5ce4), "bcax", "v4.16b, v7.16b, v15.16b, v23.16b" },
+        .{ @as(u32, 0xce230510), "bcax", "v16.16b, v8.16b, v3.16b, v1.16b" },
+        .{ @as(u32, 0xce020c20), "eor3", "v0.16b, v1.16b, v2.16b, v3.16b" },
+        .{ @as(u32, 0xce1d73df), "eor3", "v31.16b, v30.16b, v29.16b, v28.16b" },
+        .{ @as(u32, 0xce0f5ce4), "eor3", "v4.16b, v7.16b, v15.16b, v23.16b" },
+        .{ @as(u32, 0xce030510), "eor3", "v16.16b, v8.16b, v3.16b, v1.16b" },
+    };
+    inline for (cases) |case| {
+        const decoded = decodeTestWord(case[0]);
+        try std.testing.expectEqualStrings(case[1], decoded.mnemonic);
+        try std.testing.expectEqualStrings(case[2], decoded.getOperands());
+    }
+    // Bit15=1 is reserved here; altered opcodes/widths must remain outside
+    // the bounded Boolean family. RAX1/XAR/SHA512H are deliberately opaque.
+    const neighbors = [_]u32{
+        0xce218040, 0xce028c20, 0x8e210040, 0x8e020c20,
+        0xce410040, 0xce608c20, 0xce820c20, 0xce608020,
+    };
+    for (neighbors) |word| {
+        const decoded = decodeTestWord(word);
+        try std.testing.expectEqualStrings("simd/fp", decoded.mnemonic);
+        try std.testing.expectEqualStrings("", decoded.getOperands());
+    }
+}
+
+test "SIMD memory preserves Q D S registers offset scales and address modes" {
+    const cases = .{
+        .{ @as(u32, 0x3dc00c20), "ldr", "q0, [x1, #0x30]" },
+        .{ @as(u32, 0x3d800be2), "str", "q2, [sp, #0x20]" },
+        .{ @as(u32, 0xfd400883), "ldr", "d3, [x4, #0x10]" },
+        .{ @as(u32, 0xbd000cc5), "str", "s5, [x6, #0xc]" },
+        .{ @as(u32, 0x3cdf0107), "ldur", "q7, [x8, #-0x10]" },
+        .{ @as(u32, 0xfc1f8149), "stur", "d9, [x10, #-0x8]" },
+        .{ @as(u32, 0x3cc1058b), "ldr", "q11, [x12], #0x10" },
+        .{ @as(u32, 0xbc1fcdcd), "str", "s13, [x14, #-0x4]!" },
+        .{ @as(u32, 0x3cf17a0f), "ldr", "q15, [x16, x17, lsl #4]" },
+        .{ @as(u32, 0xfc345a72), "str", "d18, [x19, w20, uxtw #3]" },
+        .{ @as(u32, 0xad410440), "ldp", "q0, q1, [x2, #0x20]" },
+        .{ @as(u32, 0x6dbf13e3), "stp", "d3, d4, [sp, #-0x10]!" },
+        .{ @as(u32, 0x2cc118e5), "ldp", "s5, s6, [x7], #0x8" },
+        .{ @as(u32, 0xac410440), "ldnp", "q0, q1, [x2, #0x20]" },
+        .{ @as(u32, 0x9c000020), "ldr", "q0, 0x1004" },
+        .{ @as(u32, 0x5cffffe1), "ldr", "d1, 0xffc" },
+    };
+    inline for (cases) |case| {
+        const decoded = decodeTestWord(case[0]);
+        try std.testing.expectEqualStrings(case[1], decoded.mnemonic);
+        try std.testing.expectEqualStrings(case[2], decoded.getOperands());
+    }
+}
+
+test "SIMD reserved widths reject and neighboring instructions stay opaque" {
+    const invalid = [_]u32{
+        0x0ee28420, // ADD Q=0 size=11
+        0x2ee28420, // SUB Q=0 size=11
+        0x7dc00c20, 0xbdc00c20, 0xfdc00c20, // Q load requires size=00
+        0x7d800c20, 0xbd800c20, 0xfd800c20, // Q store requires size=00
+        0xdc000020, // SIMD literal opc=11
+        0x3cc1098b, // SIMD unprivileged imm9 is unallocated
+        0x3cf13a0f, // invalid register-offset option=001
+    };
+    for (invalid) |word| {
+        const decoded = decodeTestWord(word);
+        try std.testing.expectEqualStrings("udf", decoded.mnemonic);
+        try std.testing.expectEqualStrings("", decoded.getOperands());
+    }
+    const unsupported = [_]u32{
+        0x1e623820, // scalar FSUB D0,D1,D2 remains outside finite coverage
+        0x5ee28420, // scalar SIMD ADD D0,D1,D2
+        0x4ee21c20, // ORN vector, intentionally outside finite families
+        0x6e621c20, // BSL vector
+        0x4e228020, // SMLAL widening neighbor
+    };
+    for (unsupported) |word| {
+        const decoded = decodeTestWord(word);
+        try std.testing.expectEqualStrings("simd/fp", decoded.mnemonic);
+    }
+    const structure = decodeTestWord(0x4c407020); // LD1 structure access
+    try std.testing.expectEqualStrings("simd/ldst", structure.mnemonic);
+    const extended_pair = decodeTestWord(0xec410440); // newer LDTNP extension
+    try std.testing.expectEqualStrings("simd/ldst", extended_pair.mnemonic);
+}
+
 test "decode B (unconditional branch)" {
     // B #0x100 from address 0x1000
     // Encoding: 0b000101 | imm26
@@ -2213,4 +2626,287 @@ test "decode instruction length always 4" {
     const insn = [4]u8{ 0x1f, 0x20, 0x03, 0xd5 }; // NOP
     const result = decode(&insn, 0x0);
     try std.testing.expectEqual(@as(u8, 4), result.length);
+}
+
+test "TBZ and TBNZ decode every signed imm14 with word scaling" {
+    for ([_]u32{ 0x36000000, 0x37000000, 0xb6000000, 0xb7000000 }) |opcode| {
+        for (0..(1 << 14)) |immediate| {
+            var raw: [4]u8 = undefined;
+            std.mem.writeInt(u32, &raw, opcode | (@as(u32, @intCast(immediate)) << 5), .little);
+            const result = decode(&raw, 0x10000);
+            const signed: i64 = if (immediate < 0x2000) @intCast(immediate) else @as(i64, @intCast(immediate)) - 0x4000;
+            const expected: u64 = @intCast(0x10000 + signed * 4);
+            try std.testing.expectEqualStrings(if (opcode & 0x01000000 == 0) "tbz" else "tbnz", result.mnemonic);
+            try std.testing.expect(result.is_branch and result.is_conditional_branch and !result.is_call);
+            try std.testing.expectEqual(@as(?u64, expected), result.branch_target);
+        }
+    }
+}
+
+test "compare and test branches match assembler encodings" {
+    // Independently assembled with Apple clang and disassembled with otool.
+    const cases = [_]struct { word: u32, address: u64, mnemonic: []const u8, operands: []const u8, target: u64 }{
+        .{ .word = 0x36f80083, .address = 0, .mnemonic = "tbz", .operands = "w3, #31, 0x10", .target = 0x10 },
+        .{ .word = 0xb7ffffe5, .address = 4, .mnemonic = "tbnz", .operands = "x5, #63, 0x0", .target = 0 },
+        .{ .word = 0x34000043, .address = 8, .mnemonic = "cbz", .operands = "w3, 0x10", .target = 0x10 },
+        .{ .word = 0xb5ffffa5, .address = 12, .mnemonic = "cbnz", .operands = "x5, 0x0", .target = 0 },
+    };
+    for (cases) |case| {
+        var raw: [4]u8 = undefined;
+        std.mem.writeInt(u32, &raw, case.word, .little);
+        const result = decode(&raw, case.address);
+        try std.testing.expectEqualStrings(case.mnemonic, result.mnemonic);
+        try std.testing.expectEqualStrings(case.operands, result.getOperands());
+        try std.testing.expectEqual(@as(?u64, case.target), result.branch_target);
+    }
+}
+
+test "signed branch immediate boundaries and address wrapping" {
+    const cases = .{
+        .{ @as(u32, 0x14000000), 26, 0, "b" },
+        .{ @as(u32, 0x94000000), 26, 0, "bl" },
+        .{ @as(u32, 0x54000000), 19, 5, "b.eq" },
+        .{ @as(u32, 0x34000000), 19, 5, "cbz" },
+        .{ @as(u32, 0xb5000000), 19, 5, "cbnz" },
+    };
+    inline for (cases) |case| {
+        const sign = 1 << (case[1] - 1);
+        for ([_]u32{ 0, 1, sign - 1, sign, sign + 1, sign * 2 - 1 }) |immediate| {
+            // The oracle uses subtraction, independently of signExtend.
+            const signed: i64 = if (immediate < sign) immediate else @as(i64, immediate) - sign * 2;
+            for ([_]u64{ 0, 0x100000000, std.math.maxInt(u64) - 3 }) |address| {
+                var raw: [4]u8 = undefined;
+                std.mem.writeInt(u32, &raw, case[0] | (immediate << case[2]), .little);
+                const result = decode(&raw, address);
+                const expected = address +% @as(u64, @bitCast(signed * 4));
+                try std.testing.expectEqualStrings(case[3], result.mnemonic);
+                try std.testing.expect(result.is_branch);
+                try std.testing.expectEqual(case[0] == 0x94000000, result.is_call);
+                try std.testing.expectEqual(@as(?u64, expected), result.branch_target);
+            }
+        }
+    }
+}
+
+test "ADR and ADRP signed immediate boundaries preserve page scaling" {
+    for ([_]u32{ 0, 1, 0xfffff, 0x100000, 0x100001, 0x1fffff }) |immediate| {
+        const signed: i64 = if (immediate < 0x100000) immediate else @as(i64, immediate) - 0x200000;
+        for ([_]u32{ 0x10000000, 0x90000000 }) |opcode| {
+            const is_page = opcode == 0x90000000;
+            for ([_]u64{ 0, 0x100001234, std.math.maxInt(u64) }) |address| {
+                var raw: [4]u8 = undefined;
+                const word = opcode | ((immediate & 3) << 29) | ((immediate >> 2) << 5);
+                std.mem.writeInt(u32, &raw, word, .little);
+                const result = decode(&raw, address);
+                const base = if (is_page) address & ~@as(u64, 0xfff) else address;
+                const offset = signed * @as(i64, if (is_page) 4096 else 1);
+                const expected = base +% @as(u64, @bitCast(offset));
+                var operands: [64]u8 = undefined;
+                const expected_operands = try std.fmt.bufPrint(&operands, "x0, 0x{x}", .{expected});
+                try std.testing.expectEqualStrings(if (is_page) "adrp" else "adr", result.mnemonic);
+                try std.testing.expectEqualStrings(expected_operands, result.getOperands());
+            }
+        }
+    }
+}
+
+test "signed load store immediates exhaust imm9 and scaled imm7" {
+    for (0..512) |immediate| {
+        const signed: i64 = if (immediate < 256) @intCast(immediate) else @as(i64, @intCast(immediate)) - 512;
+        var raw: [4]u8 = undefined;
+        // STR x0, [x1], #imm9 uses post-index syntax even when the offset is zero.
+        std.mem.writeInt(u32, &raw, 0xf8000420 | (@as(u32, @intCast(immediate)) << 12), .little);
+        const result = decode(&raw, 0x1000);
+        var operands: [64]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&operands, "x0, [x1], #{s}0x{x}", .{ if (signed < 0) "-" else "", @abs(signed) });
+        try std.testing.expectEqualStrings("str", result.mnemonic);
+        try std.testing.expectEqualStrings(expected, result.getOperands());
+    }
+    for ([_]bool{ false, true }) |wide| {
+        for (0..128) |immediate| {
+            const signed: i64 = if (immediate < 64) @intCast(immediate) else @as(i64, @intCast(immediate)) - 128;
+            const offset = signed * @as(i64, if (wide) 8 else 4);
+            var raw: [4]u8 = undefined;
+            const opcode: u32 = if (wide) 0xa8800820 else 0x28800820;
+            std.mem.writeInt(u32, &raw, opcode | (@as(u32, @intCast(immediate)) << 15), .little);
+            const result = decode(&raw, 0x1000);
+            var operands: [64]u8 = undefined;
+            const expected = try std.fmt.bufPrint(&operands, "{s}0, {s}2, [x1], #{s}0x{x}", .{ if (wide) "x" else "w", if (wide) "x" else "w", if (offset < 0) "-" else "", @abs(offset) });
+            try std.testing.expectEqualStrings("stp", result.mnemonic);
+            try std.testing.expectEqualStrings(expected, result.getOperands());
+        }
+    }
+}
+
+// Independent oracle: classify element-size ranges directly, then evaluate
+// every output bit's membership in the rotated run. No production rotate,
+// size-selector, replication, or mask-building helper is reused.
+fn referenceLogicalImmediate(sf: bool, n: u1, imms: u6, immr: u6) ?u64 {
+    if (!sf and n != 0) return null;
+    const element_size: u8 = if (n == 1) 64 else if (imms < 32) 32 else if (imms < 48) 16 else if (imms < 56) 8 else if (imms < 60) 4 else if (imms < 62) 2 else return null;
+    const ones: u8 = @as(u8, imms) % element_size + 1;
+    if (ones == element_size) return null;
+    var mask: u64 = 0;
+    const width: u8 = if (sf) 64 else 32;
+    var position: u8 = 0;
+    while (position < width) : (position += 1) {
+        const source_bit = (@as(u16, position) + immr) % element_size;
+        if (source_bit < ones) mask |= @as(u64, 1) << @as(u6, @intCast(position));
+    }
+    return mask;
+}
+
+test "evidence: logical immediates exhaust widths selectors rotations and reserved encodings" {
+    var valid: usize = 0;
+    var invalid: usize = 0;
+    const names = [_][]const u8{ "and", "orr", "eor", "ands" };
+    for (0..2) |sf_raw| {
+        for (0..2) |n_raw| {
+            for (0..64) |s_raw| {
+                for (0..64) |r_raw| {
+                    const sf = sf_raw != 0;
+                    const n: u1 = @intCast(n_raw);
+                    const s: u6 = @intCast(s_raw);
+                    const r: u6 = @intCast(r_raw);
+                    const expected = referenceLogicalImmediate(sf, n, s, r);
+                    try std.testing.expectEqual(expected, decodeBitmaskImm(n, s, r, sf));
+                    if (expected != null) valid += 1 else invalid += 1;
+                    for (0..4) |opc| {
+                        const word: u32 = 0x12000043 | (@as(u32, @intCast(sf_raw)) << 31) |
+                            (@as(u32, @intCast(opc)) << 29) | (@as(u32, n) << 22) |
+                            (@as(u32, r) << 16) | (@as(u32, s) << 10);
+                        var raw: [4]u8 = undefined;
+                        std.mem.writeInt(u32, &raw, word, .little);
+                        const decoded = decode(&raw, 0x1000);
+                        if (expected) |mask| {
+                            try std.testing.expectEqualStrings(names[opc], decoded.mnemonic);
+                            var expected_buf: [80]u8 = undefined;
+                            const operands = try std.fmt.bufPrint(&expected_buf, "{s}3, {s}2, #0x{x}", .{ if (sf) "x" else "w", if (sf) "x" else "w", mask });
+                            try std.testing.expectEqualStrings(operands, decoded.getOperands());
+                        } else {
+                            try std.testing.expectEqualStrings("udf", decoded.mnemonic);
+                            try std.testing.expectEqual(@as(u8, 0), decoded.operands_len);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 11328), valid);
+    try std.testing.expectEqual(@as(usize, 5056), invalid);
+}
+
+test "evidence: logical immediate native regression and full width rotate" {
+    const cases = [_]struct { word: u32, mnemonic: []const u8, operands: []const u8 }{
+        .{ .word = 0x521d03c9, .mnemonic = "eor", .operands = "w9, w30, #0x8" },
+        .{ .word = 0xb24103e0, .mnemonic = "mov", .operands = "x0, #0x8000000000000000" },
+        .{ .word = 0xb24003e0, .mnemonic = "mov", .operands = "x0, #0x1" },
+        .{ .word = 0x320003e0, .mnemonic = "mov", .operands = "w0, #0x1" },
+        .{ .word = 0x324003e0, .mnemonic = "udf", .operands = "" },
+        .{ .word = 0xb240ffe0, .mnemonic = "udf", .operands = "" },
+    };
+    for (cases) |case| {
+        var raw: [4]u8 = undefined;
+        std.mem.writeInt(u32, &raw, case.word, .little);
+        const decoded = decode(&raw, 0);
+        try std.testing.expectEqualStrings(case.mnemonic, decoded.mnemonic);
+        try std.testing.expectEqualStrings(case.operands, decoded.getOperands());
+    }
+}
+
+test "opaque family labels do not claim decoded instruction identity" {
+    for ([_][]const u8{ "simd/ldst", "simd/fp", "dp_reg", "dp1src", "dp2src", "ldr/str", "sve", "udf" }) |name|
+        try std.testing.expectEqual(DecodeStatus.unsupported, decodeStatus(0xcccccccc, name));
+    try std.testing.expectEqual(DecodeStatus.unsupported, decodeTestWord(0xcccccccc).decode_status);
+    try std.testing.expectEqual(DecodeStatus.unsupported, decodeTestWord(0x1e623820).decode_status);
+    try std.testing.expectEqual(DecodeStatus.decoded, decodeTestWord(0x3dc00c20).decode_status);
+    try std.testing.expectEqual(DecodeStatus.decoded, decodeTestWord(0x4ee28420).decode_status);
+    try std.testing.expectEqual(DecodeStatus.decoded, decodeTestWord(0x00001234).decode_status);
+    try std.testing.expectEqual(DecodeStatus.unsupported, decodeTestWord(0xffffffff).decode_status);
+    try std.testing.expectEqual(DecodeStatus.unsupported, decode(&.{ 0, 0 }, 0).decode_status);
+}
+
+test "finite MOVI 2D and register pointer authentication decode preserve known fallthrough" {
+    const cases = .{
+        .{ @as(u32, 0x6f00e400), "movi", "v0.2d, #0x0" },
+        .{ @as(u32, 0x6f05e543), "movi", "v3.2d, #0xff00ff00ff00ff00" },
+        .{ @as(u32, 0xdac123f0), "paciza", "x16" },
+        .{ @as(u32, 0xdac127f1), "pacizb", "x17" },
+        .{ @as(u32, 0xdac12bf2), "pacdza", "x18" },
+        .{ @as(u32, 0xdac12ff3), "pacdzb", "x19" },
+        .{ @as(u32, 0xdac133f4), "autiza", "x20" },
+        .{ @as(u32, 0xdac137f5), "autizb", "x21" },
+        .{ @as(u32, 0xdac13bf6), "autdza", "x22" },
+        .{ @as(u32, 0xdac13ff7), "autdzb", "x23" },
+        .{ @as(u32, 0xdac143f8), "xpaci", "x24" },
+        .{ @as(u32, 0xdac147f9), "xpacd", "x25" },
+        .{ @as(u32, 0xdac10041), "pacia", "x1, x2" },
+        .{ @as(u32, 0xdac10483), "pacib", "x3, x4" },
+        .{ @as(u32, 0xdac108c5), "pacda", "x5, x6" },
+        .{ @as(u32, 0xdac10d07), "pacdb", "x7, x8" },
+        .{ @as(u32, 0xdac11149), "autia", "x9, x10" },
+        .{ @as(u32, 0xdac1158b), "autib", "x11, x12" },
+        .{ @as(u32, 0xdac119cd), "autda", "x13, x14" },
+        .{ @as(u32, 0xdac11e0f), "autdb", "x15, x16" },
+    };
+    inline for (cases) |case| {
+        const d = decodeTestWord(case[0]);
+        try std.testing.expectEqualStrings(case[1], d.mnemonic);
+        try std.testing.expectEqualStrings(case[2], d.getOperands());
+        try std.testing.expectEqual(DecodeStatus.decoded, d.decode_status);
+        try std.testing.expect(!d.is_branch and !d.is_call and !d.is_return);
+    }
+    for ([_]u32{ 0x2f00e400, 0x6f00ec00, 0x6f00e000, 0xdac163f0, 0x5ac123f0, 0xcccccccc, 0x0bc00000, 0x0b008000 }) |word|
+        try std.testing.expectEqual(DecodeStatus.unsupported, decodeTestWord(word).decode_status);
+}
+
+test "scalar FADD identity preserves CFG fallthrough without modeling FP effects" {
+    const cases = .{
+        .{ @as(u32, 0x1e202800), "s0, s0, s0" },
+        .{ @as(u32, 0x1e622820), "d0, d1, d2" },
+        .{ @as(u32, 0x1e3d2bdf), "s31, s30, s29" },
+    };
+    inline for (cases) |case| {
+        const d = decodeTestWord(case[0]);
+        try std.testing.expectEqualStrings("fadd", d.mnemonic);
+        try std.testing.expectEqualStrings(case[1], d.getOperands());
+        try std.testing.expectEqual(DecodeStatus.decoded, d.decode_status);
+        try std.testing.expect(!d.is_branch and !d.is_call and !d.is_return);
+    }
+    for ([_]u32{ 0x1e623820, 0x1ee22820, 0x1ea22820, 0x9e622820, 0x1e222c20 }) |word|
+        try std.testing.expectEqual(DecodeStatus.unsupported, decodeTestWord(word).decode_status);
+}
+
+test "CCMP CCMN immediate selector and reserved bits are exact" {
+    const cases = .{
+        .{ @as(u32, 0x7a462900), "ccmp", "w8, #6, #0, cs" },
+        .{ @as(u32, 0x7a462100), "ccmp", "w8, w6, #0, cs" },
+        .{ @as(u32, 0xba5ffbeF), "ccmn", "xzr, #31, #15, nv" },
+        .{ @as(u32, 0x3a400800), "ccmn", "w0, #0, #0, eq" },
+    };
+    inline for (cases) |case| {
+        const d = decodeTestWord(case[0]);
+        try std.testing.expectEqualStrings(case[1], d.mnemonic);
+        try std.testing.expectEqualStrings(case[2], d.getOperands());
+    }
+    for ([_]u32{ 0x7a462910, 0x7a462d00, 0x5a462900 }) |word|
+        try std.testing.expectEqual(DecodeStatus.unsupported, decodeTestWord(word).decode_status);
+}
+
+test "LSE atomic identities preserve sequential CFG without claiming atomic IR semantics" {
+    const cases = .{
+        .{ @as(u32, 0x38e08108), "swpalb", "w0, w8, [x8]" },
+        .{ @as(u32, 0xf8e90108), "ldaddal", "x9, x8, [x8]" },
+        .{ @as(u32, 0x78203041), "ldseth", "w0, w1, [x2]" },
+        .{ @as(u32, 0xb8bf23ff), "ldeora", "wzr, wzr, [sp]" },
+    };
+    inline for (cases) |case| {
+        const d = decodeTestWord(case[0]);
+        try std.testing.expectEqualStrings(case[1], d.mnemonic);
+        try std.testing.expectEqualStrings(case[2], d.getOperands());
+        try std.testing.expectEqual(DecodeStatus.decoded, d.decode_status);
+        try std.testing.expect(!d.is_branch and !d.is_call and !d.is_return);
+    }
+    for ([_]u32{ 0x38e09108, 0x38e0a108, 0x38e0f108, 0x38e08508, 0x38e08d08 }) |word|
+        try std.testing.expectEqual(DecodeStatus.unsupported, decodeTestWord(word).decode_status);
 }

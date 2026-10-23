@@ -6,8 +6,13 @@ comptime {
     _ = @import("analysis/xref.zig");
     _ = @import("analysis/procedures.zig");
     _ = @import("analysis/cfg.zig");
+    _ = @import("analysis/structure.zig");
     _ = @import("analysis/disassembler.zig");
+    _ = @import("analysis/arm64_semantics.zig");
+    _ = @import("analysis/arm64_branch_predicate.zig");
     _ = @import("analysis/pipeline.zig");
+    _ = @import("analysis/abi.zig");
+    _ = @import("analysis/types.zig");
     _ = @import("analysis/objc.zig");
     _ = @import("analysis/swift.zig");
     _ = @import("arch/arm64.zig");

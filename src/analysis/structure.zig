@@ -126,26 +126,21 @@ fn buildCfgIndex(
     // Build successor/predecessor lists from the BasicBlock arrays themselves
     // (these are already deduped by cfg.zig).
     var successors = try allocator.alloc([]u32, n);
-    errdefer allocator.free(successors);
+    @memset(successors, &.{});
+    errdefer {
+        for (successors) |indices| allocator.free(indices);
+        allocator.free(successors);
+    }
     var predecessors = try allocator.alloc([]u32, n);
-    errdefer allocator.free(predecessors);
+    @memset(predecessors, &.{});
+    errdefer {
+        for (predecessors) |indices| allocator.free(indices);
+        allocator.free(predecessors);
+    }
 
-    var any_filled: u32 = 0;
     for (blocks, 0..) |b, i| {
-        var s_list = std.array_list.Managed(u32).init(allocator);
-        defer s_list.deinit();
-        for (b.successors) |succ_addr| {
-            if (index_of.get(succ_addr)) |idx| try s_list.append(idx);
-        }
-        successors[i] = try allocator.dupe(u32, s_list.items);
-
-        var p_list = std.array_list.Managed(u32).init(allocator);
-        defer p_list.deinit();
-        for (b.predecessors) |pred_addr| {
-            if (index_of.get(pred_addr)) |idx| try p_list.append(idx);
-        }
-        predecessors[i] = try allocator.dupe(u32, p_list.items);
-        any_filled += 1;
+        successors[i] = try copyNeighborIndices(allocator, &index_of, b.successors);
+        predecessors[i] = try copyNeighborIndices(allocator, &index_of, b.predecessors);
     }
 
     // Identify true/false successors using the edge list.
@@ -181,6 +176,28 @@ fn buildCfgIndex(
         .true_succ = true_succ,
         .false_succ = false_succ,
     };
+}
+
+/// Small adjacency lists use local scratch storage. The returned indices always
+/// belong to `allocator` and remain valid after this function reuses its buffer.
+fn copyNeighborIndices(
+    allocator: std.mem.Allocator,
+    index_of: *const std.AutoHashMap(u64, u32),
+    neighbors: []const u64,
+) ![]u32 {
+    var buffer: [128]u8 align(@alignOf(u32)) = undefined;
+    var scratch: std.heap.BufferFirstAllocator = .init(&buffer, allocator);
+    const scratch_allocator = scratch.allocator();
+    var indices: std.ArrayList(u32) = .empty;
+    defer indices.deinit(scratch_allocator);
+    // Reserve directly so ArrayList's initial growth rounding cannot spill a
+    // tiny list beyond the local buffer on targets with large cache lines.
+    try indices.ensureTotalCapacityPrecise(scratch_allocator, @min(neighbors.len, buffer.len / @sizeOf(u32)));
+
+    for (neighbors) |address| {
+        if (index_of.get(address)) |index| try indices.append(scratch_allocator, index);
+    }
+    return allocator.dupe(u32, indices.items);
 }
 
 // ============================================================================
@@ -834,6 +851,126 @@ fn freeBlocks(allocator: std.mem.Allocator, blocks: []types.BasicBlock) void {
         allocator.free(b.predecessors);
     }
     allocator.free(blocks);
+}
+
+test "CFG index owns adjacency after scratch reuse" {
+    var first_successors = [_]u64{ 0x1004, 0x1008 };
+    var second_successors = [_]u64{0x1008};
+    var second_predecessors = [_]u64{0x1000};
+    var third_predecessors = [_]u64{ 0x1000, 0x1004 };
+    const blocks = [_]types.BasicBlock{
+        .{ .start = 0x1000, .size = 4, .instruction_count = 1, .successors = &first_successors, .predecessors = &.{}, .terminator = .branch },
+        .{ .start = 0x1004, .size = 4, .instruction_count = 1, .successors = &second_successors, .predecessors = &second_predecessors, .terminator = .jump },
+        .{ .start = 0x1008, .size = 4, .instruction_count = 1, .successors = &.{}, .predecessors = &third_predecessors, .terminator = .@"return" },
+    };
+    const edges = [_]types.CfgEdge{
+        .{ .from = 0x1000, .to = 0x1004, .edge_type = .branch_true },
+        .{ .from = 0x1000, .to = 0x1008, .edge_type = .branch_false },
+    };
+    var cfg = try buildCfgIndex(testing.allocator, &blocks, &edges);
+    defer cfg.deinit();
+
+    // A later build and mutations to another owned slice must not change the
+    // first graph's adjacency. Every scratch buffer has already gone away.
+    var second_cfg = try buildCfgIndex(testing.allocator, &blocks, &edges);
+    defer second_cfg.deinit();
+    second_cfg.successors[0][0] = 2;
+    cfg.predecessors[2][0] = 1;
+
+    try testing.expectEqualSlices(u32, &.{ 1, 2 }, cfg.successors[0]);
+    try testing.expectEqualSlices(u32, &.{2}, cfg.successors[1]);
+    try testing.expectEqualSlices(u32, &.{0}, cfg.predecessors[1]);
+    try testing.expectEqualSlices(u32, &.{ 0, 1 }, second_cfg.predecessors[2]);
+    try testing.expectEqual(@as(?u32, 1), cfg.true_succ[0]);
+    try testing.expectEqual(@as(?u32, 2), cfg.false_succ[0]);
+}
+
+test "CFG index supports empty graphs and ignores missing neighbors" {
+    var empty_cfg = try buildCfgIndex(testing.allocator, &.{}, &.{});
+    defer empty_cfg.deinit();
+    try testing.expectEqual(0, empty_cfg.addr_of.len);
+    try testing.expectEqual(0, empty_cfg.successors.len);
+    try testing.expectEqual(0, empty_cfg.predecessors.len);
+
+    var neighbors = [_]u64{ 0xdead, 0x1000, 0xbeef };
+    var missing = [_]u64{ 0xdead, 0xbeef };
+    const blocks = [_]types.BasicBlock{
+        .{ .start = 0x1000, .size = 4, .instruction_count = 1, .successors = &neighbors, .predecessors = &missing, .terminator = .branch },
+    };
+    const edges = [_]types.CfgEdge{
+        .{ .from = 0x1000, .to = 0xdead, .edge_type = .branch_true },
+        .{ .from = 0xdead, .to = 0x1000, .edge_type = .branch_false },
+    };
+    var cfg = try buildCfgIndex(testing.allocator, &blocks, &edges);
+    defer cfg.deinit();
+    try testing.expectEqualSlices(u32, &.{0}, cfg.successors[0]);
+    try testing.expectEqual(0, cfg.predecessors[0].len);
+    try testing.expectEqual(@as(?u32, null), cfg.true_succ[0]);
+    try testing.expectEqual(@as(?u32, null), cfg.false_succ[0]);
+}
+
+test "CFG index small adjacency allocates only its owned result" {
+    var index_of = std.AutoHashMap(u64, u32).init(testing.allocator);
+    defer index_of.deinit();
+    try index_of.put(0x1000, 0);
+    try index_of.put(0x1004, 1);
+    var tracked: testing.FailingAllocator = .init(testing.allocator, .{});
+    const indices = try copyNeighborIndices(tracked.allocator(), &index_of, &.{ 0x1004, 0xdead, 0x1000 });
+    defer tracked.allocator().free(indices);
+    try testing.expectEqualSlices(u32, &.{ 1, 0 }, indices);
+    try testing.expectEqual(1, tracked.allocations);
+    try testing.expectEqual(2 * @sizeOf(u32), tracked.allocated_bytes);
+}
+
+test "CFG index scratch spills to caller allocator for high degree lists" {
+    var index_of = std.AutoHashMap(u64, u32).init(testing.allocator);
+    defer index_of.deinit();
+    var neighbors: [96]u64 = undefined;
+    for (&neighbors, 0..) |*address, i| {
+        address.* = 0x1000 + i * 4;
+        try index_of.put(address.*, @intCast(i));
+    }
+    var tracked: testing.FailingAllocator = .init(testing.allocator, .{});
+    {
+        const indices = try copyNeighborIndices(tracked.allocator(), &index_of, &neighbors);
+        defer tracked.allocator().free(indices);
+        try testing.expectEqual(neighbors.len, indices.len);
+        for (indices, 0..) |index, i| try testing.expectEqual(i, index);
+        // One allocation owns the result; at least one more served scratch
+        // growth after the fixed buffer filled. All scratch is already freed.
+        try testing.expect(tracked.allocations > 1);
+        try testing.expectEqual(tracked.allocations - 1, tracked.deallocations);
+    }
+    try testing.expectEqual(tracked.allocated_bytes, tracked.freed_bytes);
+}
+
+fn checkCfgIndexAllocationFailure(allocator: std.mem.Allocator, degree: usize) !void {
+    var blocks: [97]types.BasicBlock = undefined;
+    var neighbors: [96]u64 = undefined;
+    for (blocks[0 .. degree + 1], 0..) |*block, i| {
+        block.* = .{
+            .start = 0x1000 + i * 4,
+            .size = 4,
+            .instruction_count = 1,
+            .successors = &.{},
+            .predecessors = &.{},
+            .terminator = .jump,
+        };
+    }
+    for (neighbors[0..degree], 0..) |*address, i| address.* = blocks[i + 1].start;
+    blocks[0].successors = neighbors[0..degree];
+    blocks[degree].predecessors = neighbors[0..degree];
+    var cfg = try buildCfgIndex(allocator, blocks[0 .. degree + 1], &.{});
+    defer cfg.deinit();
+    try testing.expectEqual(degree, cfg.successors[0].len);
+    try testing.expectEqual(degree, cfg.predecessors[degree].len);
+    for (cfg.successors[0], 0..) |index, i| try testing.expectEqual(i + 1, index);
+    for (cfg.predecessors[degree], 0..) |index, i| try testing.expectEqual(i + 1, index);
+}
+
+test "CFG index releases partial adjacency on every allocation failure" {
+    try testing.checkAllAllocationFailures(testing.allocator, checkCfgIndexAllocationFailure, .{2});
+    try testing.checkAllAllocationFailures(testing.allocator, checkCfgIndexAllocationFailure, .{96});
 }
 
 test "single-block return is a return_stmt" {

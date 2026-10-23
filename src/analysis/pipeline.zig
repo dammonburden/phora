@@ -1,6 +1,6 @@
 // Phora — Unified Analysis Pipeline
 // Single entry point for all binary analysis: disassembly, procedure detection,
-// string detection, xref tracking, and lifting.
+// string detection and xref tracking. Lifting is explicitly requested elsewhere.
 // Both CLI (main.zig) and MCP (tools.zig) call this — ensuring identical results.
 
 const std = @import("std");
@@ -161,6 +161,7 @@ fn analyzeWithOptions(
         defer allocator.free(call_targets);
 
         for (call_targets) |target| {
+            if (doc.codeRangeEnd(target) == null or !doc.permitsProcedureStart(target)) continue;
             if (target < text_start or target >= text_end) continue;
             if (!proc_set.contains(target)) {
                 proc_set.put(target, {}) catch {};
@@ -209,6 +210,7 @@ fn analyzeWithOptions(
         defer allocator.free(call_targets);
 
         for (call_targets) |target| {
+            if (doc.codeRangeEnd(target) == null or !doc.permitsProcedureStart(target)) continue;
             if (target < text_start or target >= text_end) continue;
             if (!proc_set.contains(target)) {
                 proc_set.put(target, {}) catch {};
@@ -249,6 +251,7 @@ fn analyzeWithOptions(
         defer allocator.free(call_targets);
 
         for (call_targets) |target| {
+            if (doc.codeRangeEnd(target) == null or !doc.permitsProcedureStart(target)) continue;
             if (target < text_start or target >= text_end) continue;
             if (!proc_set.contains(target)) {
                 proc_set.put(target, {}) catch {};
@@ -291,6 +294,7 @@ fn analyzeWithOptions(
         const call_targets = try xrefs.getCallTargets(allocator);
         defer allocator.free(call_targets);
         for (call_targets) |target| {
+            if (doc.codeRangeEnd(target) == null or !doc.permitsProcedureStart(target)) continue;
             if (target < text_start or target >= text_end) continue;
             if (!proc_set.contains(target)) {
                 proc_set.put(target, {}) catch {};
@@ -325,6 +329,7 @@ fn analyzeWithOptions(
         const call_targets = try xrefs.getCallTargets(allocator);
         defer allocator.free(call_targets);
         for (call_targets) |target| {
+            if (doc.codeRangeEnd(target) == null or !doc.permitsProcedureStart(target)) continue;
             if (target < text_start or target >= text_end) continue;
             if (!proc_set.contains(target)) {
                 proc_set.put(target, {}) catch {};
@@ -398,37 +403,9 @@ fn analyzeWithOptions(
 
     logPhase(io, "strings_done", phase_start);
 
-    // ====================================================================
-    // Phase 5: Lift procedures to IR (W1 — maturity passes wired)
-    // Phase 6: Recover structured control flow (W2)
-    // Phase 7: Detect jump tables (W3)
-    // Phase 8: Recover types from IR (W4)
-    //
-    // PARALLELISATION: kept SERIAL for v7.8.0 — see W1A1 caveat.
-    // `liftProcedure` reads from a `*Database` whose internal HashMaps are
-    // not documented as thread-safe; running it in parallel risks racy reads
-    // even though we never write through that pointer. Per the safety
-    // guidance ("Default to option 2 if in doubt — ship safe first, optimize
-    // later") we ship serial. The parallel scaffolding (parallel_mod) is
-    // imported so W8 (v7.9) can flip a feature flag to enable it once a
-    // thread-safe read API exists.
-    //
-    // Cost cap: we lift up to MAX_LIFT_FUNCS procedures so very large
-    // binaries (10k+ functions) don't spend minutes here. The pseudocode
-    // tool already lifts on demand.
-    // ====================================================================
-    var lift_success = false;
-    runMaturityPipeline(allocator, io, doc, data) catch |err| {
-        // Phase 5+ are best-effort: a failure here shouldn't block the rest
-        // of the analysis result. We log and continue with lift_success=false.
-        if (!builtin.is_test) std.debug.print("[phora load] phase=maturity_pipeline error={s}\n", .{@errorName(err)});
-    };
-    // If any structured function was produced, the lifter clearly succeeded
-    // for at least one proc.
-    if (doc.structured_functions) |sf_map| {
-        if (sf_map.count() > 0) lift_success = true;
-    }
-    logPhase(io, "maturity_done", phase_start);
+    // Loading builds binary evidence only. IR, inferred types, and structured
+    // derived views are computed by explicit analysis requests, never speculatively.
+    const lift_success = false;
 
     logPhase(io, "analyze_done", phase_start);
 
@@ -448,7 +425,7 @@ fn analyzeWithOptions(
 
 /// Cap on how many procedures we run the v7.8.0 maturity pipeline on per
 /// load. Beyond this, agents can opt-in to per-function analysis via the
-/// pseudocode/decompile MCP tools (which lift on demand). 4 KiB == ~32 ms
+/// IR MCP tools (which lift on demand). 4 KiB == ~32 ms
 /// per proc on the typical 90 MB binary, so 1024 procs ~ 30 s budget.
 const MAX_LIFT_FUNCS: usize = 1024;
 

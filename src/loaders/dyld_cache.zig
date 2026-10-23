@@ -257,7 +257,7 @@ pub fn loadImage(allocator: std.mem.Allocator, io: std.Io, image_name: []const u
         const cmdsize = std.mem.readInt(u32, lc_buf[off + 4 ..][0..4], .little);
         if (cmdsize == 0 or off + cmdsize > lc_buf.len) break;
         if (cmd == LC_SEGMENT_64 and cmdsize >= 72) {
-            var name_arr: [16]u8 = [_]u8{0} ** 16;
+            var name_arr: [16]u8 = @splat(0);
             @memcpy(&name_arr, lc_buf[off + 8 ..][0..16]);
             const vmaddr = std.mem.readInt(u64, lc_buf[off + 24 ..][0..8], .little);
             const vmsize = std.mem.readInt(u64, lc_buf[off + 32 ..][0..8], .little);
@@ -491,6 +491,13 @@ pub fn loadImage(allocator: std.mem.Allocator, io: std.Io, image_name: []const u
     // either using its orig_fileoff (if non-zero AND in main cache) or
     // translating its orig_vmaddr through the mappings table.
     // ------------------------------------------------------------------------
+    // These lists are complete. Keep borrowed element pointers stable through
+    // layout and rewriting; unlock before their deferred deinitialization.
+    segs.lockPointers();
+    defer segs.unlockPointers();
+    chunks.lockPointers();
+    defer chunks.unlockPointers();
+
     const PAGE: u64 = 0x4000; // 16 KiB page (arm64 macOS)
     var cur_fileoff: u64 = 0;
     var cur_vmaddr: u64 = 0x100000000;

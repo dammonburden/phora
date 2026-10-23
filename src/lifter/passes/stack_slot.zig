@@ -17,6 +17,16 @@ const types = @import("../../types.zig");
 // ---------------------------------------------------------------------------
 
 pub fn run(allocator: std.mem.Allocator, func: *types.IRFunction) !void {
+    // A write to SP or unknown effect can move the stack. Without stack-depth
+    // dataflow, equal textual offsets need not name the same memory location.
+    for (func.statements) |stmt| {
+        if (stmt.type == .@"opaque") return;
+        if (stmt.type == .assign or stmt.type == .load) {
+            if (stmt.dest) |dest| {
+                if (std.mem.eql(u8, dest, "stack_ptr") or std.mem.eql(u8, dest, "sp")) return;
+            }
+        }
+    }
     // Map from canonical offset (i64) to slot index.
     var slot_map = std.AutoHashMap(i64, u32).init(allocator);
     defer slot_map.deinit();
@@ -163,6 +173,7 @@ pub fn parseSpOffset(s: []const u8) ?i64 {
         }
         if (end == 0) return null;
     }
+    if (std.mem.trim(u8, num_str[end..], " \t").len != 0) return null;
     num_str = num_str[0..end];
 
     const magnitude: u64 = if (hex)
@@ -188,7 +199,7 @@ test "stack_slot: parseSpOffset accepts common forms" {
     try std.testing.expectEqual(@as(?i64, 32), parseSpOffset("[sp, #32]"));
     try std.testing.expectEqual(@as(?i64, 64), parseSpOffset("[sp, #0x40]"));
     try std.testing.expectEqual(@as(?i64, -16), parseSpOffset("[sp,#-0x10]"));
-    try std.testing.expectEqual(@as(?i64, 8), parseSpOffset("[sp+8, x0, lsl #2]"));
+    try std.testing.expectEqual(@as(?i64, null), parseSpOffset("[sp+8, x0, lsl #2]"));
 }
 
 test "stack_slot: parseSpOffset rejects non-sp expressions" {

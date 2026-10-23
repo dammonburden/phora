@@ -1,11 +1,11 @@
 // Phora — x86_64 Instruction Decoder
-// Variable-length instruction decoder for AMD64/Intel 64.
+// Variable-length instruction decoder for AMD64/Intel 64 and 32-bit x86.
 // Reference: Intel SDM Vol. 2, AMD APM Vol. 3
 
 const std = @import("std");
 const types = @import("../types.zig");
 
-threadlocal var instruction_operands_scratch: [64]u8 = [_]u8{0} ** 64;
+threadlocal var instruction_operands_scratch: [64]u8 = @splat(0);
 
 // ============================================================================
 // Decoded instruction — internal representation with rich metadata
@@ -13,7 +13,7 @@ threadlocal var instruction_operands_scratch: [64]u8 = [_]u8{0} ** 64;
 
 pub const DecodedInstruction = struct {
     mnemonic: []const u8 = "udf",
-    operands: [128]u8 = [_]u8{0} ** 128,
+    operands: [128]u8 = @splat(0),
     operands_len: u8 = 0,
     length: u8 = 1,
     is_branch: bool = false,
@@ -41,7 +41,10 @@ pub const DecodedInstruction = struct {
 // Prefix state
 // ============================================================================
 
+const Mode = enum { bits32, bits64 };
+
 const Prefixes = struct {
+    mode: Mode = .bits64,
     rex: u8 = 0,
     has_rex: bool = false,
     has_66: bool = false, // operand size override
@@ -72,10 +75,10 @@ const Prefixes = struct {
 const OperandSize = enum { bits8, bits16, bits32, bits64 };
 
 fn effectiveOperandSize(pfx: *const Prefixes, default_64: bool) OperandSize {
+    // Stack operations ignore REX.W; 0x66 still selects 16-bit operands.
+    if (default_64) return if (pfx.has_66) .bits16 else if (pfx.mode == .bits64) .bits64 else .bits32;
     if (pfx.rexW()) return .bits64;
-    if (default_64) return .bits64;
-    if (pfx.has_66) return .bits16;
-    return .bits32;
+    return if (pfx.has_66) .bits16 else .bits32;
 }
 
 // ============================================================================
@@ -196,6 +199,7 @@ const FmtBuf = struct {
 const ByteReader = struct {
     data: []const u8,
     pos: usize,
+    failed: bool = false,
 
     fn init(data: []const u8) ByteReader {
         return .{ .data = data, .pos = 0 };
@@ -207,7 +211,10 @@ const ByteReader = struct {
     }
 
     fn readU8(self: *ByteReader) ?u8 {
-        if (self.pos >= self.data.len) return null;
+        if (self.pos >= self.data.len) {
+            self.failed = true;
+            return null;
+        }
         const val = self.data[self.pos];
         self.pos += 1;
         return val;
@@ -224,7 +231,10 @@ const ByteReader = struct {
     }
 
     fn readU16(self: *ByteReader) ?u16 {
-        if (self.pos + 2 > self.data.len) return null;
+        if (self.pos + 2 > self.data.len) {
+            self.failed = true;
+            return null;
+        }
         const val = @as(u16, self.data[self.pos]) |
             (@as(u16, self.data[self.pos + 1]) << 8);
         self.pos += 2;
@@ -232,7 +242,10 @@ const ByteReader = struct {
     }
 
     fn readU32(self: *ByteReader) ?u32 {
-        if (self.pos + 4 > self.data.len) return null;
+        if (self.pos + 4 > self.data.len) {
+            self.failed = true;
+            return null;
+        }
         const val = @as(u32, self.data[self.pos]) |
             (@as(u32, self.data[self.pos + 1]) << 8) |
             (@as(u32, self.data[self.pos + 2]) << 16) |
@@ -247,7 +260,10 @@ const ByteReader = struct {
     }
 
     fn readU64(self: *ByteReader) ?u64 {
-        if (self.pos + 8 > self.data.len) return null;
+        if (self.pos + 8 > self.data.len) {
+            self.failed = true;
+            return null;
+        }
         const val = @as(u64, self.data[self.pos]) |
             (@as(u64, self.data[self.pos + 1]) << 8) |
             (@as(u64, self.data[self.pos + 2]) << 16) |
@@ -289,123 +305,124 @@ fn extendReg(base: u3, rex_bit: bool) u4 {
     return @as(u4, if (rex_bit) 8 else 0) | @as(u4, base);
 }
 
-/// Decode a ModR/M memory reference and append it to the format buffer.
-/// Returns false if we ran out of bytes.
-fn appendModRM(f: *FmtBuf, reader: *ByteReader, modrm: u8, pfx: *const Prefixes, op_size: OperandSize) bool {
+fn addressRegName(idx: u4, pfx: *const Prefixes) []const u8 {
+    return if (pfx.mode == .bits32 or pfx.has_67) reg32_names[idx] else reg64_names[idx];
+}
+
+fn appendDisplacement(f: *FmtBuf, disp: i64) void {
+    if (disp > 0) {
+        f.appendFmt(" + 0x{x}", .{@as(u64, @intCast(disp))});
+    } else if (disp < 0) {
+        // All callers widen disp8/disp32 first, so their signed minimum is safe.
+        f.appendFmt(" - 0x{x}", .{@as(u64, @intCast(-disp))});
+    }
+}
+
+/// Shared effective-address formatter. 16-bit addressing is rejected by decodeMode.
+fn appendMemory(f: *FmtBuf, reader: *ByteReader, modrm: u8, pfx: *const Prefixes) bool {
     const mod = modrm_mod(modrm);
     const rm = modrm_rm(modrm);
-    const rm_ext = extendReg(rm, pfx.rexB());
-
-    if (mod == 0b11) {
-        // Register direct
-        f.append(regName(rm_ext, op_size, pfx.has_rex));
-        return true;
-    }
-
-    // Memory reference — add size prefix
-    switch (op_size) {
-        .bits8 => f.append("byte ptr ["),
-        .bits16 => f.append("word ptr ["),
-        .bits32 => f.append("dword ptr ["),
-        .bits64 => f.append("qword ptr ["),
-    }
-
+    f.append("[");
     if (rm == 0b100) {
-        // SIB byte follows
         const sib_byte = reader.readU8() orelse return false;
         const base = sib_base(sib_byte);
         const index = sib_index(sib_byte);
         const scale = sib_scale(sib_byte);
-        const base_ext = extendReg(base, pfx.rexB());
-        const index_ext = extendReg(index, pfx.rexX());
-
+        const has_index = index != 0b100 or pfx.rexX();
         if (mod == 0b00 and base == 0b101) {
-            // [disp32 + index*scale] or [disp32] (no base)
             const disp = reader.readI32() orelse return false;
-            if (index != 0b100) {
-                f.append(reg64_names[index_ext]);
-                if (scale > 0) {
-                    f.appendFmt("*{d}", .{@as(u32, 1) << @as(u2, scale)});
-                }
-                if (disp > 0) {
-                    f.append(" + ");
-                    f.appendFmt("0x{x}", .{@as(u32, @bitCast(disp))});
-                } else if (disp < 0) {
-                    f.append(" - ");
-                    f.appendFmt("0x{x}", .{@as(u32, @bitCast(-disp))});
-                }
+            if (has_index) {
+                f.append(addressRegName(extendReg(index, pfx.rexX()), pfx));
+                if (scale > 0) f.appendFmt("*{d}", .{@as(u32, 1) << scale});
+                appendDisplacement(f, disp);
             } else {
                 f.appendFmt("0x{x}", .{@as(u32, @bitCast(disp))});
             }
         } else {
-            f.append(reg64_names[base_ext]);
-            if (index != 0b100) {
+            f.append(addressRegName(extendReg(base, pfx.rexB()), pfx));
+            if (has_index) {
                 f.append(" + ");
-                f.append(reg64_names[index_ext]);
-                if (scale > 0) {
-                    f.appendFmt("*{d}", .{@as(u32, 1) << @as(u2, scale)});
-                }
+                f.append(addressRegName(extendReg(index, pfx.rexX()), pfx));
+                if (scale > 0) f.appendFmt("*{d}", .{@as(u32, 1) << scale});
             }
-            if (mod == 0b01) {
-                const disp = reader.readI8() orelse return false;
-                if (disp > 0) {
-                    f.appendFmt(" + 0x{x}", .{@as(u8, @bitCast(disp))});
-                } else if (disp < 0) {
-                    f.appendFmt(" - 0x{x}", .{@as(u8, @bitCast(-disp))});
-                }
-            } else if (mod == 0b10) {
-                const disp = reader.readI32() orelse return false;
-                if (disp > 0) {
-                    f.appendFmt(" + 0x{x}", .{@as(u32, @bitCast(disp))});
-                } else if (disp < 0) {
-                    f.appendFmt(" - 0x{x}", .{@as(u32, @bitCast(-disp))});
-                }
-            }
+            if (mod == 0b01) appendDisplacement(f, reader.readI8() orelse return false);
+            if (mod == 0b10) appendDisplacement(f, reader.readI32() orelse return false);
         }
     } else if (mod == 0b00 and rm == 0b101) {
-        // RIP-relative addressing [rip + disp32]
         const disp = reader.readI32() orelse return false;
-        f.append("rip");
-        if (disp > 0) {
-            f.appendFmt(" + 0x{x}", .{@as(u32, @bitCast(disp))});
-        } else if (disp < 0) {
-            f.appendFmt(" - 0x{x}", .{@as(u32, @bitCast(-disp))});
+        if (pfx.mode == .bits32) {
+            f.appendFmt("0x{x}", .{@as(u32, @bitCast(disp))});
+        } else {
+            f.append(if (pfx.has_67) "eip" else "rip");
+            appendDisplacement(f, disp);
         }
     } else {
-        // Simple [reg], [reg+disp8], [reg+disp32]
-        f.append(reg64_names[rm_ext]);
-        if (mod == 0b01) {
-            const disp = reader.readI8() orelse return false;
-            if (disp > 0) {
-                f.appendFmt(" + 0x{x}", .{@as(u8, @bitCast(disp))});
-            } else if (disp < 0) {
-                f.appendFmt(" - 0x{x}", .{@as(u8, @bitCast(-disp))});
-            }
-        } else if (mod == 0b10) {
-            const disp = reader.readI32() orelse return false;
-            if (disp > 0) {
-                f.appendFmt(" + 0x{x}", .{@as(u32, @bitCast(disp))});
-            } else if (disp < 0) {
-                f.appendFmt(" - 0x{x}", .{@as(u32, @bitCast(-disp))});
-            }
-        }
+        f.append(addressRegName(extendReg(rm, pfx.rexB()), pfx));
+        if (mod == 0b01) appendDisplacement(f, reader.readI8() orelse return false);
+        if (mod == 0b10) appendDisplacement(f, reader.readI32() orelse return false);
     }
-
     f.append("]");
     return true;
+}
+
+/// Decode a ModR/M register or sized memory reference.
+fn appendModRM(f: *FmtBuf, reader: *ByteReader, modrm: u8, pfx: *const Prefixes, op_size: OperandSize) bool {
+    if (modrm_mod(modrm) == 0b11) {
+        f.append(regName(extendReg(modrm_rm(modrm), pfx.rexB()), op_size, pfx.has_rex));
+        return true;
+    }
+    f.append(switch (op_size) {
+        .bits8 => "byte ptr ",
+        .bits16 => "word ptr ",
+        .bits32 => "dword ptr ",
+        .bits64 => "qword ptr ",
+    });
+    return appendMemory(f, reader, modrm, pfx);
 }
 
 // ============================================================================
 // Main decode entry point
 // ============================================================================
 
+/// Decode an instruction in 64-bit long mode (the original public API).
 pub fn decode(raw: []const u8, address: u64) DecodedInstruction {
-    if (raw.len == 0) {
-        return .{};
-    }
+    return decodeMode(raw, address, .bits64);
+}
 
-    var reader = ByteReader.init(raw);
-    var pfx = Prefixes{};
+/// Decode legacy 32-bit x86. A 0x67 address override is explicitly unsupported.
+pub fn decode32(raw: []const u8, address: u64) DecodedInstruction {
+    return decodeMode(raw, address, .bits32);
+}
+
+fn decodeMode(raw: []const u8, address: u64, mode: Mode) DecodedInstruction {
+    // The architectural limit also bounds prefix scanning and length conversions.
+    var reader = ByteReader.init(raw[0..@min(raw.len, 15)]);
+    const result = decodeBody(reader.data, address, mode, &reader);
+    // Helpers may have written a mnemonic before discovering a truncated operand.
+    // Never expose that partial value as a successfully decoded instruction.
+    if (reader.failed) return .{};
+    return result;
+}
+
+fn readNearRelative(reader: *ByteReader, pfx: *const Prefixes) ?i32 {
+    if (pfx.mode == .bits32 and pfx.has_66) {
+        const bits = reader.readU16() orelse return null;
+        return @as(i16, @bitCast(bits));
+    }
+    return reader.readI32();
+}
+
+fn relativeTarget(address: u64, length: usize, rel: i32, pfx: *const Prefixes, near: bool) u64 {
+    const target = address +% @as(u64, @intCast(length)) +% @as(u64, @bitCast(@as(i64, rel)));
+    if (pfx.mode == .bits32) {
+        if (near and pfx.has_66) return @as(u16, @truncate(target));
+        return @as(u32, @truncate(target));
+    }
+    return target;
+}
+
+fn decodeBody(raw: []const u8, address: u64, mode: Mode, reader: *ByteReader) DecodedInstruction {
+    var pfx = Prefixes{ .mode = mode };
 
     // Parse prefixes
     while (reader.peekU8()) |b| {
@@ -435,6 +452,7 @@ pub fn decode(raw: []const u8, address: u64) DecodedInstruction {
                 _ = reader.readU8();
             },
             0x40...0x4F => {
+                if (mode == .bits32) break;
                 // REX prefix
                 pfx.rex = b;
                 pfx.has_rex = true;
@@ -444,70 +462,83 @@ pub fn decode(raw: []const u8, address: u64) DecodedInstruction {
         }
     }
 
+    // 0x67 selects the 16-bit effective-address table in legacy 32-bit mode.
+    // Do not present a fabricated 32/64-bit memory operand for that encoding.
+    if (mode == .bits32 and pfx.has_67) return .{ .mnemonic = "unsupported", .length = @intCast(reader.pos) };
+
     var result = DecodedInstruction{};
     const opcode = reader.readU8() orelse return result;
 
     // Two-byte opcode escape
     if (opcode == 0x0F) {
-        return decodeTwoByteOpcode(&reader, &pfx, address);
+        return decodeTwoByteOpcode(reader, &pfx, address);
     }
 
     // One-byte opcode map
     switch (opcode) {
+        // In 32-bit mode these are opcodes, never REX prefixes.
+        0x40...0x4F => {
+            result.mnemonic = if (opcode < 0x48) "inc" else "dec";
+            var f = FmtBuf.init(&result.operands);
+            f.append(regName(@intCast(opcode & 7), effectiveOperandSize(&pfx, false), false));
+            result.operands_len = f.len();
+            result.length = @intCast(reader.pos);
+            return result;
+        },
         // ADD r/m, r (00-03)
-        0x00 => return decodeRM(raw, &reader, &pfx, address, "add", .bits8, .rm_reg),
-        0x01 => return decodeRM(raw, &reader, &pfx, address, "add", effectiveOperandSize(&pfx, false), .rm_reg),
-        0x02 => return decodeRM(raw, &reader, &pfx, address, "add", .bits8, .reg_rm),
-        0x03 => return decodeRM(raw, &reader, &pfx, address, "add", effectiveOperandSize(&pfx, false), .reg_rm),
-        0x04 => return decodeALImm(raw, &reader, &pfx, address, "add", .bits8),
-        0x05 => return decodeALImm(raw, &reader, &pfx, address, "add", effectiveOperandSize(&pfx, false)),
+        0x00 => return decodeRM(raw, reader, &pfx, address, "add", .bits8, .rm_reg),
+        0x01 => return decodeRM(raw, reader, &pfx, address, "add", effectiveOperandSize(&pfx, false), .rm_reg),
+        0x02 => return decodeRM(raw, reader, &pfx, address, "add", .bits8, .reg_rm),
+        0x03 => return decodeRM(raw, reader, &pfx, address, "add", effectiveOperandSize(&pfx, false), .reg_rm),
+        0x04 => return decodeALImm(raw, reader, &pfx, address, "add", .bits8),
+        0x05 => return decodeALImm(raw, reader, &pfx, address, "add", effectiveOperandSize(&pfx, false)),
 
         // OR r/m, r (08-0D)
-        0x08 => return decodeRM(raw, &reader, &pfx, address, "or", .bits8, .rm_reg),
-        0x09 => return decodeRM(raw, &reader, &pfx, address, "or", effectiveOperandSize(&pfx, false), .rm_reg),
-        0x0A => return decodeRM(raw, &reader, &pfx, address, "or", .bits8, .reg_rm),
-        0x0B => return decodeRM(raw, &reader, &pfx, address, "or", effectiveOperandSize(&pfx, false), .reg_rm),
-        0x0C => return decodeALImm(raw, &reader, &pfx, address, "or", .bits8),
-        0x0D => return decodeALImm(raw, &reader, &pfx, address, "or", effectiveOperandSize(&pfx, false)),
+        0x08 => return decodeRM(raw, reader, &pfx, address, "or", .bits8, .rm_reg),
+        0x09 => return decodeRM(raw, reader, &pfx, address, "or", effectiveOperandSize(&pfx, false), .rm_reg),
+        0x0A => return decodeRM(raw, reader, &pfx, address, "or", .bits8, .reg_rm),
+        0x0B => return decodeRM(raw, reader, &pfx, address, "or", effectiveOperandSize(&pfx, false), .reg_rm),
+        0x0C => return decodeALImm(raw, reader, &pfx, address, "or", .bits8),
+        0x0D => return decodeALImm(raw, reader, &pfx, address, "or", effectiveOperandSize(&pfx, false)),
 
         // AND r/m, r (20-25)
-        0x20 => return decodeRM(raw, &reader, &pfx, address, "and", .bits8, .rm_reg),
-        0x21 => return decodeRM(raw, &reader, &pfx, address, "and", effectiveOperandSize(&pfx, false), .rm_reg),
-        0x22 => return decodeRM(raw, &reader, &pfx, address, "and", .bits8, .reg_rm),
-        0x23 => return decodeRM(raw, &reader, &pfx, address, "and", effectiveOperandSize(&pfx, false), .reg_rm),
-        0x24 => return decodeALImm(raw, &reader, &pfx, address, "and", .bits8),
-        0x25 => return decodeALImm(raw, &reader, &pfx, address, "and", effectiveOperandSize(&pfx, false)),
+        0x20 => return decodeRM(raw, reader, &pfx, address, "and", .bits8, .rm_reg),
+        0x21 => return decodeRM(raw, reader, &pfx, address, "and", effectiveOperandSize(&pfx, false), .rm_reg),
+        0x22 => return decodeRM(raw, reader, &pfx, address, "and", .bits8, .reg_rm),
+        0x23 => return decodeRM(raw, reader, &pfx, address, "and", effectiveOperandSize(&pfx, false), .reg_rm),
+        0x24 => return decodeALImm(raw, reader, &pfx, address, "and", .bits8),
+        0x25 => return decodeALImm(raw, reader, &pfx, address, "and", effectiveOperandSize(&pfx, false)),
 
         // SUB r/m, r (28-2D)
-        0x28 => return decodeRM(raw, &reader, &pfx, address, "sub", .bits8, .rm_reg),
-        0x29 => return decodeRM(raw, &reader, &pfx, address, "sub", effectiveOperandSize(&pfx, false), .rm_reg),
-        0x2A => return decodeRM(raw, &reader, &pfx, address, "sub", .bits8, .reg_rm),
-        0x2B => return decodeRM(raw, &reader, &pfx, address, "sub", effectiveOperandSize(&pfx, false), .reg_rm),
-        0x2C => return decodeALImm(raw, &reader, &pfx, address, "sub", .bits8),
-        0x2D => return decodeALImm(raw, &reader, &pfx, address, "sub", effectiveOperandSize(&pfx, false)),
+        0x28 => return decodeRM(raw, reader, &pfx, address, "sub", .bits8, .rm_reg),
+        0x29 => return decodeRM(raw, reader, &pfx, address, "sub", effectiveOperandSize(&pfx, false), .rm_reg),
+        0x2A => return decodeRM(raw, reader, &pfx, address, "sub", .bits8, .reg_rm),
+        0x2B => return decodeRM(raw, reader, &pfx, address, "sub", effectiveOperandSize(&pfx, false), .reg_rm),
+        0x2C => return decodeALImm(raw, reader, &pfx, address, "sub", .bits8),
+        0x2D => return decodeALImm(raw, reader, &pfx, address, "sub", effectiveOperandSize(&pfx, false)),
 
         // XOR r/m, r (30-35)
-        0x30 => return decodeRM(raw, &reader, &pfx, address, "xor", .bits8, .rm_reg),
-        0x31 => return decodeRM(raw, &reader, &pfx, address, "xor", effectiveOperandSize(&pfx, false), .rm_reg),
-        0x32 => return decodeRM(raw, &reader, &pfx, address, "xor", .bits8, .reg_rm),
-        0x33 => return decodeRM(raw, &reader, &pfx, address, "xor", effectiveOperandSize(&pfx, false), .reg_rm),
-        0x34 => return decodeALImm(raw, &reader, &pfx, address, "xor", .bits8),
-        0x35 => return decodeALImm(raw, &reader, &pfx, address, "xor", effectiveOperandSize(&pfx, false)),
+        0x30 => return decodeRM(raw, reader, &pfx, address, "xor", .bits8, .rm_reg),
+        0x31 => return decodeRM(raw, reader, &pfx, address, "xor", effectiveOperandSize(&pfx, false), .rm_reg),
+        0x32 => return decodeRM(raw, reader, &pfx, address, "xor", .bits8, .reg_rm),
+        0x33 => return decodeRM(raw, reader, &pfx, address, "xor", effectiveOperandSize(&pfx, false), .reg_rm),
+        0x34 => return decodeALImm(raw, reader, &pfx, address, "xor", .bits8),
+        0x35 => return decodeALImm(raw, reader, &pfx, address, "xor", effectiveOperandSize(&pfx, false)),
 
         // CMP r/m, r (38-3D)
-        0x38 => return decodeRM(raw, &reader, &pfx, address, "cmp", .bits8, .rm_reg),
-        0x39 => return decodeRM(raw, &reader, &pfx, address, "cmp", effectiveOperandSize(&pfx, false), .rm_reg),
-        0x3A => return decodeRM(raw, &reader, &pfx, address, "cmp", .bits8, .reg_rm),
-        0x3B => return decodeRM(raw, &reader, &pfx, address, "cmp", effectiveOperandSize(&pfx, false), .reg_rm),
-        0x3C => return decodeALImm(raw, &reader, &pfx, address, "cmp", .bits8),
-        0x3D => return decodeALImm(raw, &reader, &pfx, address, "cmp", effectiveOperandSize(&pfx, false)),
+        0x38 => return decodeRM(raw, reader, &pfx, address, "cmp", .bits8, .rm_reg),
+        0x39 => return decodeRM(raw, reader, &pfx, address, "cmp", effectiveOperandSize(&pfx, false), .rm_reg),
+        0x3A => return decodeRM(raw, reader, &pfx, address, "cmp", .bits8, .reg_rm),
+        0x3B => return decodeRM(raw, reader, &pfx, address, "cmp", effectiveOperandSize(&pfx, false), .reg_rm),
+        0x3C => return decodeALImm(raw, reader, &pfx, address, "cmp", .bits8),
+        0x3D => return decodeALImm(raw, reader, &pfx, address, "cmp", effectiveOperandSize(&pfx, false)),
 
         // PUSH r64 (50-57)
         0x50...0x57 => {
             const reg_idx = extendReg(@truncate(opcode & 0x7), pfx.rexB());
             result.mnemonic = "push";
             var f = FmtBuf.init(&result.operands);
-            f.append(reg64_names[reg_idx]);
+            f.append(regName(reg_idx, effectiveOperandSize(&pfx, true), pfx.has_rex));
             result.operands_len = f.len();
             result.length = @intCast(reader.pos);
             return result;
@@ -518,7 +549,27 @@ pub fn decode(raw: []const u8, address: u64) DecodedInstruction {
             const reg_idx = extendReg(@truncate(opcode & 0x7), pfx.rexB());
             result.mnemonic = "pop";
             var f = FmtBuf.init(&result.operands);
-            f.append(reg64_names[reg_idx]);
+            f.append(regName(reg_idx, effectiveOperandSize(&pfx, true), pfx.has_rex));
+            result.operands_len = f.len();
+            result.length = @intCast(reader.pos);
+            return result;
+        },
+
+        // MOVSXD r64, r/m32. Legacy opcode 63 is ARPL, and the non-REX.W
+        // long-mode forms are deliberately outside this supported subset.
+        0x63 => {
+            // REX must immediately precede the opcode. LOCK is invalid, and
+            // segment overrides are not represented by appendMemory yet.
+            if (mode != .bits64 or !pfx.rexW() or pfx.has_f0 or
+                pfx.seg_override != 0 or reader.pos < 2 or
+                raw[reader.pos - 2] & 0xf0 != 0x40) return result;
+            const modrm = reader.readU8() orelse return result;
+            const reg = extendReg(modrm_reg(modrm), pfx.rexR());
+            var f = FmtBuf.init(&result.operands);
+            f.append(regName(reg, .bits64, true));
+            f.comma();
+            if (!appendModRM(&f, reader, modrm, &pfx, .bits32)) return result;
+            result.mnemonic = "movsxd";
             result.operands_len = f.len();
             result.length = @intCast(reader.pos);
             return result;
@@ -526,7 +577,7 @@ pub fn decode(raw: []const u8, address: u64) DecodedInstruction {
 
         // PUSH imm32/imm16
         0x68 => {
-            const op_size = effectiveOperandSize(&pfx, false);
+            const op_size = effectiveOperandSize(&pfx, true);
             result.mnemonic = "push";
             var f = FmtBuf.init(&result.operands);
             if (op_size == .bits16) {
@@ -556,7 +607,7 @@ pub fn decode(raw: []const u8, address: u64) DecodedInstruction {
         0x70...0x7F => {
             const cc: u4 = @truncate(opcode & 0xF);
             const rel = reader.readI8() orelse return result;
-            const target = @as(u64, @bitCast(@as(i64, @bitCast(address)) +% @as(i64, @intCast(reader.pos)) +% @as(i64, rel)));
+            const target = relativeTarget(address, reader.pos, rel, &pfx, opcode == 0xE8 or opcode == 0xE9);
             result.mnemonic = jcc_mnemonics[cc];
             result.is_branch = true;
             result.is_conditional_branch = true;
@@ -569,26 +620,38 @@ pub fn decode(raw: []const u8, address: u64) DecodedInstruction {
         },
 
         // Group 1: ADD/OR/ADC/SBB/AND/SUB/XOR/CMP r/m, imm
-        0x80 => return decodeGroup1(raw, &reader, &pfx, address, .bits8, .imm8),
-        0x81 => return decodeGroup1(raw, &reader, &pfx, address, effectiveOperandSize(&pfx, false), .imm32),
-        0x83 => return decodeGroup1(raw, &reader, &pfx, address, effectiveOperandSize(&pfx, false), .imm8),
+        0x80 => return decodeGroup1(raw, reader, &pfx, address, .bits8, .imm8),
+        0x81 => return decodeGroup1(raw, reader, &pfx, address, effectiveOperandSize(&pfx, false), .imm32),
+        0x83 => return decodeGroup1(raw, reader, &pfx, address, effectiveOperandSize(&pfx, false), .imm8),
 
         // TEST r/m, r
-        0x84 => return decodeRM(raw, &reader, &pfx, address, "test", .bits8, .rm_reg),
-        0x85 => return decodeRM(raw, &reader, &pfx, address, "test", effectiveOperandSize(&pfx, false), .rm_reg),
+        0x84 => return decodeRM(raw, reader, &pfx, address, "test", .bits8, .rm_reg),
+        0x85 => return decodeRM(raw, reader, &pfx, address, "test", effectiveOperandSize(&pfx, false), .rm_reg),
 
         // XCHG r/m, r
-        0x86 => return decodeRM(raw, &reader, &pfx, address, "xchg", .bits8, .reg_rm),
-        0x87 => return decodeRM(raw, &reader, &pfx, address, "xchg", effectiveOperandSize(&pfx, false), .reg_rm),
+        0x86 => return decodeRM(raw, reader, &pfx, address, "xchg", .bits8, .reg_rm),
+        0x87 => return decodeRM(raw, reader, &pfx, address, "xchg", effectiveOperandSize(&pfx, false), .reg_rm),
 
         // MOV r/m, r (88-8B)
-        0x88 => return decodeRM(raw, &reader, &pfx, address, "mov", .bits8, .rm_reg),
-        0x89 => return decodeRM(raw, &reader, &pfx, address, "mov", effectiveOperandSize(&pfx, false), .rm_reg),
-        0x8A => return decodeRM(raw, &reader, &pfx, address, "mov", .bits8, .reg_rm),
-        0x8B => return decodeRM(raw, &reader, &pfx, address, "mov", effectiveOperandSize(&pfx, false), .reg_rm),
+        0x88 => return decodeRM(raw, reader, &pfx, address, "mov", .bits8, .rm_reg),
+        0x89 => return decodeRM(raw, reader, &pfx, address, "mov", effectiveOperandSize(&pfx, false), .rm_reg),
+        0x8A => return decodeRM(raw, reader, &pfx, address, "mov", .bits8, .reg_rm),
+        0x8B => return decodeRM(raw, reader, &pfx, address, "mov", effectiveOperandSize(&pfx, false), .reg_rm),
 
         // LEA r, m
-        0x8D => return decodeRM(raw, &reader, &pfx, address, "lea", effectiveOperandSize(&pfx, false), .reg_rm_lea),
+        0x8D => return decodeRM(raw, reader, &pfx, address, "lea", effectiveOperandSize(&pfx, false), .reg_rm_lea),
+
+        // POP r/m16, r/m32 or r/m64 (only /0 is valid).
+        0x8F => {
+            const modrm = reader.readU8() orelse return result;
+            if (modrm_reg(modrm) != 0) return result;
+            var f = FmtBuf.init(&result.operands);
+            if (!appendModRM(&f, reader, modrm, &pfx, effectiveOperandSize(&pfx, true))) return result;
+            result.mnemonic = "pop";
+            result.operands_len = f.len();
+            result.length = @intCast(reader.pos);
+            return result;
+        },
 
         // NOP (XCHG eax, eax) / PAUSE
         0x90 => {
@@ -617,14 +680,14 @@ pub fn decode(raw: []const u8, address: u64) DecodedInstruction {
 
         // CDQ / CQO
         0x99 => {
-            result.mnemonic = if (pfx.rexW()) "cqo" else "cdq";
+            result.mnemonic = if (pfx.rexW()) "cqo" else if (pfx.has_66) "cwd" else "cdq";
             result.length = @intCast(reader.pos);
             return result;
         },
 
         // TEST AL, imm8 / TEST rAX, imm
-        0xA8 => return decodeALImm(raw, &reader, &pfx, address, "test", .bits8),
-        0xA9 => return decodeALImm(raw, &reader, &pfx, address, "test", effectiveOperandSize(&pfx, false)),
+        0xA8 => return decodeALImm(raw, reader, &pfx, address, "test", .bits8),
+        0xA9 => return decodeALImm(raw, reader, &pfx, address, "test", effectiveOperandSize(&pfx, false)),
 
         // MOV r8, imm8 (B0-B7)
         0xB0...0xB7 => {
@@ -664,12 +727,12 @@ pub fn decode(raw: []const u8, address: u64) DecodedInstruction {
         },
 
         // Shift/rotate group (C0/C1 = imm8, D0/D1 = 1, D2/D3 = CL)
-        0xC0 => return decodeShiftGroup(raw, &reader, &pfx, address, .bits8, .imm8),
-        0xC1 => return decodeShiftGroup(raw, &reader, &pfx, address, effectiveOperandSize(&pfx, false), .imm8),
-        0xD0 => return decodeShiftGroup(raw, &reader, &pfx, address, .bits8, .one),
-        0xD1 => return decodeShiftGroup(raw, &reader, &pfx, address, effectiveOperandSize(&pfx, false), .one),
-        0xD2 => return decodeShiftGroup(raw, &reader, &pfx, address, .bits8, .cl),
-        0xD3 => return decodeShiftGroup(raw, &reader, &pfx, address, effectiveOperandSize(&pfx, false), .cl),
+        0xC0 => return decodeShiftGroup(raw, reader, &pfx, address, .bits8, .imm8),
+        0xC1 => return decodeShiftGroup(raw, reader, &pfx, address, effectiveOperandSize(&pfx, false), .imm8),
+        0xD0 => return decodeShiftGroup(raw, reader, &pfx, address, .bits8, .one),
+        0xD1 => return decodeShiftGroup(raw, reader, &pfx, address, effectiveOperandSize(&pfx, false), .one),
+        0xD2 => return decodeShiftGroup(raw, reader, &pfx, address, .bits8, .cl),
+        0xD3 => return decodeShiftGroup(raw, reader, &pfx, address, effectiveOperandSize(&pfx, false), .cl),
 
         // RET near
         0xC3 => {
@@ -694,8 +757,8 @@ pub fn decode(raw: []const u8, address: u64) DecodedInstruction {
         },
 
         // MOV r/m, imm (C6/C7)
-        0xC6 => return decodeMovImm(raw, &reader, &pfx, address, .bits8),
-        0xC7 => return decodeMovImm(raw, &reader, &pfx, address, effectiveOperandSize(&pfx, false)),
+        0xC6 => return decodeMovImm(raw, reader, &pfx, address, .bits8),
+        0xC7 => return decodeMovImm(raw, reader, &pfx, address, effectiveOperandSize(&pfx, false)),
 
         // ENTER
         0xC8 => {
@@ -738,8 +801,8 @@ pub fn decode(raw: []const u8, address: u64) DecodedInstruction {
 
         // CALL rel32
         0xE8 => {
-            const rel = reader.readI32() orelse return result;
-            const target = @as(u64, @bitCast(@as(i64, @bitCast(address)) +% @as(i64, @intCast(reader.pos)) +% @as(i64, rel)));
+            const rel = readNearRelative(reader, &pfx) orelse return result;
+            const target = relativeTarget(address, reader.pos, rel, &pfx, opcode == 0xE8 or opcode == 0xE9);
             result.mnemonic = "call";
             result.is_branch = true;
             result.is_call = true;
@@ -753,8 +816,8 @@ pub fn decode(raw: []const u8, address: u64) DecodedInstruction {
 
         // JMP rel32
         0xE9 => {
-            const rel = reader.readI32() orelse return result;
-            const target = @as(u64, @bitCast(@as(i64, @bitCast(address)) +% @as(i64, @intCast(reader.pos)) +% @as(i64, rel)));
+            const rel = readNearRelative(reader, &pfx) orelse return result;
+            const target = relativeTarget(address, reader.pos, rel, &pfx, opcode == 0xE8 or opcode == 0xE9);
             result.mnemonic = "jmp";
             result.is_branch = true;
             result.branch_target = target;
@@ -768,7 +831,7 @@ pub fn decode(raw: []const u8, address: u64) DecodedInstruction {
         // JMP rel8
         0xEB => {
             const rel = reader.readI8() orelse return result;
-            const target = @as(u64, @bitCast(@as(i64, @bitCast(address)) +% @as(i64, @intCast(reader.pos)) +% @as(i64, rel)));
+            const target = relativeTarget(address, reader.pos, rel, &pfx, opcode == 0xE8 or opcode == 0xE9);
             result.mnemonic = "jmp";
             result.is_branch = true;
             result.branch_target = target;
@@ -780,11 +843,11 @@ pub fn decode(raw: []const u8, address: u64) DecodedInstruction {
         },
 
         // Group 3: TEST/NOT/NEG/MUL/IMUL/DIV/IDIV r/m
-        0xF6 => return decodeGroup3(raw, &reader, &pfx, address, .bits8),
-        0xF7 => return decodeGroup3(raw, &reader, &pfx, address, effectiveOperandSize(&pfx, false)),
+        0xF6 => return decodeGroup3(raw, reader, &pfx, address, .bits8),
+        0xF7 => return decodeGroup3(raw, reader, &pfx, address, effectiveOperandSize(&pfx, false)),
 
         // Group 5: INC/DEC/CALL/JMP/PUSH r/m
-        0xFF => return decodeGroup5(raw, &reader, &pfx, address),
+        0xFF => return decodeGroup5(raw, reader, &pfx, address),
 
         // HLT
         0xF4 => {
@@ -899,8 +962,8 @@ fn decodeTwoByteOpcode(reader: *ByteReader, pfx: *const Prefixes, address: u64) 
         // Near Jcc rel32 (0F 80-8F)
         0x80...0x8F => {
             const cc: u4 = @truncate(opcode2 & 0xF);
-            const rel = reader.readI32() orelse return result;
-            const target = @as(u64, @bitCast(@as(i64, @bitCast(address)) +% @as(i64, @intCast(reader.pos)) +% @as(i64, rel)));
+            const rel = readNearRelative(reader, pfx) orelse return result;
+            const target = relativeTarget(address, reader.pos, rel, pfx, true);
             result.mnemonic = jcc_mnemonics[cc];
             result.is_branch = true;
             result.is_conditional_branch = true;
@@ -1071,7 +1134,7 @@ fn decodeRM(raw: []const u8, reader: *ByteReader, pfx: *const Prefixes, address:
             f.append(regName(reg, op_size, pfx.has_rex));
             f.comma();
             // LEA uses address-size memory reference, no size prefix
-            if (!appendModRM_lea(&f, reader, modrm, pfx)) return result;
+            if (!appendModRM_lea(&f, reader, modrm, pfx)) return .{};
         },
     }
 
@@ -1080,97 +1143,10 @@ fn decodeRM(raw: []const u8, reader: *ByteReader, pfx: *const Prefixes, address:
     return result;
 }
 
-/// LEA version of ModRM — no size prefix, and mod=11 is invalid
+/// LEA has no memory-size prefix, and register-direct ModR/M is invalid.
 fn appendModRM_lea(f: *FmtBuf, reader: *ByteReader, modrm: u8, pfx: *const Prefixes) bool {
-    const mod = modrm_mod(modrm);
-    const rm = modrm_rm(modrm);
-    const rm_ext = extendReg(rm, pfx.rexB());
-
-    if (mod == 0b11) {
-        // Invalid for LEA, but still decode
-        f.append(reg64_names[rm_ext]);
-        return true;
-    }
-
-    f.append("[");
-
-    if (rm == 0b100) {
-        const sib_byte = reader.readU8() orelse return false;
-        const base = sib_base(sib_byte);
-        const index = sib_index(sib_byte);
-        const scale = sib_scale(sib_byte);
-        const base_ext = extendReg(base, pfx.rexB());
-        const index_ext = extendReg(index, pfx.rexX());
-
-        if (mod == 0b00 and base == 0b101) {
-            const disp = reader.readI32() orelse return false;
-            if (index != 0b100) {
-                f.append(reg64_names[index_ext]);
-                if (scale > 0) {
-                    f.appendFmt("*{d}", .{@as(u32, 1) << @as(u2, scale)});
-                }
-                if (disp > 0) {
-                    f.appendFmt(" + 0x{x}", .{@as(u32, @bitCast(disp))});
-                } else if (disp < 0) {
-                    f.appendFmt(" - 0x{x}", .{@as(u32, @bitCast(-disp))});
-                }
-            } else {
-                f.appendFmt("0x{x}", .{@as(u32, @bitCast(disp))});
-            }
-        } else {
-            f.append(reg64_names[base_ext]);
-            if (index != 0b100) {
-                f.append(" + ");
-                f.append(reg64_names[index_ext]);
-                if (scale > 0) {
-                    f.appendFmt("*{d}", .{@as(u32, 1) << @as(u2, scale)});
-                }
-            }
-            if (mod == 0b01) {
-                const disp = reader.readI8() orelse return false;
-                if (disp > 0) {
-                    f.appendFmt(" + 0x{x}", .{@as(u8, @bitCast(disp))});
-                } else if (disp < 0) {
-                    f.appendFmt(" - 0x{x}", .{@as(u8, @bitCast(-disp))});
-                }
-            } else if (mod == 0b10) {
-                const disp = reader.readI32() orelse return false;
-                if (disp > 0) {
-                    f.appendFmt(" + 0x{x}", .{@as(u32, @bitCast(disp))});
-                } else if (disp < 0) {
-                    f.appendFmt(" - 0x{x}", .{@as(u32, @bitCast(-disp))});
-                }
-            }
-        }
-    } else if (mod == 0b00 and rm == 0b101) {
-        const disp = reader.readI32() orelse return false;
-        f.append("rip");
-        if (disp > 0) {
-            f.appendFmt(" + 0x{x}", .{@as(u32, @bitCast(disp))});
-        } else if (disp < 0) {
-            f.appendFmt(" - 0x{x}", .{@as(u32, @bitCast(-disp))});
-        }
-    } else {
-        f.append(reg64_names[rm_ext]);
-        if (mod == 0b01) {
-            const disp = reader.readI8() orelse return false;
-            if (disp > 0) {
-                f.appendFmt(" + 0x{x}", .{@as(u8, @bitCast(disp))});
-            } else if (disp < 0) {
-                f.appendFmt(" - 0x{x}", .{@as(u8, @bitCast(-disp))});
-            }
-        } else if (mod == 0b10) {
-            const disp = reader.readI32() orelse return false;
-            if (disp > 0) {
-                f.appendFmt(" + 0x{x}", .{@as(u32, @bitCast(disp))});
-            } else if (disp < 0) {
-                f.appendFmt(" - 0x{x}", .{@as(u32, @bitCast(-disp))});
-            }
-        }
-    }
-
-    f.append("]");
-    return true;
+    if (modrm_mod(modrm) == 0b11) return false;
+    return appendMemory(f, reader, modrm, pfx);
 }
 
 fn decodeALImm(raw: []const u8, reader: *ByteReader, pfx: *const Prefixes, address: u64, mnemonic: []const u8, base_size: OperandSize) DecodedInstruction {
@@ -1304,7 +1280,12 @@ fn decodeGroup5(raw: []const u8, reader: *ByteReader, pfx: *const Prefixes, addr
     var result = DecodedInstruction{};
     const modrm = reader.readU8() orelse return result;
     const reg_field = modrm_reg(modrm);
-    const op_size = effectiveOperandSize(pfx, true); // default 64-bit in 64-bit mode
+    // INC/DEC retain the usual 32-bit default. Only near indirect control
+    // transfer and PUSH default to 64-bit in long mode.
+    const op_size: OperandSize = if (pfx.mode == .bits64 and (reg_field == 2 or reg_field == 4))
+        .bits64
+    else
+        effectiveOperandSize(pfx, reg_field >= 2);
 
     switch (reg_field) {
         0 => {
@@ -1429,7 +1410,14 @@ fn decodeMovImm(raw: []const u8, reader: *ByteReader, pfx: *const Prefixes, addr
 // ============================================================================
 
 pub fn decodeInstruction(raw: []const u8, address: u64) types.Instruction {
-    const decoded = decode(raw, address);
+    return decodedInstruction(raw, address, decode(raw, address));
+}
+
+pub fn decodeInstruction32(raw: []const u8, address: u64) types.Instruction {
+    return decodedInstruction(raw, address, decode32(raw, address));
+}
+
+fn decodedInstruction(raw: []const u8, address: u64, decoded: DecodedInstruction) types.Instruction {
     // v7.8.1 H3 fix: copy operands into the Instruction's owned buffer so
     // they survive after the decoded stack local goes out of scope.
     // Previously this assigned `decoded.getOperands()` directly, which is
@@ -1729,4 +1717,179 @@ test "variable length instructions" {
     try std.testing.expectEqual(@as(u8, 5), decode(&[_]u8{ 0xe8, 0x00, 0x00, 0x00, 0x00 }, 0).length);
     // 3-byte: mov rdi, rsi (48 89 f7)
     try std.testing.expectEqual(@as(u8, 3), decode(&[_]u8{ 0x48, 0x89, 0xf7 }, 0).length);
+}
+
+fn expectDecode32(bytes: []const u8, mnemonic: []const u8, operands: []const u8) !void {
+    const result = decode32(bytes, 0x1000);
+    try std.testing.expectEqualStrings(mnemonic, result.mnemonic);
+    try std.testing.expectEqualStrings(operands, result.getOperands());
+    try std.testing.expectEqual(@as(u8, @intCast(bytes.len)), result.length);
+}
+
+test "x86 mode distinguishes INC DEC opcodes from REX prefixes" {
+    for (0..8) |reg| {
+        const inc = [_]u8{@as(u8, @intCast(0x40 + reg))};
+        const dec = [_]u8{@as(u8, @intCast(0x48 + reg))};
+        const inc16 = [_]u8{ 0x66, inc[0] };
+        try expectDecode32(&inc, "inc", reg32_names[reg]);
+        try expectDecode32(&dec, "dec", reg32_names[reg]);
+        try expectDecode32(&inc16, "inc", reg16_names[reg]);
+        try std.testing.expectEqualStrings("udf", decode(&inc, 0).mnemonic);
+    }
+    const bytes = [_]u8{ 0x48, 0x89, 0xc8 };
+    try std.testing.expectEqualStrings("rax, rcx", decode(&bytes, 0).getOperands());
+    const legacy = decode32(&bytes, 0);
+    try std.testing.expectEqualStrings("dec", legacy.mnemonic);
+    try std.testing.expectEqual(@as(u8, 1), legacy.length);
+}
+
+test "x86 mode stack registers and operand override" {
+    try expectDecode32(&.{0x55}, "push", "ebp");
+    try expectDecode32(&.{0x5d}, "pop", "ebp");
+    try expectDecode32(&.{ 0x66, 0x55 }, "push", "bp");
+    try expectDecode32(&.{ 0x66, 0x5d }, "pop", "bp");
+    try expectDecode32(&.{ 0xff, 0x30 }, "push", "dword ptr [eax]");
+    try expectDecode32(&.{ 0x66, 0xff, 0x30 }, "push", "word ptr [eax]");
+    try expectDecode32(&.{ 0x8f, 0x00 }, "pop", "dword ptr [eax]");
+    try expectDecode32(&.{ 0x66, 0x8f, 0x00 }, "pop", "word ptr [eax]");
+    try std.testing.expectEqualStrings("rbp", decode(&.{0x55}, 0).getOperands());
+    try std.testing.expectEqualStrings("bp", decode(&.{ 0x66, 0x55 }, 0).getOperands());
+    try std.testing.expectEqualStrings("bp", decode(&.{ 0x66, 0x48, 0x55 }, 0).getOperands());
+    try std.testing.expectEqualStrings("word ptr [rax]", decode(&.{ 0x66, 0xff, 0x30 }, 0).getOperands());
+    try std.testing.expectEqualStrings("dword ptr [rax]", decode(&.{ 0xff, 0x00 }, 0).getOperands());
+    try std.testing.expectEqualStrings("qword ptr [rax]", decode(&.{ 0x48, 0xff, 0x00 }, 0).getOperands());
+    try expectDecode32(&.{ 0xff, 0xd0 }, "call", "eax");
+}
+
+test "x86 mode memory addresses never masquerade as RIP relative" {
+    const absolute = [_]u8{ 0x8b, 0x05, 0x78, 0x56, 0x34, 0x12 };
+    try expectDecode32(&absolute, "mov", "eax, dword ptr [0x12345678]");
+    try std.testing.expectEqualStrings("eax, dword ptr [rip + 0x12345678]", decode(&absolute, 0).getOperands());
+    try expectDecode32(&.{ 0x8d, 0x05, 0x78, 0x56, 0x34, 0x12 }, "lea", "eax, [0x12345678]");
+    try expectDecode32(&.{ 0x8b, 0x4d, 0x0c }, "mov", "ecx, dword ptr [ebp + 0xc]");
+    try expectDecode32(&.{ 0x8d, 0x44, 0x49, 0x01 }, "lea", "eax, [ecx + ecx*2 + 0x1]");
+    try expectDecode32(&.{ 0x8b, 0x04, 0x8d, 0, 0x10, 0, 0 }, "mov", "eax, dword ptr [ecx*4 + 0x1000]");
+    try expectDecode32(&.{ 0x8b, 0x04, 0x25, 0, 0, 0, 0x80 }, "mov", "eax, dword ptr [0x80000000]");
+    try expectDecode32(&.{ 0x8b, 0x45, 0x80 }, "mov", "eax, dword ptr [ebp - 0x80]");
+    try expectDecode32(&.{ 0x8b, 0x85, 0, 0, 0, 0x80 }, "mov", "eax, dword ptr [ebp - 0x80000000]");
+    try std.testing.expectEqualStrings("eax, dword ptr [r12*2 + 0x1000]", decode(&.{ 0x42, 0x8b, 0x04, 0x65, 0, 0x10, 0, 0 }, 0).getOperands());
+    try std.testing.expectEqualStrings("eax, dword ptr [ecx]", decode(&.{ 0x67, 0x8b, 0x01 }, 0).getOperands());
+    try std.testing.expectEqualStrings("eax, dword ptr [eip + 0x1]", decode(&.{ 0x67, 0x8b, 0x05, 1, 0, 0, 0 }, 0).getOperands());
+}
+
+test "x86 mode operand widths and fixture instructions" {
+    try expectDecode32(&.{ 0x89, 0xe5 }, "mov", "ebp, esp");
+    try expectDecode32(&.{ 0x66, 0x89, 0xe5 }, "mov", "bp, sp");
+    try expectDecode32(&.{ 0x88, 0xe0 }, "mov", "al, ah");
+    try expectDecode32(&.{ 0x0f, 0x42, 0xc2 }, "cmovb", "eax, edx");
+    try expectDecode32(&.{ 0x0f, 0x47, 0xca }, "cmova", "ecx, edx");
+    try expectDecode32(&.{ 0x83, 0xf9, 0x25 }, "cmp", "ecx, 0x25");
+    try expectDecode32(&.{ 0xc1, 0xe8, 3 }, "shr", "eax, 0x3");
+    try expectDecode32(&.{ 0xb8, 0x25, 0, 0, 0 }, "mov", "eax, 0x25");
+    try expectDecode32(&.{ 0x66, 0xb8, 0x25, 0 }, "mov", "ax, 0x25");
+    try expectDecode32(&.{ 0x66, 0x99 }, "cwd", "");
+    const inst = decodeInstruction32(&.{ 0x8b, 0x4d, 0x0c }, 0x1234);
+    try std.testing.expectEqualStrings("ecx, dword ptr [ebp + 0xc]", inst.operands_buf[0..inst.operands_len]);
+    try std.testing.expectEqual(@as(u64, 0x1234), inst.address);
+}
+
+test "x86 mode near relative operands and instruction pointer wrap" {
+    const rel32 = decode32(&.{ 0xe8, 0xff, 0xff, 0xff, 0xff }, 0xffff_fffd);
+    try std.testing.expectEqual(@as(?u64, 1), rel32.branch_target);
+    const rel16 = decode32(&.{ 0x66, 0xe9, 0xfc, 0xff }, 0x1234_1000);
+    try std.testing.expectEqual(@as(?u64, 0x1000), rel16.branch_target);
+    try std.testing.expectEqual(@as(u8, 4), rel16.length);
+    const cc16 = decode32(&.{ 0x66, 0x0f, 0x84, 0xfb, 0xff }, 0x1234_1000);
+    try std.testing.expectEqual(@as(?u64, 0x1000), cc16.branch_target);
+    try std.testing.expectEqual(@as(u8, 5), cc16.length);
+    try std.testing.expectEqual(@as(?u64, 0), decode32(&.{ 0xeb, 0x00 }, 0xffff_fffe).branch_target);
+}
+
+test "x86 mode truncated instructions and unsupported address16 stay explicit" {
+    const complete = [_][]const u8{
+        &.{ 0x8b, 0x85, 0, 0, 0, 0x80 },
+        &.{ 0xb8, 0x25, 0, 0, 0 },
+        &.{ 0x0f, 0x42, 0xc2 },
+        &.{ 0x8b, 0x04, 0x8d, 0, 0x10, 0, 0 },
+        &.{ 0x66, 0xe9, 0xfc, 0xff },
+        &.{ 0x0f, 0x1f, 0x44, 0, 0 },
+    };
+    for (complete) |bytes| {
+        for (0..bytes.len) |len| {
+            const result = decode32(bytes[0..len], 0);
+            try std.testing.expectEqualStrings("udf", result.mnemonic);
+            try std.testing.expectEqual(@as(u8, 1), result.length);
+        }
+    }
+    try std.testing.expectEqualStrings("udf", decode32(&.{ 0x8d, 0xc0 }, 0).mnemonic);
+    const unsupported = decode32(&.{ 0x67, 0x8b, 0x01 }, 0);
+    try std.testing.expectEqualStrings("unsupported", unsupported.mnemonic);
+    try std.testing.expectEqual(@as(u8, 1), unsupported.length);
+    const too_long: [17]u8 = @splat(0x66);
+    try std.testing.expectEqualStrings("udf", decode32(&too_long, 0).mnemonic);
+    try std.testing.expectEqualStrings("udf", decode(&too_long, 0).mnemonic);
+}
+
+test "MOVSXD REX.W register and memory operands preserve widths and lengths" {
+    // Encodings cross-checked with clang's x86_64 assembler.
+    const cases = [_]struct { bytes: []const u8, operands: []const u8 }{
+        .{ .bytes = &.{ 0x48, 0x63, 0xc6 }, .operands = "rax, esi" },
+        .{ .bytes = &.{ 0x4d, 0x63, 0xc1 }, .operands = "r8, r9d" },
+        .{ .bytes = &.{ 0x48, 0x63, 0x00 }, .operands = "rax, dword ptr [rax]" },
+        .{ .bytes = &.{ 0x4d, 0x63, 0x45, 0x80 }, .operands = "r8, dword ptr [r13 - 0x80]" },
+        .{ .bytes = &.{ 0x4f, 0x63, 0x94, 0xac, 0x78, 0x56, 0x34, 0x12 }, .operands = "r10, dword ptr [r12 + r13*4 + 0x12345678]" },
+        .{ .bytes = &.{ 0x48, 0x63, 0x05, 0x10, 0, 0, 0 }, .operands = "rax, dword ptr [rip + 0x10]" },
+        .{ .bytes = &.{ 0x48, 0x63, 0x04, 0x8d, 0, 0x10, 0, 0 }, .operands = "rax, dword ptr [rcx*4 + 0x1000]" },
+        .{ .bytes = &.{ 0x67, 0x48, 0x63, 0x01 }, .operands = "rax, dword ptr [ecx]" },
+        .{ .bytes = &.{ 0x67, 0x48, 0x63, 0x05, 0x10, 0, 0, 0 }, .operands = "rax, dword ptr [eip + 0x10]" },
+        .{ .bytes = &.{ 0x66, 0x48, 0x63, 0xc6 }, .operands = "rax, esi" },
+    };
+    for (cases) |case| {
+        const result = decode(case.bytes, 0x1000);
+        try std.testing.expectEqualStrings("movsxd", result.mnemonic);
+        try std.testing.expectEqualStrings(case.operands, result.getOperands());
+        try std.testing.expectEqual(@as(u8, @intCast(case.bytes.len)), result.length);
+        for (0..case.bytes.len) |len| {
+            const truncated = decode(case.bytes[0..len], 0x1000);
+            try std.testing.expectEqualStrings("udf", truncated.mnemonic);
+            try std.testing.expectEqual(@as(u8, 1), truncated.length);
+        }
+    }
+}
+
+test "MOVSXD guards legacy ARPL non-REX.W and unsupported prefixes" {
+    const unsupported = [_][]const u8{
+        &.{ 0x63, 0xc6 },             &.{ 0x40, 0x63, 0xc6 },
+        &.{ 0x66, 0x63, 0xc6 },       &.{ 0x48, 0x66, 0x63, 0xc6 },
+        &.{ 0xf0, 0x48, 0x63, 0x00 }, &.{ 0x64, 0x48, 0x63, 0x00 },
+    };
+    for (unsupported) |bytes| try std.testing.expectEqualStrings("udf", decode(bytes, 0).mnemonic);
+    try std.testing.expectEqualStrings("udf", decode32(&.{ 0x63, 0xc6 }, 0).mnemonic);
+    try std.testing.expectEqualStrings("udf", decode32(&.{ 0x66, 0x63, 0xc6 }, 0).mnemonic);
+    // In legacy mode the apparent REX.W byte remains the DEC opcode.
+    try expectDecode32(&.{0x48}, "dec", "eax");
+}
+
+test "MOVSXD raw benchmark C05 decodes every byte in both signed branches" {
+    const bytes = [_]u8{
+        0x39, 0xf7, 0x7d, 0x0e, 0x48, 0x63, 0xc6, 0x48,
+        0x63, 0xcf, 0x48, 0x29, 0xc8, 0x48, 0x83, 0xc0,
+        0x17, 0xc3, 0x48, 0x63, 0xc7, 0x48, 0x63, 0xce,
+        0x48, 0x29, 0xc8, 0x48, 0x83, 0xc0, 0xf5, 0xc3,
+    };
+    const mnemonics = [_][]const u8{ "cmp", "jge", "movsxd", "movsxd", "sub", "add", "ret", "movsxd", "movsxd", "sub", "add", "ret" };
+    var offset: usize = 0;
+    var movsxd_count: usize = 0;
+    for (mnemonics) |mnemonic| {
+        const result = decode(bytes[offset..], 0x1000 + offset);
+        try std.testing.expectEqualStrings(mnemonic, result.mnemonic);
+        if (std.mem.eql(u8, mnemonic, "movsxd")) {
+            movsxd_count += 1;
+            try std.testing.expectEqual(@as(u8, 3), result.length);
+        }
+        if (result.is_conditional_branch) try std.testing.expectEqual(@as(?u64, 0x1012), result.branch_target);
+        offset += result.length;
+    }
+    try std.testing.expectEqual(bytes.len, offset);
+    try std.testing.expectEqual(@as(usize, 4), movsxd_count);
 }

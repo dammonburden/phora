@@ -12,6 +12,8 @@ CONFIRM_PRIVATE=0
 CONFIRM_PUBLIC=0
 BUILD_TMP=""
 ZIG_TEST_FAILED=0
+REQUIRE_TESTS=0
+ZIG="${ZIG:-zig}"
 
 usage() {
   cat <<'EOF'
@@ -22,11 +24,18 @@ Options:
   --remote URL               Use this Git remote as origin when pushing.
   --branch NAME              Initial branch name. Default: main.
   --push                     Push to origin after all checks pass.
+  --require-tests            Fail the export if tests fail or Zig is unavailable.
   --confirm-private-repo     Required with --push to a private repo.
   --confirm-public-repo      Required with --push to a public repo.
   -h, --help                 Show this help.
 
 Default mode creates a sanitized source-only export and does not push.
+
+Environment:
+  ZIG                         Zig executable. Default: zig.
+  PHORA_EXPORT_ZIG_CACHE_DIR   Persistent global cache for export tests.
+                              Falls back to ZIG_GLOBAL_CACHE_DIR, then the
+                              user cache directory under phora/zig-export.
 EOF
 }
 
@@ -65,6 +74,51 @@ resolve_existing_parent() {
   (cd "$dir" && pwd -P)
 }
 
+check_global_cache_location() {
+  local path="$1"
+
+  case "$path" in
+    "$ROOT"|"$ROOT"/*|"$EXPORT_DIR"|"$EXPORT_DIR"/*)
+      die "Zig global cache must be outside the source and export trees: $path"
+      ;;
+  esac
+}
+
+resolve_global_cache() {
+  local cache_path
+  local cache_parent
+
+  if [ -n "${PHORA_EXPORT_ZIG_CACHE_DIR:-}" ]; then
+    cache_path="$PHORA_EXPORT_ZIG_CACHE_DIR"
+  elif [ -n "${ZIG_GLOBAL_CACHE_DIR:-}" ]; then
+    cache_path="$ZIG_GLOBAL_CACHE_DIR"
+  elif [ -n "${XDG_CACHE_HOME:-}" ]; then
+    cache_path="$XDG_CACHE_HOME/phora/zig-export"
+  elif [ "$(uname -s)" = "Darwin" ]; then
+    cache_path="$HOME/Library/Caches/phora/zig-export"
+  else
+    cache_path="$HOME/.cache/phora/zig-export"
+  fi
+
+  # Resolve relative overrides before the test process enters the export.
+  case "$cache_path" in
+    /*) ;;
+    *) cache_path="$PWD/$cache_path" ;;
+  esac
+  cache_parent="$(resolve_existing_parent "$cache_path")" || return
+  check_global_cache_location "$cache_parent"
+  if [ -e "$cache_path" ]; then
+    [ -d "$cache_path" ] || die "Zig global cache is not a directory: $cache_path"
+    cache_path="$(cd "$cache_path" && pwd -P)" || return
+    check_global_cache_location "$cache_path"
+  else
+    mkdir -p "$cache_path" || return
+    cache_path="$(cd "$cache_path" && pwd -P)" || return
+    check_global_cache_location "$cache_path"
+  fi
+  printf '%s\n' "$cache_path"
+}
+
 cleanup() {
   if [ -n "$BUILD_TMP" ] && [ -d "$BUILD_TMP" ]; then
     rm -rf "$BUILD_TMP"
@@ -91,6 +145,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --push)
       PUSH=1
+      shift
+      ;;
+    --require-tests)
+      REQUIRE_TESTS=1
       shift
       ;;
     --confirm-private-repo)
@@ -180,12 +238,13 @@ for rel in \
   benchmarks/cases.json \
   scripts/bench-phora.py \
   scripts/github-safe-audit.sh \
-  scripts/github-safe-publish.sh
+  scripts/github-safe-publish.sh \
+  scripts/test-github-safe-publish.sh
 do
   copy_file "$rel"
 done
 
-chmod +x "$EXPORT_DIR/scripts/bench-phora.py" "$EXPORT_DIR/scripts/github-safe-audit.sh" "$EXPORT_DIR/scripts/github-safe-publish.sh"
+chmod +x "$EXPORT_DIR/scripts/bench-phora.py" "$EXPORT_DIR/scripts/github-safe-audit.sh" "$EXPORT_DIR/scripts/github-safe-publish.sh" "$EXPORT_DIR/scripts/test-github-safe-publish.sh"
 
 "$SCRIPT_DIR/github-safe-audit.sh" "$EXPORT_DIR"
 
@@ -198,25 +257,32 @@ if ! git -C "$EXPORT_DIR" config user.email >/dev/null; then
   git -C "$EXPORT_DIR" config user.email "phora-safe-publish@example.invalid"
 fi
 
-if command -v zig >/dev/null 2>&1; then
+if command -v "$ZIG" >/dev/null 2>&1; then
   note "Running zig build test in sanitized export..."
+  EXPORT_ZIG_CACHE="$(resolve_global_cache)"
+  note "Zig global cache: $EXPORT_ZIG_CACHE"
   BUILD_TMP="$(mktemp -d "${TMPDIR:-/tmp}/phora-zig-build.XXXXXX")"
-  mkdir -p "$BUILD_TMP/cache" "$BUILD_TMP/global-cache" "$BUILD_TMP/prefix"
+  mkdir -p "$BUILD_TMP/cache" "$BUILD_TMP/prefix"
   set +e
   (
     cd "$EXPORT_DIR"
-    zig build test \
+    ZIG_GLOBAL_CACHE_DIR="$EXPORT_ZIG_CACHE" "$ZIG" build test \
       --cache-dir "$BUILD_TMP/cache" \
-      --global-cache-dir "$BUILD_TMP/global-cache" \
       --prefix "$BUILD_TMP/prefix"
   )
   zig_status=$?
   set -e
   if [ "$zig_status" -ne 0 ]; then
     ZIG_TEST_FAILED=1
+    if [ "$REQUIRE_TESTS" -eq 1 ]; then
+      die "zig build test failed in the sanitized export"
+    fi
     note "zig build test failed in the sanitized export; dry-run export will still be created, but push is blocked."
   fi
 else
+  if [ "$REQUIRE_TESTS" -eq 1 ]; then
+    die "Zig is unavailable: $ZIG"
+  fi
   note "Skipping zig build test: zig is not available on PATH."
 fi
 

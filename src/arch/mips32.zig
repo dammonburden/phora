@@ -12,7 +12,7 @@ const types = @import("../types.zig");
 
 pub const DecodedInstruction = struct {
     mnemonic: []const u8,
-    operands: [128]u8 = [_]u8{0} ** 128,
+    operands: [128]u8 = @splat(0),
     operands_len: u8 = 0,
     length: u8 = 4,
     is_branch: bool = false,
@@ -123,15 +123,6 @@ fn bit(insn: u32, pos: u5) u1 {
     return @truncate(insn >> pos);
 }
 
-fn signExtend(value: u64, sign_bit: u6) i64 {
-    const mask = @as(u64, 1) << sign_bit;
-    if (value & mask != 0) {
-        const ext: u64 = @as(u64, 0xFFFFFFFFFFFFFFFF) << @as(u6, sign_bit + 1);
-        return @bitCast(ext | value);
-    }
-    return @intCast(value);
-}
-
 fn readU32LE(raw: []const u8) u32 {
     return @as(u32, raw[0]) |
         (@as(u32, raw[1]) << 8) |
@@ -141,7 +132,7 @@ fn readU32LE(raw: []const u8) u32 {
 
 /// Compute branch target: (address + 4) + (sign_extend(imm16) << 2)
 fn branchTarget(address: u64, imm16: u32) u64 {
-    const offset = signExtend(@as(u64, imm16), 15);
+    const offset = std.math.signExtend(i64, @as(u16, @intCast(imm16)));
     const shifted = offset << 2;
     return @bitCast(@as(i64, @bitCast(address +% 4)) +% shifted);
 }
@@ -202,11 +193,11 @@ pub fn decode(raw: []const u8, address: u64) DecodedInstruction {
         0x2B => decodeLoadStore("sw", insn),
         0x2E => decodeLoadStore("swr", insn),
         0x31 => decodeFPLoadStore("lwc1", insn),
-        0x32 => decodeVFPULoadStore("lv.s", insn),
-        0x34 => decodeVFPULoadStore("lv.q", insn),
-        0x36 => decodeVFPULoadStore("sv.s", insn),
+        0x32 => decodeVFPULoadStore("lv.s", insn, false),
+        0x36 => decodeVFPULoadStore("lv.q", insn, true),
         0x39 => decodeFPLoadStore("swc1", insn),
-        0x3E => decodeVFPULoadStore("sv.q", insn),
+        0x3A => decodeVFPULoadStore("sv.s", insn, false),
+        0x3E => decodeVFPULoadStore("sv.q", insn, true),
         else => decodeUnknown(insn),
     };
 }
@@ -368,7 +359,7 @@ fn decodeImmArith(mnemonic: []const u8, insn: u32, signed: bool) DecodedInstruct
     f.comma();
 
     if (signed) {
-        const sext = signExtend(@as(u64, imm16), 15);
+        const sext = std.math.signExtend(i64, @as(u16, @intCast(imm16)));
         f.appendDec(sext);
     } else {
         f.appendDec(@intCast(imm16));
@@ -425,7 +416,7 @@ fn decodeLoadStore(mnemonic: []const u8, insn: u32) DecodedInstruction {
     const base = bits(insn, 25, 21);
     const rt = bits(insn, 20, 16);
     const imm16 = bits(insn, 15, 0);
-    const offset = signExtend(@as(u64, imm16), 15);
+    const offset = std.math.signExtend(i64, @as(u16, @intCast(imm16)));
 
     var result = DecodedInstruction{ .mnemonic = mnemonic };
     var f = FmtBuf.init(&result.operands);
@@ -448,7 +439,7 @@ fn decodeFPLoadStore(mnemonic: []const u8, insn: u32) DecodedInstruction {
     const base = bits(insn, 25, 21);
     const ft = bits(insn, 20, 16);
     const imm16 = bits(insn, 15, 0);
-    const offset = signExtend(@as(u64, imm16), 15);
+    const offset = std.math.signExtend(i64, @as(u16, @intCast(imm16)));
 
     var result = DecodedInstruction{ .mnemonic = mnemonic };
     var f = FmtBuf.init(&result.operands);
@@ -978,11 +969,14 @@ fn decodeVFPUFallback(insn: u32) DecodedInstruction {
 }
 
 /// VFPU load/store: lv.s/sv.s/lv.q/sv.q $vt, offset($base)
-fn decodeVFPULoadStore(mnemonic: []const u8, insn: u32) DecodedInstruction {
+fn decodeVFPULoadStore(mnemonic: []const u8, insn: u32, is_quad: bool) DecodedInstruction {
     const base = bits(insn, 25, 21);
-    const vt = bits(insn, 20, 16);
-    const imm16 = bits(insn, 15, 0);
-    const offset = signExtend(@as(u64, imm16), 15);
+    // The low bits extend vt, not the byte offset. For quad transfers,
+    // bit 1 instead carries the writeback hint.
+    const register_high = insn & @as(u32, if (is_quad) 1 else 3);
+    const vt = bits(insn, 20, 16) | (register_high << 5);
+    const imm16 = insn & 0xfffc;
+    const offset = std.math.signExtend(i64, @as(u16, @intCast(imm16)));
 
     var result = DecodedInstruction{ .mnemonic = mnemonic };
     var f = FmtBuf.init(&result.operands);
@@ -992,6 +986,7 @@ fn decodeVFPULoadStore(mnemonic: []const u8, insn: u32) DecodedInstruction {
     f.append("(");
     f.append(gprName(base));
     f.append(")");
+    if (is_quad and insn & 2 != 0) f.append(", wb");
 
     result.operands_len = f.len();
     return result;
@@ -1730,10 +1725,10 @@ test "lv.s $v4, 8($sp) (VFPU load single)" {
 }
 
 test "sv.s $v6, -4($sp) (VFPU store single)" {
-    // SWC2: opcode=0x36, base=29($sp), vt=6, offset=-4 (0xFFFC)
-    // 110110 11101 00110 1111111111111100
-    // = 0xDBA6FFFC
-    const raw = [_]u8{ 0xFC, 0xFF, 0xA6, 0xDB };
+    // SWC2: opcode=0x3A, base=29($sp), vt=6, offset=-4 (0xFFFC)
+    // 111010 11101 00110 1111111111111100
+    // = 0xEBA6FFFC
+    const raw = [_]u8{ 0xFC, 0xFF, 0xA6, 0xEB };
     const result = decode(&raw, 0x1000);
     try std.testing.expectEqualStrings("sv.s", result.mnemonic);
     try std.testing.expect(!result.is_branch);
@@ -1741,10 +1736,10 @@ test "sv.s $v6, -4($sp) (VFPU store single)" {
 }
 
 test "lv.q $v8, 16($a0) (VFPU load quad)" {
-    // opcode=0x34, base=4($a0), vt=8, offset=16
-    // 110100 00100 01000 0000000000010000
-    // = 0xD0880010
-    const raw = [_]u8{ 0x10, 0x00, 0x88, 0xD0 };
+    // opcode=0x36, base=4($a0), vt=8, offset=16
+    // 110110 00100 01000 0000000000010000
+    // = 0xD8880010
+    const raw = [_]u8{ 0x10, 0x00, 0x88, 0xD8 };
     const result = decode(&raw, 0x1000);
     try std.testing.expectEqualStrings("lv.q", result.mnemonic);
     try std.testing.expect(!result.is_branch);
@@ -1878,4 +1873,106 @@ test "GTE non-opcode falls through to VFPU (vadd preserved)" {
     const raw = [_]u8{ 0x00, 0x00, 0x00, 0x4A };
     const result = decode(&raw, 0x1000);
     try std.testing.expectEqualStrings("vadd", result.mnemonic);
+}
+
+test "signed imm16 exhausts branch word scaling and signed operands" {
+    for (0..65536) |immediate| {
+        const signed: i64 = if (immediate < 32768) @intCast(immediate) else @as(i64, @intCast(immediate)) - 65536;
+        var raw: [4]u8 = undefined;
+        const imm: u32 = @intCast(immediate);
+        std.mem.writeInt(u32, &raw, 0x10800000 | imm, .little); // beq $a0, $zero
+        const branch = decode(&raw, 0x100000);
+        try std.testing.expectEqualStrings("beq", branch.mnemonic);
+        try std.testing.expect(branch.is_branch and branch.is_conditional_branch);
+        try std.testing.expectEqual(@as(?u64, @intCast(0x100004 + signed * 4)), branch.branch_target);
+
+        std.mem.writeInt(u32, &raw, 0x27bd0000 | imm, .little); // addiu $sp, $sp
+        const arithmetic = decode(&raw, 0x100000);
+        var operands: [64]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&operands, "$sp, $sp, {d}", .{signed});
+        try std.testing.expectEqualStrings(expected, arithmetic.getOperands());
+    }
+}
+
+test "signed load store imm16 boundaries cover integer and floating operands" {
+    const cases = .{
+        .{ @as(u32, 0x8fa40000), "lw", "$a0" },
+        .{ @as(u32, 0xc7a40000), "lwc1", "$f4" },
+    };
+    inline for (cases) |case| {
+        for ([_]u32{ 0, 1, 0x7fff, 0x8000, 0x8001, 0xffff }) |immediate| {
+            const signed: i64 = if (immediate < 0x8000) immediate else @as(i64, immediate) - 0x10000;
+            var raw: [4]u8 = undefined;
+            std.mem.writeInt(u32, &raw, case[0] | immediate, .little);
+            const result = decode(&raw, 0x1000);
+            var operands: [64]u8 = undefined;
+            const expected = try std.fmt.bufPrint(&operands, "{s}, {d}($sp)", .{ case[2], signed });
+            try std.testing.expectEqualStrings(case[1], result.mnemonic);
+            try std.testing.expectEqualStrings(expected, result.getOperands());
+        }
+    }
+}
+
+test "signed branch offset preserves wrapping across address boundaries" {
+    for ([_]u32{ 0, 1, 0x7fff, 0x8000, 0xffff }) |immediate| {
+        const signed: i64 = if (immediate < 0x8000) immediate else @as(i64, immediate) - 0x10000;
+        for ([_]u64{ 0, std.math.maxInt(u64) - 3 }) |address| {
+            var raw: [4]u8 = undefined;
+            std.mem.writeInt(u32, &raw, 0x10800000 | immediate, .little);
+            const result = decode(&raw, address);
+            const expected = (address +% 4) +% @as(u64, @bitCast(signed * 4));
+            try std.testing.expectEqual(@as(?u64, expected), result.branch_target);
+        }
+    }
+}
+
+test "VFPU load store fields match PPSSPP reference encodings" {
+    // Primary reference: PPSSPP Core/MIPS/MIPSDisVFPU.cpp Dis_SV/Dis_SVQ
+    // and Core/MIPS/MIPSTables.cpp tableImmediate.
+    const cases = [_]struct { word: u32, mnemonic: []const u8, operands: []const u8 }{
+        .{ .word = 0xcba40001, .mnemonic = "lv.s", .operands = "$v36, 0($sp)" },
+        .{ .word = 0xcba4ffff, .mnemonic = "lv.s", .operands = "$v100, -4($sp)" },
+        .{ .word = 0xeba60002, .mnemonic = "sv.s", .operands = "$v70, 0($sp)" },
+        .{ .word = 0xeba6fffd, .mnemonic = "sv.s", .operands = "$v38, -4($sp)" },
+        .{ .word = 0xd8880011, .mnemonic = "lv.q", .operands = "$v40, 16($a0)" },
+        .{ .word = 0xd8888003, .mnemonic = "lv.q", .operands = "$v40, -32768($a0), wb" },
+        .{ .word = 0xf8a27ffe, .mnemonic = "sv.q", .operands = "$v2, 32764($a1), wb" },
+        .{ .word = 0xf8a2ffff, .mnemonic = "sv.q", .operands = "$v34, -4($a1), wb" },
+    };
+    for (cases) |case| {
+        var raw: [4]u8 = undefined;
+        std.mem.writeInt(u32, &raw, case.word, .little);
+        const result = decode(&raw, 0x1000);
+        try std.testing.expectEqualStrings(case.mnemonic, result.mnemonic);
+        try std.testing.expectEqualStrings(case.operands, result.getOperands());
+        try std.testing.expect(!result.is_branch);
+    }
+}
+
+test "VFPU scalar and quad transfers exhaust aligned offsets and register high bits" {
+    const cases = .{
+        .{ @as(u32, 0xc8000000), "lv.s", false },
+        .{ @as(u32, 0xe8000000), "sv.s", false },
+        .{ @as(u32, 0xd8000000), "lv.q", true },
+        .{ @as(u32, 0xf8000000), "sv.q", true },
+    };
+    inline for (cases) |case| {
+        for (0..16384) |index| {
+            // Generate signed byte offsets independently of the decoder.
+            const offset = @as(i64, @intCast(index)) * 4 - 32768;
+            const encoded_offset: u32 = @intCast(if (offset < 0) offset + 65536 else offset);
+            for (0..4) |low_bits| {
+                const register = 31 + 32 * (if (case[2]) low_bits % 2 else low_bits);
+                const writeback = case[2] and low_bits >= 2;
+                const word = case[0] | (29 << 21) | (31 << 16) | encoded_offset | @as(u32, @intCast(low_bits));
+                var raw: [4]u8 = undefined;
+                std.mem.writeInt(u32, &raw, word, .little);
+                const result = decode(&raw, 0x1000);
+                var operands: [64]u8 = undefined;
+                const expected = try std.fmt.bufPrint(&operands, "$v{d}, {d}($sp){s}", .{ register, offset, if (writeback) ", wb" else "" });
+                try std.testing.expectEqualStrings(case[1], result.mnemonic);
+                try std.testing.expectEqualStrings(expected, result.getOperands());
+            }
+        }
+    }
 }

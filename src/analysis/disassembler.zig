@@ -63,10 +63,8 @@ pub fn disassembleDocument(
     for (doc.segments) |segment| {
         if (!segment.permissions.execute) continue;
 
-        var found_code_section = false;
         for (segment.sections) |section| {
-            if (!isCodeSection(section.name)) continue;
-            found_code_section = true;
+            if (!section.isCode()) continue;
 
             if (section.file_offset >= doc.data.len) continue;
 
@@ -86,7 +84,7 @@ pub fn disassembleDocument(
         }
 
         // Fallback: no code sections found (stripped ELF). Use segment mapping.
-        if (!found_code_section and segment.file_size > 0) {
+        if (segment.sections.len == 0 and segment.file_size > 0) {
             if (segment.file_offset < doc.data.len) {
                 var seg_instructions = try disassembleSection(
                     allocator,
@@ -194,7 +192,7 @@ fn extractXrefsFiltered(inst: types.Instruction, xrefs: *xref_mod.XrefTracker, c
     }
 }
 
-/// Lean ARM64 linear sweep over a raw byte range. Extracts BL/B/CBZ/CBNZ/B.cond
+/// Lean ARM64 linear sweep over a raw byte range. Extracts BL/B/CBZ/CBNZ/B.cond/TBZ/TBNZ
 /// xrefs and tracks ADRP+ADD pairs for data references.
 fn leanSweepArm64(
     data: []const u8,
@@ -212,7 +210,7 @@ fn leanSweepArm64(
     var addr = base_addr;
 
     // Reset ADRP state at region boundary
-    adrp_valid.* = [_]bool{false} ** 32;
+    adrp_valid.* = @splat(false);
 
     while (offset + 4 <= end_offset) {
         const raw = data[offset..][0..4];
@@ -245,6 +243,12 @@ fn leanSweepArm64(
             else
                 @as(i64, @intCast(imm19));
             const target: u64 = @bitCast(@as(i64, @bitCast(addr)) +% (cond_off << 2));
+            try xrefs.addXref(addr, target, .jump);
+        } else if ((word & 0x7E000000) == 0x36000000) {
+            // TBZ/TBNZ: bit number is separate from the signed imm14 target.
+            const imm14: u14 = @truncate(word >> 5);
+            const bit_off = std.math.signExtend(i64, imm14);
+            const target: u64 = @bitCast(@as(i64, @bitCast(addr)) +% (bit_off << 2));
             try xrefs.addXref(addr, target, .jump);
         } else if (word & 0x9F000000 == 0x90000000) {
             // ADRP
@@ -315,7 +319,7 @@ pub fn disassembleDocumentLean(
     for (doc.segments) |segment| {
         if (!segment.permissions.read) continue;
         for (segment.sections) |section| {
-            if (isCodeSection(section.name)) continue;
+            if (section.isCode()) continue;
             if (section.length == 0) continue;
             if (data_section_count < data_sections_buf.len) {
                 data_sections_buf[data_section_count] = .{
@@ -331,9 +335,9 @@ pub fn disassembleDocumentLean(
     // ADRP tracking: last page address computed per register (32 ARM64 GP regs).
     // Each entry stores the page address and the instruction address of the ADRP
     // so we can enforce a proximity window for the matching ADD.
-    var adrp_page: [32]u64 = [_]u64{0} ** 32;
-    var adrp_addr: [32]u64 = [_]u64{0} ** 32;
-    var adrp_valid: [32]bool = [_]bool{false} ** 32;
+    var adrp_page: [32]u64 = @splat(0);
+    var adrp_addr: [32]u64 = @splat(0);
+    var adrp_valid: [32]bool = @splat(false);
 
     for (doc.segments) |segment| {
         if (!segment.permissions.execute) continue;
@@ -342,10 +346,8 @@ pub fn disassembleDocumentLean(
         // For ELF: if no code sections exist (stripped section headers), use the
         // segment's p_offset/p_vaddr mapping directly. This is the authoritative
         // mapping for ELF program headers.
-        var found_code_section = false;
         for (segment.sections) |section| {
-            if (!isCodeSection(section.name)) continue;
-            found_code_section = true;
+            if (!section.isCode()) continue;
 
             const file_off: usize = @intCast(section.file_offset);
             const sect_len: usize = @intCast(section.length);
@@ -358,7 +360,7 @@ pub fn disassembleDocumentLean(
 
         // Fallback: no code sections found (stripped ELF or unlabeled segments).
         // Use the segment's file_offset (p_offset) and file_size (p_filesz) directly.
-        if (!found_code_section and segment.file_size > 0) {
+        if (segment.sections.len == 0 and segment.file_size > 0) {
             const file_off: usize = @intCast(segment.file_offset);
             const seg_file_end = file_off + @as(usize, @intCast(segment.file_size));
             if (file_off < doc.data.len) {
@@ -474,10 +476,8 @@ pub fn disassembleDocumentLean32(
         if (!segment.permissions.execute) continue;
 
         // Try code sections first.
-        var found_code_section = false;
         for (segment.sections) |section| {
-            if (!isCodeSection(section.name)) continue;
-            found_code_section = true;
+            if (!section.isCode()) continue;
 
             const file_off: usize = @intCast(section.file_offset);
             const sect_len: usize = @intCast(section.length);
@@ -490,7 +490,7 @@ pub fn disassembleDocumentLean32(
 
         // Fallback: no code sections found (stripped ELF or unlabeled segments).
         // Use the segment's file_offset (p_offset) and file_size (p_filesz) directly.
-        if (!found_code_section and segment.file_size > 0) {
+        if (segment.sections.len == 0 and segment.file_size > 0) {
             const file_off: usize = @intCast(segment.file_offset);
             const seg_file_end = file_off + @as(usize, @intCast(segment.file_size));
             if (file_off < doc.data.len) {
@@ -522,7 +522,7 @@ fn leanSweepMips32(
     var addr = base_addr;
 
     // Reset LUI state at region boundary
-    lui_valid.* = [_]bool{false} ** 32;
+    lui_valid.* = @splat(false);
 
     while (offset + 4 <= end_offset) {
         const raw = data[offset..][0..4];
@@ -652,7 +652,7 @@ pub fn disassembleDocumentLeanMips32(
     for (doc.segments) |segment| {
         if (!segment.permissions.read) continue;
         for (segment.sections) |section| {
-            if (isCodeSection(section.name)) continue;
+            if (section.isCode()) continue;
             if (section.length == 0) continue;
             if (data_section_count < data_sections_buf.len) {
                 data_sections_buf[data_section_count] = .{
@@ -666,17 +666,15 @@ pub fn disassembleDocumentLeanMips32(
     const data_sections = data_sections_buf[0..data_section_count];
 
     // LUI tracking: last upper-immediate value per register (32 MIPS GP regs).
-    var lui_value: [32]u64 = [_]u64{0} ** 32;
-    var lui_addr: [32]u64 = [_]u64{0} ** 32;
-    var lui_valid: [32]bool = [_]bool{false} ** 32;
+    var lui_value: [32]u64 = @splat(0);
+    var lui_addr: [32]u64 = @splat(0);
+    var lui_valid: [32]bool = @splat(false);
 
     for (doc.segments) |segment| {
         if (!segment.permissions.execute) continue;
 
-        var found_code_section = false;
         for (segment.sections) |section| {
-            if (!isCodeSection(section.name)) continue;
-            found_code_section = true;
+            if (!section.isCode()) continue;
 
             const file_off: usize = @intCast(section.file_offset);
             const sect_len: usize = @intCast(section.length);
@@ -688,7 +686,7 @@ pub fn disassembleDocumentLeanMips32(
         }
 
         // Fallback: no code sections found (stripped ELF).
-        if (!found_code_section and segment.file_size > 0) {
+        if (segment.sections.len == 0 and segment.file_size > 0) {
             const file_off: usize = @intCast(segment.file_offset);
             const seg_file_end = file_off + @as(usize, @intCast(segment.file_size));
             if (file_off < raw_data.len) {
@@ -740,24 +738,9 @@ fn leanSweepX86_64(
     return insn_count;
 }
 
-/// v7.13.0 B1+B2 — Lean x86-32 (i386) linear sweep. PE32 binaries
-/// previously routed nowhere — neither x86_64 nor x86 lean sweeps fired, so
-/// `procedure_count`, `string_refs`, and call graph were all empty. This is a
-/// minimal byte-pattern sweep for the most common x86-32 call/jump/data
-/// idioms; deep operand decoding stays the responsibility of the future
-/// dedicated x86 decoder.
-///
-/// Patterns handled:
-///   - `e8 disp32`            → CALL rel32           (xref .call)
-///   - `e9 disp32`            → JMP rel32            (xref .jump)
-///   - `eb disp8`             → JMP rel8             (xref .jump)
-///   - `0f 8x disp32`         → Jcc rel32 (long form)(xref .jump)
-///   - `7x disp8`             → Jcc rel8             (xref .jump)
-///   - `8d /r [imm32]`        → LEA reg, [disp32]    (xref .data_read)
-///   - `8b /r [imm32]`        → MOV reg, [disp32]    (xref .data_read)
-///   - `c7 /0 [imm32], imm32` → MOV [disp32], imm32  (xref .data_write)
-///   - `89 /r [imm32]`        → MOV [disp32], reg    (xref .data_write)
-///   - `68 imm32`             → PUSH imm32 (treated as data_read if in-range)
+/// Lean i386 sweep using the same mode-aware lengths as instruction evidence.
+/// Data-reference recognition is deliberately limited to absolute MOV/LEA and
+/// PUSH-immediate patterns; undecoded instructions stop the sweep.
 fn leanSweepX86(
     data: []const u8,
     start_offset: usize,
@@ -769,136 +752,38 @@ fn leanSweepX86(
     var insn_count: usize = 0;
     var offset = start_offset;
     var addr = base_addr;
+    const end = @min(end_offset, data.len);
 
-    while (offset < end_offset and offset < data.len) {
-        if (end_offset - offset < 1) break;
-        const op = data[offset];
-
-        // Single-byte branch / call instructions ----------------------------
-        if (op == 0xE8 and offset + 5 <= end_offset) {
-            // CALL rel32
-            const disp = std.mem.readInt(i32, data[offset + 1 ..][0..4], .little);
-            const target: u64 = @bitCast(@as(i64, @bitCast(addr + 5)) +% @as(i64, disp));
-            try xrefs.addXref(addr, target, .call);
-            offset += 5;
-            addr += 5;
-            insn_count += 1;
-            continue;
-        }
-        if (op == 0xE9 and offset + 5 <= end_offset) {
-            // JMP rel32
-            const disp = std.mem.readInt(i32, data[offset + 1 ..][0..4], .little);
-            const target: u64 = @bitCast(@as(i64, @bitCast(addr + 5)) +% @as(i64, disp));
-            try xrefs.addXref(addr, target, .jump);
-            offset += 5;
-            addr += 5;
-            insn_count += 1;
-            continue;
-        }
-        if (op == 0xEB and offset + 2 <= end_offset) {
-            // JMP rel8
-            const disp = @as(i8, @bitCast(data[offset + 1]));
-            const target: u64 = @bitCast(@as(i64, @bitCast(addr + 2)) +% @as(i64, disp));
-            try xrefs.addXref(addr, target, .jump);
-            offset += 2;
-            addr += 2;
-            insn_count += 1;
-            continue;
-        }
-        if (op >= 0x70 and op <= 0x7F and offset + 2 <= end_offset) {
-            // Short Jcc rel8
-            const disp = @as(i8, @bitCast(data[offset + 1]));
-            const target: u64 = @bitCast(@as(i64, @bitCast(addr + 2)) +% @as(i64, disp));
-            try xrefs.addXref(addr, target, .jump);
-            offset += 2;
-            addr += 2;
-            insn_count += 1;
-            continue;
-        }
-        if (op == 0x0F and offset + 6 <= end_offset) {
-            const op2 = data[offset + 1];
-            if (op2 >= 0x80 and op2 <= 0x8F) {
-                // Long Jcc rel32
-                const disp = std.mem.readInt(i32, data[offset + 2 ..][0..4], .little);
-                const target: u64 = @bitCast(@as(i64, @bitCast(addr + 6)) +% @as(i64, disp));
-                try xrefs.addXref(addr, target, .jump);
-                offset += 6;
-                addr += 6;
-                insn_count += 1;
-                continue;
-            }
+    while (offset < end) {
+        const bytes = data[offset..end];
+        const decoded = x86_64.decode32(bytes, addr);
+        // There is no reliable next instruction boundary for these encodings.
+        if (std.mem.eql(u8, decoded.mnemonic, "unsupported") or
+            std.mem.eql(u8, decoded.mnemonic, "udf") or
+            std.mem.eql(u8, decoded.mnemonic, "db")) break;
+        if (decoded.branch_target) |target| {
+            try xrefs.addXref(addr, target, if (decoded.is_call) .call else .jump);
         }
 
-        // Absolute-address loads / stores -----------------------------------
-        // 8d /r mod=00 r/m=101 → LEA reg, [disp32]      (5 bytes after prefix)
-        // 8b /r mod=00 r/m=101 → MOV reg, [disp32]
-        // 89 /r mod=00 r/m=101 → MOV [disp32], reg
-        // c7 /0 mod=00 r/m=101 → MOV [disp32], imm32   (10 bytes total)
-        if ((op == 0x8D or op == 0x8B or op == 0x89) and offset + 6 <= end_offset) {
-            const modrm = data[offset + 1];
-            const mod: u8 = (modrm >> 6) & 0x3;
-            const rm: u8 = modrm & 0x7;
-            if (mod == 0 and rm == 5) {
-                const imm = std.mem.readInt(u32, data[offset + 2 ..][0..4], .little);
-                const target: u64 = imm;
-                const xtype: types.XrefType = if (op == 0x89) .data_write else .data_read;
+        // Preserve the supported unprefixed absolute-address data patterns.
+        const op = bytes[0];
+        if ((op == 0x8D or op == 0x8B or op == 0x89 or op == 0xC7) and decoded.length >= 6) {
+            const modrm = bytes[1];
+            if ((modrm & 0xc7) == 0x05 and (op != 0xC7 or (modrm & 0x38) == 0)) {
+                const target = std.mem.readInt(u32, bytes[2..6], .little);
                 if (isInDataSection(target, data_sections)) {
-                    try xrefs.addXref(addr, target, xtype);
+                    try xrefs.addXref(addr, target, if (op == 0x89 or op == 0xC7) .data_write else .data_read);
                 }
-                offset += 6;
-                addr += 6;
-                insn_count += 1;
-                continue;
             }
-        }
-        if (op == 0xC7 and offset + 10 <= end_offset) {
-            const modrm = data[offset + 1];
-            const mod: u8 = (modrm >> 6) & 0x3;
-            const rm: u8 = modrm & 0x7;
-            const reg: u8 = (modrm >> 3) & 0x7;
-            if (mod == 0 and rm == 5 and reg == 0) {
-                const imm = std.mem.readInt(u32, data[offset + 2 ..][0..4], .little);
-                const target: u64 = imm;
-                if (isInDataSection(target, data_sections)) {
-                    try xrefs.addXref(addr, target, .data_write);
-                }
-                offset += 10;
-                addr += 10;
-                insn_count += 1;
-                continue;
-            }
+        } else if (op == 0x68 and decoded.length == 5) {
+            const target = std.mem.readInt(u32, bytes[1..5], .little);
+            if (isInDataSection(target, data_sections)) try xrefs.addXref(addr, target, .data_read);
         }
 
-        // PUSH imm32 — `68 imm32`. Often used to push a string pointer for
-        // `printf`-class calls; treat the immediate as a data_read if it
-        // lands in a data section.
-        if (op == 0x68 and offset + 5 <= end_offset) {
-            const imm = std.mem.readInt(u32, data[offset + 1 ..][0..4], .little);
-            const target: u64 = imm;
-            if (isInDataSection(target, data_sections)) {
-                try xrefs.addXref(addr, target, .data_read);
-            }
-            offset += 5;
-            addr += 5;
-            insn_count += 1;
-            continue;
-        }
-
-        // RET — terminates a procedure (used by detectX86Procedures B2).
-        if (op == 0xC3 or op == 0xC2 or op == 0xCB or op == 0xCA) {
-            offset += 1;
-            addr += 1;
-            insn_count += 1;
-            continue;
-        }
-
-        // Unknown / not-tracked: advance one byte. We don't try to be a full
-        // x86 decoder — this lean sweep is intentionally pattern-based.
-        offset += 1;
-        addr += 1;
         insn_count += 1;
+        offset += decoded.length;
+        addr += decoded.length;
     }
-
     return insn_count;
 }
 
@@ -916,7 +801,7 @@ pub fn disassembleDocumentLeanX86(
     for (doc.segments) |segment| {
         if (!segment.permissions.read) continue;
         for (segment.sections) |section| {
-            if (isCodeSection(section.name)) continue;
+            if (section.isCode()) continue;
             if (section.length == 0) continue;
             if (data_section_count < data_sections_buf.len) {
                 data_sections_buf[data_section_count] = .{
@@ -931,10 +816,8 @@ pub fn disassembleDocumentLeanX86(
 
     for (doc.segments) |segment| {
         if (!segment.permissions.execute) continue;
-        var found_code_section = false;
         for (segment.sections) |section| {
-            if (!isCodeSection(section.name)) continue;
-            found_code_section = true;
+            if (!section.isCode()) continue;
             const file_off: usize = @intCast(section.file_offset);
             const sect_len: usize = @intCast(section.length);
             const section_end = file_off + sect_len;
@@ -942,7 +825,7 @@ pub fn disassembleDocumentLeanX86(
             const end_offset = @min(section_end, doc.data.len);
             insn_count += try leanSweepX86(doc.data, file_off, end_offset, section.start, xrefs, data_sections);
         }
-        if (!found_code_section and segment.file_size > 0) {
+        if (segment.sections.len == 0 and segment.file_size > 0) {
             const file_off: usize = @intCast(segment.file_offset);
             const seg_file_end = file_off + @as(usize, @intCast(segment.file_size));
             if (file_off < doc.data.len) {
@@ -969,7 +852,7 @@ pub fn disassembleDocumentLeanX86_64(
     for (doc.segments) |segment| {
         if (!segment.permissions.read) continue;
         for (segment.sections) |section| {
-            if (isCodeSection(section.name)) continue;
+            if (section.isCode()) continue;
             if (section.length == 0) continue;
             if (data_section_count < data_sections_buf.len) {
                 data_sections_buf[data_section_count] = .{
@@ -984,10 +867,8 @@ pub fn disassembleDocumentLeanX86_64(
 
     for (doc.segments) |segment| {
         if (!segment.permissions.execute) continue;
-        var found_code_section = false;
         for (segment.sections) |section| {
-            if (!isCodeSection(section.name)) continue;
-            found_code_section = true;
+            if (!section.isCode()) continue;
             const file_off: usize = @intCast(section.file_offset);
             const sect_len: usize = @intCast(section.length);
             const section_end = file_off + sect_len;
@@ -995,7 +876,7 @@ pub fn disassembleDocumentLeanX86_64(
             const end_offset = @min(section_end, doc.data.len);
             insn_count += try leanSweepX86_64(doc.data, file_off, end_offset, section.start, xrefs, data_sections);
         }
-        if (!found_code_section and segment.file_size > 0) {
+        if (segment.sections.len == 0 and segment.file_size > 0) {
             const file_off: usize = @intCast(segment.file_offset);
             const seg_file_end = file_off + @as(usize, @intCast(segment.file_size));
             if (file_off < doc.data.len) {
@@ -1056,13 +937,6 @@ fn isInDataSection(addr: u64, sections: []const DataSectionBounds) bool {
     return false;
 }
 
-fn isCodeSection(name: []const u8) bool {
-    return std.mem.eql(u8, name, "__text") or
-        std.mem.eql(u8, name, "__stubs") or
-        std.mem.eql(u8, name, ".text") or
-        std.mem.eql(u8, name, ".plt");
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1100,7 +974,7 @@ test "linear sweep with mock decoder" {
         }
     }.decode;
 
-    const data = [_]u8{0} ** 16;
+    const data: [16]u8 = @splat(0);
     var instructions = try disassembleSection(
         allocator,
         &data,
@@ -1116,4 +990,69 @@ test "linear sweep with mock decoder" {
     try std.testing.expectEqual(@as(usize, 4), instructions.items.len);
     try std.testing.expectEqual(@as(u64, 0x1000), instructions.items[0].address);
     try std.testing.expectEqual(@as(u64, 0x100C), instructions.items[3].address);
+}
+
+test "x86 lean sweep respects decoded immediates and operand-size branches" {
+    const allocator = std.testing.allocator;
+    var xrefs = xref_mod.XrefTracker.init(allocator, std.testing.io);
+    defer xrefs.deinit();
+    // A MOV immediate deliberately contains E8 (CALL opcode), followed by a
+    // real operand-size-overridden relative CALL and an absolute data load.
+    const bytes = [_]u8{
+        0xb8, 0xe8, 0,    0, 0,
+        0x66, 0xe8, 0,    0, 0x8b,
+        0x05, 0,    0x20, 0, 0,
+        0xc3,
+    };
+    const count = try leanSweepX86(&bytes, 0, bytes.len, 0x1000, &xrefs, &.{.{ .start = 0x2000, .end = 0x2100 }});
+    try std.testing.expectEqual(@as(usize, 4), count);
+    try std.testing.expectEqual(@as(usize, 0), xrefs.getRefsFrom(0x1001).len);
+    const call = xrefs.getRefsFrom(0x1005);
+    try std.testing.expectEqual(@as(usize, 1), call.len);
+    try std.testing.expectEqual(@as(u64, 0x1009), call[0].to);
+    try std.testing.expectEqual(types.XrefType.call, call[0].xref_type);
+    const load = xrefs.getRefsFrom(0x1009);
+    try std.testing.expectEqual(@as(usize, 1), load.len);
+    try std.testing.expectEqual(@as(u64, 0x2000), load[0].to);
+    try std.testing.expectEqual(types.XrefType.data_read, load[0].xref_type);
+}
+
+test "x86 lean sweep stops at truncated or unsupported instruction boundary" {
+    var xrefs = xref_mod.XrefTracker.init(std.testing.allocator, std.testing.io);
+    defer xrefs.deinit();
+    try std.testing.expectEqual(@as(usize, 1), try leanSweepX86(&.{ 0x90, 0xe8, 0, 0 }, 0, 100, 0x1000, &xrefs, &.{}));
+    try std.testing.expectEqual(@as(usize, 1), try leanSweepX86(&.{ 0x90, 0x67, 0x8b, 0, 0xe8, 0, 0, 0, 0 }, 0, 9, 0x1000, &xrefs, &.{}));
+    try std.testing.expectEqual(@as(usize, 0), xrefs.refs_from.count());
+}
+
+test "x86 lean sweep never treats unknown opcode operands as instructions" {
+    var xrefs = xref_mod.XrefTracker.init(std.testing.allocator, std.testing.io);
+    defer xrefs.deinit();
+    // IMUL r32,r/m32,imm32 (69) is not decoded yet. Its immediate contains
+    // E8 followed by enough bytes to fabricate a CALL if scanning resumes.
+    const bytes = [_]u8{ 0x90, 0x69, 0xc0, 0xe8, 0, 0, 0, 0, 0xc3 };
+    try std.testing.expectEqual(@as(usize, 1), try leanSweepX86(&bytes, 0, bytes.len, 0x1000, &xrefs, &.{}));
+    try std.testing.expectEqual(@as(usize, 0), xrefs.refs_from.count());
+}
+
+test "ARM64 lean sweep records TBZ TBNZ signed targets" {
+    const t = std.testing;
+    var xrefs = xref_mod.XrefTracker.init(t.allocator, t.io);
+    defer xrefs.deinit();
+    // tbz w0,#0,+8; tbnz x1,#63,-4; tbz w2,#2,+32764;
+    // tbnz x3,#32,-32768. Literal encodings exercise both offset bounds.
+    const words = [_]u32{ 0x36000040, 0xb7ffffe1, 0x3613ffe2, 0xb7040003 };
+    const targets = [_]u64{ 0x10008, 0x10000, 0x18004, 0x800c };
+    var bytes: [words.len * 4]u8 = undefined;
+    for (words, 0..) |word, i| std.mem.writeInt(u32, bytes[i * 4 ..][0..4], word, .little);
+    var pages: [32]u64 = @splat(0);
+    var addresses: [32]u64 = @splat(0);
+    var valid: [32]bool = @splat(false);
+    try t.expectEqual(@as(usize, words.len), try leanSweepArm64(&bytes, 0, bytes.len, 0x10000, &xrefs, &.{}, &pages, &addresses, &valid));
+    for (targets, 0..) |target, i| {
+        const refs = xrefs.getRefsFrom(0x10000 + i * 4);
+        try t.expectEqual(@as(usize, 1), refs.len);
+        try t.expectEqual(target, refs[0].to);
+        try t.expectEqual(types.XrefType.jump, refs[0].xref_type);
+    }
 }

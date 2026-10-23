@@ -12,7 +12,7 @@ const json = @import("util/json.zig");
 const http = @import("util/http.zig");
 const pipeline = @import("analysis/pipeline.zig");
 
-const version_string = "7.15.3";
+const version_string = "7.17.0";
 
 /// Max binary size: 2GB. The real limit is available RAM — Zig's allocator
 /// will fail gracefully if the machine can't handle it.

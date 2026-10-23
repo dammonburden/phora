@@ -76,6 +76,17 @@ pub fn detect(
     };
 }
 
+/// Mapped, bounded, clobber-safe ARM64 recovery used by on-demand CFGs.
+/// Legacy `detect` remains dormant; it lacks Document mapping/owner bounds.
+pub fn recoverArm64(allocator: std.mem.Allocator, doc: *const types.Document, entry: u64, size: u64) ![]JumpTable {
+    return @import("arm64_jumptable.zig").recover(allocator, doc, entry, size);
+}
+
+pub fn freeRecoveredTables(allocator: std.mem.Allocator, tables: []JumpTable) void {
+    for (tables) |table| allocator.free(table.cases);
+    allocator.free(tables);
+}
+
 // ============================================================================
 // Shared helpers
 // ============================================================================
@@ -844,7 +855,7 @@ test "arm64 tbb relative table" {
     // image_base = 0x1000. Code at 0x1100. Table at 0x2000 (4 bytes: 1,2,3,4).
     // Targets = base(0x2000) + (entry << 2) = 0x2004, 0x2008, 0x200c, 0x2010.
     const image_base: u64 = 0x1000;
-    var data: [0x4000]u8 = [_]u8{0} ** 0x4000;
+    var data: [0x4000]u8 = @splat(0);
     // Table at file_off 0x2000-0x1000 = 0x1000.
     data[0x1000] = 1;
     data[0x1001] = 2;
@@ -880,7 +891,7 @@ test "arm64 absolute 8-byte table" {
     const allocator = testing.allocator;
 
     const image_base: u64 = 0x100000000;
-    var data: [0x4000]u8 = [_]u8{0} ** 0x4000;
+    var data: [0x4000]u8 = @splat(0);
     // Table at virtual 0x100002000 == file offset 0x2000.
     const targets = [_]u64{ 0x100001000, 0x100001100, 0x100001200 };
     for (targets, 0..) |t, i| {
@@ -914,7 +925,7 @@ test "x86_64 4-byte rip-relative table" {
     const allocator = testing.allocator;
 
     const image_base: u64 = 0x400000;
-    var data: [0x4000]u8 = [_]u8{0} ** 0x4000;
+    var data: [0x4000]u8 = @splat(0);
     // Table at virtual 0x402000 (file off 0x2000). Three offsets relative to
     // table_addr: targets = 0x402000 + entry.
     const offsets = [_]i32{ 0x100, 0x200, 0x300 };
@@ -952,7 +963,7 @@ test "x86_64 8-byte absolute rip-relative table" {
     const allocator = testing.allocator;
 
     const image_base: u64 = 0x400000;
-    var data: [0x4000]u8 = [_]u8{0} ** 0x4000;
+    var data: [0x4000]u8 = @splat(0);
     const targets = [_]u64{ 0x401100, 0x401200 };
     for (targets, 0..) |t, i| {
         std.mem.writeInt(u64, data[0x2000 + i * 8 ..][0..8], t, .little);
@@ -984,7 +995,7 @@ test "mips32 absolute 4-byte table" {
     const allocator = testing.allocator;
 
     const image_base: u64 = 0x400000;
-    var data: [0x4000]u8 = [_]u8{0} ** 0x4000;
+    var data: [0x4000]u8 = @splat(0);
     const targets = [_]u32{ 0x401100, 0x401200, 0x401300 };
     // Table at 0x402100 → file off 0x2100.
     for (targets, 0..) |t, i| {
@@ -1018,7 +1029,7 @@ test "mips32 absolute 4-byte table" {
 
 test "mips32 jr ra is not a switch" {
     const allocator = testing.allocator;
-    var data: [0x100]u8 = [_]u8{0} ** 0x100;
+    var data: [0x100]u8 = @splat(0);
     const insts = [_]types.Instruction{
         makeInst(0x401000, "jr", "$ra", 4),
     };
@@ -1028,7 +1039,7 @@ test "mips32 jr ra is not a switch" {
 
 test "out-of-range table address yields null" {
     const allocator = testing.allocator;
-    var data: [0x100]u8 = [_]u8{0} ** 0x100;
+    var data: [0x100]u8 = @splat(0);
     // Table address way past binary_data end.
     const insts = [_]types.Instruction{
         makeInst(0x1100, "cmp", "w0, #0x3", 4),
@@ -1044,7 +1055,7 @@ test "out-of-range table address yields null" {
 
 test "no pattern match yields null" {
     const allocator = testing.allocator;
-    var data: [0x100]u8 = [_]u8{0} ** 0x100;
+    var data: [0x100]u8 = @splat(0);
     // Just a `br x0` with no preceding pattern.
     const insts = [_]types.Instruction{
         makeInst(0x1100, "mov", "x0, x1", 4),
@@ -1056,7 +1067,7 @@ test "no pattern match yields null" {
 
 test "non-indirect branch yields null" {
     const allocator = testing.allocator;
-    var data: [0x100]u8 = [_]u8{0} ** 0x100;
+    var data: [0x100]u8 = @splat(0);
     const insts = [_]types.Instruction{
         makeInst(0x1100, "ret", "", 4),
     };
@@ -1066,7 +1077,7 @@ test "non-indirect branch yields null" {
 
 test "arm32 currently unsupported" {
     const allocator = testing.allocator;
-    var data: [0x100]u8 = [_]u8{0} ** 0x100;
+    var data: [0x100]u8 = @splat(0);
     const insts = [_]types.Instruction{
         makeInst(0x1100, "bx", "r0", 4),
     };

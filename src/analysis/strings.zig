@@ -104,12 +104,22 @@ pub fn detectAllStrings(
     return results;
 }
 
-/// Scan only __BUN segments with min_length=4 for on-demand bundle string searching.
-/// Used by get_strings pattern=X to find short strings in embedded JS bundles
-/// that were skipped during load (which uses min_length=15 for __BUN).
+/// Extract printable runs (>= `min_length`) from packed runtime segments
+/// (`__BUN`, `__asar`, ...) on demand. These segments are skipped during load
+/// (`detectAllStrings`) because byte-scanning 100+ MB costs 200+ s, so this is
+/// the escape hatch for reading embedded-runtime text (e.g. a Bun JS bundle).
+///
+/// STREAMING + BOUNDED: appends up to `max_results` strings and returns as soon
+/// as the cap is hit, without ever materializing the full multi-million-string
+/// set — safe to call on a 150 MB bundle. Callers should treat a result length
+/// == max_results as "truncated". Uses relaxed termination (any non-printable
+/// byte ends a run), matching the minified-JS layout. Returned `.value` slices
+/// point into `doc.data` and are NOT owned by the caller.
 pub fn detectBundleStrings(
     allocator: std.mem.Allocator,
     doc: *const types.Document,
+    min_length: u32,
+    max_results: usize,
 ) !std.array_list.Managed(types.String) {
     var results = std.array_list.Managed(types.String).init(allocator);
     errdefer results.deinit();
@@ -122,10 +132,22 @@ pub fn detectBundleStrings(
             if (section_end > doc.data.len) continue;
             if (section.file_offset >= doc.data.len) continue;
 
-            const section_data = doc.data[section.file_offset..section_end];
-            var section_strings = try detectStrings(allocator, section_data, section.start, 4, false);
-            defer section_strings.deinit();
-            try results.appendSlice(section_strings.items);
+            const data = doc.data[section.file_offset..section_end];
+            var i: usize = 0;
+            while (i < data.len) {
+                if (results.items.len >= max_results) return results;
+                const run_start = i;
+                while (i < data.len and isPrintableAscii(data[i])) i += 1;
+                const run_len = i - run_start;
+                if (run_len >= min_length) {
+                    try results.append(.{
+                        .address = section.start + run_start,
+                        .value = data[run_start .. run_start + run_len],
+                        .length = @intCast(run_len),
+                    });
+                }
+                if (run_len == 0) i += 1; // advance past the non-printable byte
+            }
         }
     }
 

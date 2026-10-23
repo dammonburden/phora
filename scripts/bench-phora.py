@@ -27,7 +27,7 @@ REQUIRED_TOOL_NAMES = {
     "get_imports",
     "get_strings",
     "read_bytes",
-    "decompile",
+    "disassemble_range",
     "close_document",
     "get_segments",
     "get_embedded_resources",
@@ -289,12 +289,12 @@ def run_strict_probes(report: dict[str, Any], session: McpSession, doc_id: Any, 
         append_tool_call(
             report,
             session,
-            "strict-decompile",
-            "decompile",
-            {"doc_id": doc_id, "address": address, "scope": "single", "max_chars": 4000, "include_addresses": False},
+            "strict-disassemble-range",
+            "disassemble_range",
+            {"doc_id": doc_id, "start": address, "byte_length": 16},
         )
     else:
-        report.setdefault("strict_warnings", []).append("entry_point missing or zero; skipped read_bytes/decompile probes")
+        report.setdefault("strict_warnings", []).append("entry_point missing or zero; skipped read_bytes/disassemble_range probes")
     append_tool_call(report, session, "strict-close-document", "close_document", {"doc_id": doc_id})
 
 

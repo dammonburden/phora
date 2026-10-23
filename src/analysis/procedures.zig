@@ -28,8 +28,10 @@ pub fn detectProcedures(
     var entries = std.AutoHashMap(u64, ProcedureSource).init(allocator);
     defer entries.deinit();
 
-    // 1. Entry point is always a procedure
-    if (doc.entry_point != 0) {
+    // Zero is a valid raw-image entry when backed by executable bytes.
+    // Other formats still use zero as the absent-entry sentinel.
+    const has_entry = doc.entry_point != 0 or (doc.format == .raw and doc.codeRangeEnd(0) != null);
+    if (has_entry and (doc.segments.len == 0 or doc.codeRangeEnd(doc.entry_point) != null)) {
         try entries.put(doc.entry_point, .entry_point);
     }
 
@@ -55,11 +57,29 @@ pub fn detectProcedures(
     defer allocator.free(call_targets);
 
     for (call_targets) |target| {
+        if (doc.segments.len > 0 and doc.codeRangeEnd(target) == null) continue;
+        if (!doc.permitsProcedureStart(target)) continue;
         // Only count calls landing in __text as real procedures
         if (text_end > 0 and (target < text_start or target >= text_end)) continue;
         if (!entries.contains(target)) {
             try entries.put(target, .call_target);
         }
+    }
+
+    // ARM64 post-return guesses must not split named symbol ranges at an
+    // internal branch destination. Keep a sorted range index, since large
+    // binaries can contain tens of thousands of symbols and return sites.
+    var symbol_ranges = std.array_list.Managed(types.Procedure).init(allocator);
+    defer symbol_ranges.deinit();
+    if (doc.arch == .arm64) {
+        for (doc.procedures.items) |p| {
+            if (p.name != null and p.size > 0) try symbol_ranges.append(p);
+        }
+        std.mem.sort(types.Procedure, symbol_ranges.items, {}, struct {
+            fn lessThan(_: void, a: types.Procedure, b: types.Procedure) bool {
+                return a.entry < b.entry;
+            }
+        }.lessThan);
     }
 
     // 3. Scan for architecture-specific prologue patterns
@@ -69,6 +89,7 @@ pub fn detectProcedures(
             if (!segment.permissions.execute) continue;
 
             for (segment.sections) |section| {
+                if (!section.isCode() or doc.hasLinkerFunctionStartsFor(section.start)) continue;
                 if (!std.mem.eql(u8, section.name, ".text") and
                     !std.mem.eql(u8, section.name, "__text")) continue;
 
@@ -103,6 +124,7 @@ pub fn detectProcedures(
             if (!segment.permissions.execute) continue;
 
             for (segment.sections) |section| {
+                if (!section.isCode() or doc.hasLinkerFunctionStartsFor(section.start)) continue;
                 if (!std.mem.eql(u8, section.name, ".text") and
                     !std.mem.eql(u8, section.name, "__text")) continue;
 
@@ -166,6 +188,7 @@ pub fn detectProcedures(
             if (!segment.permissions.execute) continue;
 
             for (segment.sections) |section| {
+                if (!section.isCode() or doc.hasLinkerFunctionStartsFor(section.start)) continue;
                 // Only scan __text/.text — other sections are stubs/helpers
                 if (!std.mem.eql(u8, section.name, "__text") and
                     !std.mem.eql(u8, section.name, ".text")) continue;
@@ -184,7 +207,9 @@ pub fn detectProcedures(
                     const word = std.mem.readInt(u32, section_data[offset..][0..4], .little);
 
                     // Instruction after RET/RETAB/RETAA is likely a new function
-                    if (prev_was_ret and !entries.contains(addr) and word != 0) {
+                    if (prev_was_ret and !entries.contains(addr) and word != 0 and
+                        !isInternalSymbolBranchTarget(symbol_ranges.items, xrefs, addr))
+                    {
                         try entries.put(addr, .prologue_scan);
                     }
                     // RET = 0xD65F03C0, RETAB = 0xD65F0FFF, RETAA = 0xD65F0BFF
@@ -225,6 +250,7 @@ pub fn detectProcedures(
 
     var it = entries.iterator();
     while (it.next()) |entry| {
+        if (!doc.permitsProcedureStart(entry.key_ptr.*)) continue;
         try result.append(.{
             .entry = entry.key_ptr.*,
             .source = entry.value_ptr.*,
@@ -239,6 +265,27 @@ pub fn detectProcedures(
     }.lessThan);
 
     return result.toOwnedSlice();
+}
+
+/// A RET can precede another size tier or early-exit path of the same function.
+/// Suppress only heuristic post-RET seeds with an incoming direct jump inside an
+/// existing sized named range. Explicit symbol/call entries remain authoritative,
+/// and a jump from outside the range (including a tail call) does not suppress it.
+fn isInternalSymbolBranchTarget(ranges: []const types.Procedure, xrefs: *const xref_mod.XrefTracker, addr: u64) bool {
+    var lo: usize = 0;
+    var hi: usize = ranges.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (ranges[mid].entry <= addr) lo = mid + 1 else hi = mid;
+    }
+    if (lo == 0) return false;
+    const owner = ranges[lo - 1];
+    if (addr == owner.entry or addr - owner.entry >= owner.size) return false;
+    for (xrefs.getRefsTo(addr)) |xref| {
+        if (xref.xref_type == .jump and xref.from >= owner.entry and
+            xref.from - owner.entry < owner.size) return true;
+    }
+    return false;
 }
 
 /// Check if a 32-bit ARM64 instruction is a function prologue.
@@ -357,6 +404,7 @@ fn detectX86Procedures(
     for (doc.segments) |segment| {
         if (!segment.permissions.execute) continue;
         for (segment.sections) |section| {
+            if (!section.isCode() or doc.hasLinkerFunctionStartsFor(section.start)) continue;
             if (!std.mem.eql(u8, section.name, "__text") and
                 !std.mem.eql(u8, section.name, ".text")) continue;
             const section_end = section.file_offset + section.length;
@@ -492,4 +540,51 @@ test "non-prologue instructions" {
     try std.testing.expect(!isArm64Prologue(0xD65F03C0)); // RET
     try std.testing.expect(!isArm64Prologue(0x94000000)); // BL
     try std.testing.expect(!isArm64Prologue(0x00000000)); // NOP-ish
+}
+
+test "ARM64 post-return branch targets remain inside named function" {
+    const t = std.testing;
+    // cbz x0, +8; ret; cbnz x1, -8; ret; nop; ret.
+    // The first ret is an early exit; the second tier is entered by cbz.
+    const data = [_]u8{ 0x40, 0x00, 0x00, 0xb4, 0xc0, 0x03, 0x5f, 0xd6, 0xc1, 0xff, 0xff, 0xb5, 0xc0, 0x03, 0x5f, 0xd6, 0x1f, 0x20, 0x03, 0xd5, 0xc0, 0x03, 0x5f, 0xd6 };
+    var doc = types.Document.init(t.allocator, 1, "early-return", &data);
+    defer doc.deinit();
+    doc.entry_point = 0x1000;
+    var sections = [_]types.Section{.{ .name = "__text", .start = 0x1000, .length = data.len, .file_offset = 0, .is_code = true }};
+    var segments = [_]types.Segment{.{ .name = "__TEXT", .start = 0x1000, .length = data.len, .file_offset = 0, .permissions = .{ .read = true, .execute = true }, .sections = &sections }};
+    doc.segments = &segments;
+    try doc.procedures.append(.{ .entry = 0x1000, .size = 16, .name = "size_tiers" });
+    var xrefs = xref_mod.XrefTracker.init(t.allocator, t.io);
+    defer xrefs.deinit();
+    try xrefs.addXref(0x1000, 0x1008, .jump);
+    try xrefs.addXref(0x1008, 0x1000, .jump);
+    const detected = try detectProcedures(t.allocator, &doc, &xrefs);
+    defer t.allocator.free(detected);
+    try t.expectEqual(@as(usize, 2), detected.len);
+    try t.expectEqual(@as(u64, 0x1000), detected[0].entry);
+    // A post-return start outside the named range remains discoverable.
+    try t.expectEqual(@as(u64, 0x1010), detected[1].entry);
+
+    // An explicitly called interior entry remains discoverable as a callable alias.
+    try xrefs.addXref(0x1010, 0x1008, .call);
+    const called = try detectProcedures(t.allocator, &doc, &xrefs);
+    defer t.allocator.free(called);
+    try t.expectEqual(@as(usize, 3), called.len);
+    try t.expectEqual(@as(u64, 0x1008), called[1].entry);
+}
+
+test "ARM64 post-return filter excludes external jumps and unsized ranges" {
+    const t = std.testing;
+    var xrefs = xref_mod.XrefTracker.init(t.allocator, t.io);
+    defer xrefs.deinit();
+    try xrefs.addXref(0x2000, 0x1008, .jump);
+    const ranges = [_]types.Procedure{.{ .entry = 0x1000, .size = 16, .name = "owner" }};
+    try t.expect(!isInternalSymbolBranchTarget(&ranges, &xrefs, 0x1008));
+    try xrefs.addXref(0x1000, 0x1008, .data_read);
+    try t.expect(!isInternalSymbolBranchTarget(&ranges, &xrefs, 0x1008));
+    try xrefs.addXref(0x1000, 0x1008, .jump);
+    try t.expect(isInternalSymbolBranchTarget(&ranges, &xrefs, 0x1008));
+    try t.expect(!isInternalSymbolBranchTarget(&.{}, &xrefs, 0x1008));
+    try t.expect(!isInternalSymbolBranchTarget(&ranges, &xrefs, 0x1000));
+    try t.expect(!isInternalSymbolBranchTarget(&ranges, &xrefs, 0x1010));
 }

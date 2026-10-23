@@ -4,9 +4,10 @@
 const std = @import("std");
 const types = @import("../../types.zig");
 
-/// True if s looks like a numeric literal (decimal, hex 0x..., negative).
+/// True if s looks like a numeric literal, including an ARM immediate prefix.
 pub fn isLiteral(s: ?[]const u8) bool {
-    const v = s orelse return false;
+    const input = s orelse return false;
+    const v = if (std.mem.startsWith(u8, input, "#")) input[1..] else input;
     if (v.len == 0) return false;
     var i: usize = 0;
     if (v[0] == '-' or v[0] == '+') {
@@ -36,7 +37,7 @@ pub fn isLiteral(s: ?[]const u8) bool {
 pub fn parseLiteral(s: []const u8) ?i64 {
     if (!isLiteral(s)) return null;
     var negative = false;
-    var rest = s;
+    var rest = if (std.mem.startsWith(u8, s, "#")) s[1..] else s;
     if (rest.len > 0 and (rest[0] == '-' or rest[0] == '+')) {
         negative = rest[0] == '-';
         rest = rest[1..];
@@ -61,34 +62,35 @@ pub fn formatLiteralAlloc(allocator: std.mem.Allocator, v: i64, hex: bool) ![]u8
     return std.fmt.allocPrint(allocator, "{d}", .{v});
 }
 
-/// True if stmt reads the given variable (src, condition, or any arg).
+fn isIdentifierByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '$';
+}
+
+/// Exact identifier matching inside expressions; `x` must not match `x1`.
+pub fn containsVariable(expression: []const u8, variable: []const u8) bool {
+    if (variable.len == 0) return false;
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, expression, cursor, variable)) |pos| {
+        const end = pos + variable.len;
+        if ((pos == 0 or !isIdentifierByte(expression[pos - 1])) and
+            (end == expression.len or !isIdentifierByte(expression[end]))) return true;
+        cursor = end;
+    }
+    return false;
+}
+
+/// Unknown effects conservatively read every variable. Other expressions are
+/// token-scanned so arithmetic and memory-address uses survive dead-store removal.
 pub fn stmtReads(stmt: types.IRStatement, variable: []const u8) bool {
-    if (stmt.src) |s| {
-        if (std.mem.eql(u8, s, variable)) return true;
-    }
-    if (stmt.condition) |c| {
-        if (std.mem.eql(u8, c, variable)) return true;
-    }
-    if (stmt.target) |t| {
-        // Indirect call targets count as reads of the target variable.
-        if (!isLiteral(t) and std.mem.eql(u8, t, variable)) return true;
+    if (stmt.type == .@"opaque") return true;
+    inline for (.{ stmt.src, stmt.condition, stmt.target }) |value| {
+        if (value) |s| if (containsVariable(s, variable)) return true;
     }
     if (stmt.args) |args| {
-        for (args) |a| {
-            if (std.mem.eql(u8, a, variable)) return true;
-        }
+        for (args) |a| if (containsVariable(a, variable)) return true;
     }
-    // Compare reads both operands (dest is a flag-source here, not a write).
-    if (stmt.type == .compare) {
-        if (stmt.dest) |d| {
-            if (std.mem.eql(u8, d, variable)) return true;
-        }
-    }
-    // Store reads dest (address) as well as src (value).
-    if (stmt.type == .store) {
-        if (stmt.dest) |d| {
-            if (std.mem.eql(u8, d, variable)) return true;
-        }
+    if (stmt.type == .compare or stmt.type == .store) {
+        if (stmt.dest) |d| if (containsVariable(d, variable)) return true;
     }
     return false;
 }
@@ -122,6 +124,11 @@ test "isLiteral accepts decimal hex negative" {
 }
 
 test "parseLiteral decodes forms" {
+    try std.testing.expectEqual(@as(?i64, 0), parseLiteral("#0x0"));
+    try std.testing.expectEqual(@as(?i64, 42), parseLiteral("#42"));
+    try std.testing.expectEqual(@as(?i64, -5), parseLiteral("#-5"));
+    try std.testing.expectEqual(@as(?i64, null), parseLiteral("#arg0"));
+    try std.testing.expectEqual(@as(?i64, null), parseLiteral("#"));
     try std.testing.expectEqual(@as(?i64, 42), parseLiteral("42"));
     try std.testing.expectEqual(@as(?i64, 16), parseLiteral("0x10"));
     try std.testing.expectEqual(@as(?i64, -5), parseLiteral("-5"));

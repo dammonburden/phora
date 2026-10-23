@@ -92,6 +92,124 @@ pub fn nop(address: u64) IRStatement {
     };
 }
 
+/// Preserve an instruction whose full effects are not modeled. This is a
+/// dataflow barrier, never an assignment to the first textual operand.
+pub fn opaqueInstruction(address: u64, mnemonic: []const u8, operands: []const u8) IRStatement {
+    return .{ .type = .@"opaque", .address = address, .op = mnemonic, .src = operands };
+}
+
+pub const MemoryEvidence = struct {
+    width: ?u8 = null,
+    signedness: types.MemorySignedness = .unknown,
+};
+
+/// Register storage width, never inferred from a renamed variable. A q-register
+/// is 16 bytes; the transfer width of extending loads is handled separately.
+pub fn registerWidth(reg: []const u8) ?u8 {
+    if (eqlI(reg, "xzr")) return 8;
+    if (eqlI(reg, "wzr")) return 4;
+    if (reg.len < 2) return null;
+    const prefix = std.ascii.toLower(reg[0]);
+    if (std.mem.indexOfScalar(u8, "wxbhsdqv", prefix) != null and std.ascii.isDigit(reg[1])) {
+        const end = std.mem.indexOfScalar(u8, reg, '.') orelse reg.len;
+        const n = std.fmt.parseInt(u8, reg[1..end], 10) catch return null;
+        if (n > 31) return null;
+        return switch (prefix) {
+            'b' => 1,
+            'h' => 2,
+            'w', 's' => 4,
+            'x', 'd' => 8,
+            'q', 'v' => 16,
+            else => null,
+        };
+    }
+    const groups = [_]struct { width: u8, names: []const []const u8 }{
+        .{ .width = 8, .names = &.{ "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp" } },
+        .{ .width = 4, .names = &.{ "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp" } },
+        .{ .width = 2, .names = &.{ "ax", "bx", "cx", "dx", "si", "di", "bp", "sp" } },
+        .{ .width = 1, .names = &.{ "al", "ah", "bl", "bh", "cl", "ch", "dl", "dh", "sil", "dil", "bpl", "spl" } },
+    };
+    for (groups) |g| for (g.names) |name| {
+        if (eqlI(reg, name)) return g.width;
+    };
+    if (prefix == 'r' and std.ascii.isDigit(reg[1])) {
+        var end = reg.len;
+        const last = std.ascii.toLower(reg[end - 1]);
+        const width: u8 = switch (last) {
+            'b' => 1,
+            'w' => 2,
+            'd' => 4,
+            else => 8,
+        };
+        if (width != 8) end -= 1;
+        const n = std.fmt.parseInt(u8, reg[1..end], 10) catch return null;
+        if (n >= 8 and n <= 15) return width;
+    }
+    return null;
+}
+
+pub fn memoryOperandWidth(operand: []const u8) ?u8 {
+    // Test longer prefixes first: "word ptr" occurs inside "qword ptr".
+    const hints = [_]struct { text: []const u8, width: u8 }{
+        .{ .text = "zmmword ptr", .width = 64 }, .{ .text = "ymmword ptr", .width = 32 },
+        .{ .text = "xmmword ptr", .width = 16 }, .{ .text = "qword ptr", .width = 8 },
+        .{ .text = "dword ptr", .width = 4 },    .{ .text = "word ptr", .width = 2 },
+        .{ .text = "byte ptr", .width = 1 },
+    };
+    for (hints) |h| if (std.mem.indexOf(u8, operand, h.text) != null) return h.width;
+    return null;
+}
+
+/// Evidence about a single memory transfer. Pair, writeback and partial MIPS
+/// transfers remain unknown rather than inventing a field width.
+pub fn memoryEvidence(mnemonic: []const u8, operands: []const u8) MemoryEvidence {
+    if (std.mem.indexOfScalar(u8, operands, '[') == null and
+        std.mem.indexOfScalar(u8, operands, '(') == null) return .{};
+    if (eqlI(mnemonic, "ldp") or eqlI(mnemonic, "stp") or
+        std.mem.indexOfScalar(u8, operands, '!') != null or
+        (std.mem.indexOf(u8, operands, "],") != null and
+            (std.mem.indexOfScalar(u8, operands, ',') orelse operands.len) < (std.mem.indexOfScalar(u8, operands, '[') orelse 0))) return .{};
+    const first = std.mem.trim(u8, operands[0 .. std.mem.indexOfScalar(u8, operands, ',') orelse operands.len], " \t");
+    const signed = eqlI(mnemonic, "ldrsb") or eqlI(mnemonic, "ldrsh") or eqlI(mnemonic, "ldrsw") or
+        eqlI(mnemonic, "ldursb") or eqlI(mnemonic, "ldursh") or eqlI(mnemonic, "ldursw") or
+        eqlI(mnemonic, "lb") or eqlI(mnemonic, "lh") or eqlI(mnemonic, "movsx") or eqlI(mnemonic, "movsxd");
+    const unsigned = eqlI(mnemonic, "ldrb") or eqlI(mnemonic, "ldrh") or eqlI(mnemonic, "ldurb") or
+        eqlI(mnemonic, "ldurh") or eqlI(mnemonic, "lbu") or eqlI(mnemonic, "lhu") or eqlI(mnemonic, "movzx");
+    const sign: types.MemorySignedness = if (signed) .signed else if (unsigned) .unsigned else .unknown;
+    if (eqlI(mnemonic, "ldrb") or eqlI(mnemonic, "ldrsb") or eqlI(mnemonic, "strb") or
+        eqlI(mnemonic, "ldurb") or eqlI(mnemonic, "ldursb") or eqlI(mnemonic, "sturb") or
+        eqlI(mnemonic, "lb") or eqlI(mnemonic, "lbu") or eqlI(mnemonic, "sb")) return .{ .width = 1, .signedness = sign };
+    if (eqlI(mnemonic, "ldrh") or eqlI(mnemonic, "ldrsh") or eqlI(mnemonic, "strh") or
+        eqlI(mnemonic, "ldurh") or eqlI(mnemonic, "ldursh") or eqlI(mnemonic, "sturh") or
+        eqlI(mnemonic, "lh") or eqlI(mnemonic, "lhu") or eqlI(mnemonic, "sh")) return .{ .width = 2, .signedness = sign };
+    if (eqlI(mnemonic, "ldrsw") or eqlI(mnemonic, "ldursw") or eqlI(mnemonic, "movsxd") or
+        eqlI(mnemonic, "lw") or eqlI(mnemonic, "sw") or eqlI(mnemonic, "lwc1") or eqlI(mnemonic, "swc1")) return .{ .width = 4, .signedness = sign };
+    if (eqlI(mnemonic, "ldr") or eqlI(mnemonic, "str") or eqlI(mnemonic, "ldur") or eqlI(mnemonic, "stur"))
+        return .{ .width = registerWidth(first), .signedness = sign };
+    if (eqlI(mnemonic, "mov") or eqlI(mnemonic, "movzx") or eqlI(mnemonic, "movsx") or
+        eqlI(mnemonic, "cmp") or eqlI(mnemonic, "test"))
+    {
+        if (memoryOperandWidth(operands)) |width| return .{ .width = width, .signedness = sign };
+        // Extending moves need the source width, not the wider destination.
+        if (eqlI(mnemonic, "movzx") or eqlI(mnemonic, "movsx")) return .{};
+        if (registerWidth(first)) |width| return .{ .width = width };
+        const comma = std.mem.lastIndexOfScalar(u8, operands, ',') orelse return .{};
+        return .{ .width = registerWidth(std.mem.trim(u8, operands[comma + 1 ..], " \t")) };
+    }
+    return .{};
+}
+
+pub fn hasVectorOrFpOperand(operands: []const u8) bool {
+    var tokens = std.mem.tokenizeAny(u8, operands, " ,[]!\t");
+    while (tokens.next()) |tok| {
+        if (tok.len < 2) continue;
+        const c = std.ascii.toLower(tok[0]);
+        if (std.mem.indexOfScalar(u8, "vbhsdq", c) != null and std.ascii.isDigit(tok[1]) and registerWidth(tok) != null) return true;
+        if (std.mem.startsWith(u8, tok, "xmm") or std.mem.startsWith(u8, tok, "ymm") or std.mem.startsWith(u8, tok, "zmm")) return true;
+    }
+    return false;
+}
+
 /// ARM64 register to variable name mapping.
 /// W-registers (32-bit views) get a "_32" suffix to distinguish from X-registers.
 pub fn registerToVariable(reg: []const u8) []const u8 {
@@ -168,15 +286,42 @@ fn eqlI(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
 
+/// Identify overlapping architectural views without equating their values.
+/// This is used for read liveness and clobbers, never for ABI positions.
+pub fn registerFamily(reg: []const u8) ?u8 {
+    if (reg.len >= 2 and (reg[0] == 'w' or reg[0] == 'x')) {
+        const n = std.fmt.parseInt(u8, reg[1..], 10) catch return null;
+        if (n <= 30) return n;
+        return null;
+    }
+    const groups = [_][]const []const u8{
+        &.{ "rax", "eax", "ax", "al", "ah" },
+        &.{ "rbx", "ebx", "bx", "bl", "bh" },
+        &.{ "rcx", "ecx", "cx", "cl", "ch" },
+        &.{ "rdx", "edx", "dx", "dl", "dh" },
+        &.{ "rsi", "esi", "si", "sil" },
+        &.{ "rdi", "edi", "di", "dil" },
+        &.{ "rbp", "ebp", "bp", "bpl" },
+        &.{ "rsp", "esp", "sp", "spl" },
+    };
+    for (groups, 0..) |names, i| for (names) |name| {
+        if (eqlI(reg, name)) return @intCast(32 + i);
+    };
+    if (reg.len >= 2 and reg[0] == 'r' and registerWidth(reg) != null) {
+        const end = if (std.ascii.isDigit(reg[reg.len - 1])) reg.len else reg.len - 1;
+        const n = std.fmt.parseInt(u8, reg[1..end], 10) catch return null;
+        if (n >= 8 and n <= 15) return 32 + n;
+    }
+    return null;
+}
+
 /// Build a Variable from a register name.
 pub fn variableFromRegister(reg: []const u8) Variable {
     return .{
-        .name = registerToVariable(reg),
+        .name = reg,
         .register = reg,
-        .type_name = if (reg.len > 0 and (reg[0] == 'w' or reg[0] == 'W'))
-            "uint32_t"
-        else
-            "uint64_t",
+        // Register storage alone does not prove a source-language integer type.
+        .type_name = null,
     };
 }
 
@@ -211,4 +356,37 @@ test "create IR statements" {
     const r = ret(0x1008, "arg0");
     try std.testing.expectEqual(IRStatementType.@"return", r.type);
     try std.testing.expectEqualStrings("arg0", r.src.?);
+}
+
+test "memory evidence uses transfer width before aliases and preserves q width" {
+    const t = std.testing;
+    try t.expectEqual(@as(?u8, 4), memoryEvidence("ldr", "w0, [x1, #4]").width);
+    try t.expectEqual(@as(?u8, 8), memoryEvidence("str", "x0, [x1, #8]").width);
+    try t.expectEqual(@as(?u8, 16), memoryEvidence("ldur", "q0, [x1, #-16]").width);
+    const signed_byte = memoryEvidence("ldrsb", "x0, [x1]");
+    try t.expectEqual(@as(?u8, 1), signed_byte.width);
+    try t.expect(signed_byte.signedness == .signed);
+    try t.expect(memoryEvidence("ldrh", "w0, [x1]").signedness == .unsigned);
+    try t.expectEqual(@as(?u8, 1), memoryEvidence("movsx", "rax, byte ptr [rcx]").width);
+    try t.expect(memoryEvidence("movsx", "rax, [rcx]").width == null);
+    try t.expectEqual(@as(?u8, 4), memoryEvidence("mov", "dword ptr [rcx], eax").width);
+    try t.expect(memoryEvidence("ldp", "q0, q1, [x2]").width == null);
+    try t.expect(memoryEvidence("ldr", "x0, [x1], #8").width == null);
+    try t.expect(registerWidth("arg0") == null);
+    try t.expect(registerWidth("local_1") == null);
+    try t.expect(registerWidth("x99") == null);
+    try t.expectEqual(@as(?u8, 1), registerWidth("al"));
+    try t.expectEqual(@as(?u8, 2), registerWidth("ax"));
+    try t.expect(hasVectorOrFpOperand("v0.16b, v1.16b, v2.16b"));
+    try t.expect(hasVectorOrFpOperand("s0, s1, s2"));
+    try t.expect(!hasVectorOrFpOperand("x0, x1, x2"));
+}
+
+test "evidence: x86 byte and word views are not ARM vector registers" {
+    try std.testing.expectEqual(@as(?u8, 1), registerWidth("bl"));
+    try std.testing.expectEqual(@as(?u8, 1), registerWidth("sil"));
+    try std.testing.expectEqual(@as(?u8, 2), registerWidth("bx"));
+    try std.testing.expectEqual(@as(?u8, 2), registerWidth("dx"));
+    try std.testing.expect(!hasVectorOrFpOperand("bl, sil"));
+    try std.testing.expect(hasVectorOrFpOperand("b0, [x0]"));
 }

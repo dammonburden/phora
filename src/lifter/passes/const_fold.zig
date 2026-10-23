@@ -6,6 +6,7 @@
 const std = @import("std");
 const types = @import("../../types.zig");
 const util = @import("pass_util.zig");
+const ir = @import("../ir.zig");
 
 const ConstMap = std.StringHashMap(i64);
 const StringSet = std.StringHashMap(void);
@@ -23,6 +24,11 @@ pub fn run(allocator: std.mem.Allocator, func: *types.IRFunction) !void {
 
     for (func.statements, 0..) |*stmt, i| {
         _ = i;
+        if (stmt.block_start) consts.clearRetainingCapacity();
+        if (stmt.type == .@"opaque") {
+            consts.clearRetainingCapacity();
+            continue; // Raw instruction operands are evidence, not expressions.
+        }
 
         // Rewrite reads first (src, condition, args) using current map.
         try foldReads(allocator, stmt, &consts, &owned);
@@ -42,12 +48,14 @@ pub fn run(allocator: std.mem.Allocator, func: *types.IRFunction) !void {
                         _ = consts.remove(d);
                     }
                 }
+                try updateArmAliases(func, stmt, &consts);
             },
             .load => {
                 // We don't model memory; an unknown value is loaded into dest.
                 if (stmt.dest) |d| _ = consts.remove(d);
+                try updateArmAliases(func, stmt, &consts);
             },
-            .call => {
+            .call, .@"opaque" => {
                 // Calls may clobber arbitrary state. Drop everything (conservative).
                 consts.clearRetainingCapacity();
             },
@@ -62,6 +70,52 @@ pub fn run(allocator: std.mem.Allocator, func: *types.IRFunction) !void {
             .compare, .nop => {
                 // No definition; map unchanged.
             },
+        }
+    }
+}
+
+// W-register writes zero-extend into X-registers. Keep their constant bindings
+// coherent, and invalidate both views after a load or a non-constant write.
+fn updateArmAliases(func: *const types.IRFunction, stmt: *const types.IRStatement, consts: *ConstMap) !void {
+    const dest = stmt.dest orelse return;
+    if (ir.registerFamily(dest)) |family| {
+        // Different width views overlap but are not interchangeable values.
+        // Invalidate previously known views on every architectural write.
+        var changed = true;
+        while (changed) {
+            changed = false;
+            var keys = consts.keyIterator();
+            while (keys.next()) |key| {
+                if (!std.mem.eql(u8, key.*, dest) and ir.registerFamily(key.*) == family) {
+                    _ = consts.remove(key.*);
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if (consts.get(dest)) |value| {
+            const width = ir.registerWidth(dest) orelse 8;
+            if (width < 8) {
+                const bits: u6 = @intCast(width * 8);
+                const mask = (@as(u64, 1) << bits) - 1;
+                try consts.put(dest, @intCast(@as(u64, @bitCast(value)) & mask));
+            }
+        }
+    }
+    for (func.variables) |variable| {
+        const reg = variable.register orelse continue;
+        if (reg.len < 2 or reg[0] != 'w' or !std.mem.endsWith(u8, variable.name, "_32")) continue;
+        const wide = variable.name[0 .. variable.name.len - 3];
+        if (std.mem.eql(u8, dest, variable.name)) {
+            if (consts.get(dest)) |value| {
+                const extended: i64 = @as(u32, @truncate(@as(u64, @bitCast(value))));
+                try consts.put(dest, extended);
+                try consts.put(wide, extended);
+            } else {
+                _ = consts.remove(wide);
+            }
+        } else if (std.mem.eql(u8, dest, wide)) {
+            _ = consts.remove(variable.name);
         }
     }
 }
@@ -126,6 +180,30 @@ fn foldReads(
 // ============================================================================
 // Tests
 // ============================================================================
+
+test "evidence: ARM narrow writes zero-extend and unknown writes invalidate aliases" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var variables = [_]types.Variable{
+        .{ .name = "arg0_32", .register = "w0" },
+        .{ .name = "arg0", .register = "x0" },
+    };
+    var statements = [_]types.IRStatement{
+        .{ .type = .assign, .address = 0, .dest = "arg0_32", .src = "#0xffffffff" },
+        .{ .type = .assign, .address = 4, .dest = "seen", .src = "arg0" },
+        .{ .type = .assign, .address = 8, .dest = "arg0_32", .src = "unknown" },
+        .{ .type = .assign, .address = 12, .dest = "after_narrow", .src = "arg0" },
+        .{ .type = .assign, .address = 16, .dest = "arg0_32", .src = "#42" },
+        .{ .type = .load, .address = 20, .dest = "arg0", .src = "memory" },
+        .{ .type = .@"return", .address = 24, .src = "arg0_32" },
+    };
+    var func = types.IRFunction{ .address = 0, .statements = &statements, .variables = &variables };
+    try run(a, &func);
+    try std.testing.expectEqualStrings("4294967295", statements[1].src.?);
+    try std.testing.expectEqualStrings("arg0", statements[3].src.?);
+    try std.testing.expectEqualStrings("arg0_32", statements[6].src.?);
+}
 
 test "const_fold basic assign-then-use" {
     const a = std.testing.allocator;
@@ -221,4 +299,27 @@ test "const_fold compare folds dest and src" {
     try std.testing.expectEqualStrings("5", func.statements[1].dest.?);
     try std.testing.expectEqualStrings("0", func.statements[1].src.?);
     a.free(func.statements[1].dest.?);
+}
+
+test "evidence: physical register views invalidate stale full and partial constants" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var stmts = [_]types.IRStatement{
+        .{ .type = .assign, .address = 0, .dest = "rax", .src = "42" },
+        .{ .type = .assign, .address = 1, .dest = "eax", .src = "unknown" },
+        .{ .type = .assign, .address = 2, .dest = "seen", .src = "rax" },
+        .{ .type = .assign, .address = 3, .dest = "eax", .src = "0x100000001" },
+        .{ .type = .assign, .address = 4, .dest = "narrow", .src = "eax" },
+        .{ .type = .assign, .address = 5, .dest = "al", .src = "7" },
+        .{ .type = .assign, .address = 6, .dest = "after_byte", .src = "eax" },
+        .{ .type = .assign, .address = 7, .dest = "x0", .src = "9" },
+        .{ .type = .assign, .address = 8, .dest = "w0", .src = "unknown" },
+        .{ .type = .@"return", .address = 9, .src = "x0" },
+    };
+    var func = types.IRFunction{ .address = 0, .statements = &stmts, .variables = &.{} };
+    try run(arena.allocator(), &func);
+    try std.testing.expectEqualStrings("rax", stmts[2].src.?);
+    try std.testing.expectEqualStrings("1", stmts[4].src.?);
+    try std.testing.expectEqualStrings("eax", stmts[6].src.?);
+    try std.testing.expectEqualStrings("x0", stmts[9].src.?);
 }

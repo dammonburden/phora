@@ -485,6 +485,7 @@ fn parseSectionHeaders(allocator: std.mem.Allocator, data: []const u8, ehdr: *co
             else
                 0,
             .is_zerofill = shdr.sh_type == SHT_NOBITS,
+            .is_code = (shdr.sh_flags & SHF_EXECINSTR) != 0,
         }) catch return;
 
         _ = allocator;
@@ -930,6 +931,7 @@ fn parseSectionHeaders32(allocator: std.mem.Allocator, data: []const u8, ehdr: *
             else
                 0,
             .is_zerofill = shdr.sh_type == SHT_NOBITS,
+            .is_code = (shdr.sh_flags & SHF_EXECINSTR) != 0,
         }) catch return;
 
         _ = allocator;
@@ -1529,7 +1531,7 @@ test "parse minimal ELF64 header" {
     const allocator = std.testing.allocator;
 
     // Construct a minimal valid ELF64 binary (just header, no program/section headers)
-    var elf_data: [64]u8 = .{0} ** 64;
+    var elf_data: [64]u8 = @splat(0);
     // ELF magic
     elf_data[0] = 0x7f;
     elf_data[1] = 'E';
@@ -1560,7 +1562,7 @@ test "parse minimal ELF64 header" {
 
 test "parse rejects non-ELF" {
     const allocator = std.testing.allocator;
-    const data = [_]u8{ 0xCF, 0xFA, 0xED, 0xFE } ++ [_]u8{0} ** 60;
+    const data = [_]u8{ 0xCF, 0xFA, 0xED, 0xFE } ++ @as([60]u8, @splat(0));
     const result = parse(allocator, 1, "/test/macho", &data, .{});
     try std.testing.expectError(ElfError.NotElf, result);
 }
@@ -1569,7 +1571,7 @@ test "parse minimal ELF32 header" {
     const allocator = std.testing.allocator;
 
     // Construct a minimal valid ELF32 binary (just header, no program/section headers)
-    var elf_data: [52]u8 = .{0} ** 52;
+    var elf_data: [52]u8 = @splat(0);
     // ELF magic
     elf_data[0] = 0x7f;
     elf_data[1] = 'E';
@@ -1600,7 +1602,7 @@ test "parse minimal ELF32 header" {
 
 test "parse rejects big-endian" {
     const allocator = std.testing.allocator;
-    var data: [64]u8 = .{0} ** 64;
+    var data: [64]u8 = @splat(0);
     data[0] = 0x7f;
     data[1] = 'E';
     data[2] = 'L';
